@@ -55,6 +55,14 @@
 - 콘텐츠 워크플로(스킬 25개 재작성 + 프롬프트 8개 + THIRD_PARTY_NOTICES, 라이선스·일관성 검토) 실행 중.
 - v2 코드 워크플로 스크립트 준비(기반 모듈 완료 후 실행): Group1 features/runner/journal → Group2 scanner/payloads → Group3 gates/pipeline → Group4 cycle+main → 통합 + 오프라인 paper e2e(`--offline-fixture`).
 
+### 06:15~08:40 기반 모듈·콘텐츠 완료, 사용량 한도
+- 기반 모듈 워크플로 완료(에이전트 31, 오류 0): 10개 모듈 + 리뷰 테스트, **전체 2,543 테스트 통과**(14초). 리뷰가 찾은 주요 결함 예: Claude SDK `parse()`는 잘림·거부 응답에서 usage/stop_reason을 읽기 전에 예외 → `create(output_config.format=json_schema)` + 직접 검증으로 변경(SPEC §8.3 갱신), 손익비 계산 전 손절·익절 상한 클램프, 비정상 시각 입력에 fail-closed 등.
+- 콘텐츠 워크플로: 스킬 25개(원문 8-gram 복사 검사·적용성 검토 후 수정) + 프롬프트 8개 + THIRD_PARTY_NOTICES 작성. 프롬프트 교차검토에서 결함 16건 확인(cgo_60 단위 불일치, 기술분석 손익비 공식이 1.5 미만, payload 필드 계약 부재 등). 마지막 수정·검증 단계와 v2 코드 워크플로는 **5시간 사용량 한도(08:40 UTC 리셋)** 로 실패.
+
+### 11:25 재개 (모델 claude-opus-5-5)
+- 콘텐츠 커밋 후, 프롬프트가 기대하는 입력 구조를 바탕으로 **SPEC v2.1 §20.3a payload 필드 계약**을 확정(역할별 키 목록·경로). 결함 16건 해소 방침을 통일 결정(D1~D15)으로 정리: cgo_60 ±3%, tp=min(4,max(2s,1.5s+0.75)), 노이즈·실행비용·뉴스 경과시간은 코드가 계산, 기술분석가 payload에서 총괄 thesis 제외, 뉴스 7단계 척도, 손절 넓히기 금지 등.
+- 병렬 실행: ① 프롬프트 8 + 스킬 5묶음 정렬 → 교차검토 → 적용 → 기계 검증, ② v2 코드(features/runner/journal → scanner/payloads → gates/pipeline → cycle+main → 통합 + 오프라인 paper e2e). 오케스트레이션 스크립트는 `docs/workflows/`에 보관.
+
 ### 진행 원칙
 - 이전 세션 트랜스크립트 원문은 비밀(키) 포함 가능성 때문에 저장소에 올리지 않음. 비밀 검사(정규식)를 통과한 요약만 커밋.
 - 기존 봇의 하드 리밋(`risk.py`), paper 기본 모드, 실자금 매매 금지 원칙은 유지.

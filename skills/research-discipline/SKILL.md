@@ -10,43 +10,48 @@ license: MIT
 
 ## When to apply
 
-Run this at the very start of every call, before you form an opinion from the packs, and once more just before you emit the output. It costs no extra tool or data; it only changes the order in which you look at the fields. The reason it exists: a language model handed a labelled JSON packet tends to lock onto the first coherent story, then reads every remaining field as support for it.
+Run this once at the start of every call, before you form a view, and once more just before you emit the output. It needs no extra data; it only changes the order in which you look at the fields. A model handed a labelled JSON packet tends to lock onto the first coherent story and then read every remaining field as support. This procedure breaks that habit. Where a count or level here differs from your role prompt, the role prompt governs.
 
-## The five biases, rewritten for this bot
+Paths per role, for the checks below:
+- news_sentiment: `headlines[].age_h`, `headlines[].source_grade`, `aliases`, `feed_health.*`, `prev_events[]`.
+- bull and bear: `technical.*`, `feature_extract.*`, `flow.*`, `news_events[].age_h/stale/score`, `news_context.*`, `event_signal.*`, `sentiment.*`, `scanner_row.factor_table.*`, `scanner_row.liquidity.*`, `regime.*`; bear also `corr_to_open`, `hv_pct`.
+- head: per `approved[]` entry `technical.*` (with `technical.labels.*`), `flow.*`, `news.events[].age_h/stale/score`, `bull.*`, `bear.*`, `risk.*`, `gate.*`; plus `sentiment.composite.*`, `regime.*`, `account_pack.*`, `abstained_channels`.
 
-| Bias | How it shows up here | Correction |
+## The five biases in this bot
+
+| Bias | How it shows up | Correction |
 |---|---|---|
-| Confirmation | You find a long setup in `technical` and then read `flow`, `news` and the scanner row only for agreement. | Before concluding, deliberately hunt the opposite: for every supporting field, name one field that argues against it. A conclusion with zero disconfirming citations is not finished. |
-| Recency / staleness | A headline, a funding print or a 24h change that is hours or days old is treated as current. | Check timestamps and windows. Headlines: `ts` versus `now_ms`, 24h and 7d cut-offs. Features: prefer the labelled timeframe closest to the decision horizon; a 1d label does not justify a 15m entry on its own. |
-| Narrative | An `event_type` label or a catchy title stands in for the event. A "listing" headline may describe a minor venue; a "protocol" item may be a roadmap post. | Score what actually happened and whom it touches. Fill `symbols` only with names the title really concerns through the alias map, not with everything in the watchlist. |
-| Large-cap default | The two largest names feel safer, so the same evidence earns a higher confidence or a looser read for them. | Confidence is set by the fields, not by the ticker. The hard limits are identical for every symbol; so is your rubric. |
-| Attention | A symbol with a spike in `abnormal_volume_multiple` or `change_24h_pct` (under `feature_extract` for bull/bear, under `technical` for the head) feels important and the analysis drifts toward justifying a trade in it. | Attention is a reason to shorten the horizon and to look for the crowd, not a reason to enter. The scanner already drops a > 15% 24h move without volume confirmation; do not reintroduce it. |
+| Confirmation | A long setup in `technical` is found first, and every other channel is then read only for agreement. | For each supporting field, look for one that argues against it. A conclusion with zero disconfirming citations is unfinished. |
+| Recency | An old headline or a slow label is treated as current. | Use the code-given `age_h` (above 24 is stale, above 168 capped at 0.33); never compute ages. Prefer the timeframe closest to the decision; a daily label alone does not justify a 15-minute entry. |
+| Narrative | An event type or a vivid title stands in for what happened. A "listing" may be a minor venue; a "protocol" item may be a roadmap post. | Score and cite what the title actually states and whom it touches. Map symbols only through `aliases`. |
+| Large-cap comfort | The biggest names feel safer, so the same evidence earns a looser read. | Confidence is set by fields, not by the ticker. The hard limits and your rubric are identical for every symbol. |
+| Attention | A spike in volume or 24h change (`feature_extract.abnormal_volume_multiple`, `feature_extract.change_24h_pct` for bull and bear; `technical.labels.*` for the head) makes a symbol feel important. | Attention shortens the horizon and invites the question "who already bought?"; it is not a reason to enter. The scanner already removes a 24h move above 15% without volume confirmation; do not argue it back in. |
 
 ## Procedure
 
-1. Write the thesis you are about to test in one sentence (internally, then in the field the schema provides for it).
-2. Walk the five rows and answer "am I about to do this?" for each.
-3. Read the packs in reverse order of your preference: start with the channel most likely to contradict the thesis.
-4. Collect the disconfirming fields first, then the supporting ones. Count them.
-5. Re-check at the end: is every claim tied to an input field name? Is any cited fact older than the horizon it supports? Did you name the strongest point of the side you reject?
+1. Write the thesis you are testing in one sentence, internally, then in the field the schema gives for it.
+2. Walk the five rows and ask "am I about to do this?" for each.
+3. Read the channels in reverse order of preference: start with the one most likely to contradict you.
+4. Collect the disconfirming fields first, then the supporting ones.
+5. Final check: does every claim carry a payload path? Is any cited fact older than the horizon it supports? Have you stated the strongest point of the side you reject?
 
-## Thresholds and rules of thumb
+## Rules of thumb
 
-- Minimum disconfirming citations: bull ≥ 2, bear ≥ 1 per positive it attacks, head ≥ 1 per BUY (the losing side's strongest point).
-- Headline freshness: > 24 hours not intraday-actionable, > 7 days stale with capped score.
-- A claim whose only evidence is the symbol's size, popularity or a label word is discarded, not downgraded.
-- If the packs contain fewer than two independent channels that are not `null` or abstained, the honest verdict is low confidence, not a confident one in either direction.
+- Minimum disconfirming citations: bull at least 2; bear one per positive it attacks; head at least the losing side's strongest point on every BUY.
+- A claim whose only support is a symbol's size, popularity or a label word is discarded, not downgraded.
+- If fewer than two independent channels are present (not `null`, not abstained), the honest output is low confidence, not a confident view either way.
+- Evidence-like strings use the format `"<field path>: <value> — <짧은 한국어 해석>"`. Free text is Korean; field names and enums stay as the schema has them.
 
 ## What not to do
 
-- Do not search for or assume facts outside the payload; there is nothing else to search.
-- Do not rephrase a supporting field as if it were disconfirming to satisfy the count.
-- Do not let an abstained channel count as silent agreement; it is missing evidence. The head sees it in `abstained_channels`; bull and bear see it as `technical` or `flow` being `null`; the news role sees it as an empty feed with `feed_health.errors`.
+- Do not assume facts outside the payload; there is nothing else to look up.
+- Do not relabel a supporting field as disconfirming to meet the count.
+- Do not let a missing channel count as silent agreement. The head sees it in `abstained_channels`; bull and bear see `technical`, `flow` or `news_context` as `null`; the news role sees an empty batch or `feed_health.errors`.
 - Do not write a bearish conclusion as a short; it is "no entry" or "exit".
 
 ## Expressing the result
 
-- news_sentiment: `events[].stale` from the timestamp check; `events[].symbols` only from the alias map; `events[].summary` describing the actual event in ≤ 20 Korean words; `feed_health_note` stating when the feed, not the market, is quiet.
-- bull: `disconfirming_evidence` (≥ 2 items, each naming a pack field such as `flow.crowding_risk` or `feature_extract.rsi_5`), `main_risk_to_bull_case`, `what_would_disprove` (an observable trigger, in Korean), and every `thesis_points[].evidence_field` filled with a real field path.
-- bear: `disconfirming_evidence` (one item per positive you found in the packs), `what_would_disprove_bear`, `strongest_point` written so it can be quoted verbatim by the head, `death_paths[].observable_trigger` tied to a field.
-- head: `disagreement_class` (horizon / caliber / risk_preference / information / none), `losing_side_strongest_point` copied verbatim from the bull or bear output, `debias.ignored_bearish_news` and `debias.chasing_spike` answered honestly, and `decisive_factor` naming the field that settled it.
+- news_sentiment: `events[].stale` from `headlines[].age_h`; `events[].symbols` only from `aliases`; `events[].summary` describing the actual event in at most 20 Korean words; `feed_health_note` saying when the feed, not the market, is quiet.
+- bull: `disconfirming_evidence` (at least 2, each naming a path such as `flow.crowding_risk` or `feature_extract.rsi_5`), `main_risk_to_bull_case`, `what_would_disprove` (an observable trigger), and every `thesis_points[].evidence_field` a real payload path.
+- bear: `disconfirming_evidence` (one per positive found), `what_would_disprove_bear`, a `strongest_point` the head can quote verbatim, and each `death_paths[].observable_trigger` tied to a field.
+- head: `disagreement_class`, `losing_side_strongest_point` copied verbatim from bull or bear, `debias.ignored_bearish_news` and `debias.chasing_spike` answered honestly, and `decisive_factor` naming the field that settled it.

@@ -1,65 +1,53 @@
 ---
 name: minute-analysis
-description: 세션 VWAP 거리·시간대 대비 거래량·비정상 거래량 배수 같은 장중 라벨로 진입 타이밍과 확신도를 조정하는 법
+description: 세션 VWAP 거리·직전 시간 대비 거래량·비정상 거래량 배수·cgo_60 같은 장중 라벨로 추격 매수를 걸러내고 진입 타이밍을 조정하는 법 (확신도·손절·노이즈 판정은 역할 프롬프트 규칙을 따름)
 roles: [technical]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/minute-analysis/SKILL.md (MIT)"
 license: MIT
 ---
-# Intraday context — VWAP and volume-of-day labels
+# Intraday context: VWAP, volume of the hour, holder cost
 
-## When to apply
+## Purpose
 
-Use on every technical call. The bot runs on 15-minute cycles, so intraday price-versus-volume context decides *when* to act on a setup the other channels have identified. All values are precomputed; read them from the feature pack:
+The bot acts on 15-minute cycles, so intraday context decides when a setup found by the regime and structure reads may be acted on. It is mostly a brake: it catches chasing and unconfirmed breakouts. All values are code-computed in the feature pack:
 
-- `vwap_distance_pct` — current price versus the session VWAP built from 15m bars (anchored to the UTC day), in %. VWAP = Σ(typical price × volume) / Σ(volume), typical price = (high + low + close) / 3.
-- `cgo_60` — price / 60-bar 1h VWAP − 1, in %. A proxy for the average holder's unrealized gain.
-- `volume_vs_hour_avg` — last 15m volume divided by the mean of the previous 4 bars.
-- `abnormal_volume_multiple` — last 15m volume divided by the median of the previous 96 bars (one day).
-- `per_tf.<tf>.volume_ratio_20` — volume relative to its 20-bar average on each timeframe.
-- `change_24h_pct` and `last_closes_1h` (20 values) for coarse context only.
+- `feature_pack.vwap_distance_pct`: price versus the session VWAP built from 15m bars (UTC-day anchored), in %.
+- `feature_pack.cgo_60`: price versus the 60-bar 1h VWAP, in %; a proxy for the average recent buyer's unrealized gain.
+- `feature_pack.volume_vs_hour_avg`: last 15m volume over the mean of the previous 4 bars.
+- `feature_pack.abnormal_volume_multiple`: last 15m volume over the median of the previous 96 bars.
+- `feature_pack.per_tf.<tf>.volume_ratio_20`: volume versus its 20-bar mean on each timeframe.
+- `feature_pack.change_24h_pct`, `feature_pack.last_closes_1h`: coarse context only.
 
-## Procedure
+Precedence: your role prompt (technical.md) governs. Its step 6 holds the chasing, breakout-volume and `cgo_60` rules with their confidence deductions; step 5 holds the noise test; step 8 the confidence recipe; step 10 the exits. This skill explains how to read the fields inside those steps and adds no confidence caps or score points of its own.
 
-1. **Locate price against VWAP.**
-   - `vwap_distance_pct` between −0.5 and +1.0 → price is near fair value for the session; `timing: "now"` is acceptable if the structure channel agrees.
-   - `vwap_distance_pct` > +1.5 → price is extended above the session average. Set `timing: "wait_pullback"` and add `vwap_distance_pct` to `evidence`. Above +3.0 with `abnormal_volume_multiple` < 2 → this is a thin spike; `direction` cannot be `long`.
-   - `vwap_distance_pct` < −1.5 → price is below the session average. Allowed for `setup_type: "mean_reversion"` only when `per_tf.15m.vote` or `per_tf.1h.vote` is `mean_reversion_long`; otherwise treat as a downtrend day and keep `direction: "flat"`.
-2. **Check volume confirmation.**
-   - A breakout or trend-continuation setup needs `volume_vs_hour_avg` ≥ 1.2 or `per_tf.15m.volume_ratio_20` ≥ 1.2. Without either, downgrade `timing` to `wait_confirmation` and cap `confidence` at 0.55.
-   - `abnormal_volume_multiple` ≥ 3.0 is a two-sided signal: participation is real, but the move is being chased. Combine with `change_24h_pct`: if the 24h change is already above +10, do not enter now (`timing: "wait_pullback"`, `confidence` − 0.10). If the 24h change is modest (< +5) and the structure is bullish, the volume surge supports `timing: "now"`.
-   - `volume_vs_hour_avg` < 0.5 → the current bar is quiet relative to the hour; treat any breakout as unconfirmed.
-3. **Read holder positioning via `cgo_60`.**
-   - `cgo_60` > +20 → most recent buyers sit on large gains and may sell into strength; subtract 1 from `score` for continuation setups.
-   - `cgo_60` < −30 → selling pressure from trapped holders is likely exhausted; add 1 to `score` for mean-reversion setups when volume confirms.
-   - Values in between carry no adjustment.
-4. **Sanity-check the stop against intraday rotation.** Do not build a stop from VWAP; `sl_reference` only allows `zone`, `kijun`, `atr` or `none`, so the stop always comes from the structure, Kijun or ATR channels. Use VWAP only as a fragility test: if `vwap_distance_pct` is positive and larger than the chosen `stop_pct`, price can hit the stop before it even revisits the session average, which means the stop sits inside ordinary intraday rotation. In that case keep the structural stop, set `noise_check: false`, mention the fragility in `invalidation`, and prefer `timing: "wait_pullback"` so the entry moves closer to the stop.
-5. **Write the invalidation line** in market terms, for example a 15m close back below the session VWAP, or `volume_vs_hour_avg` staying below 1.0 for the next 4 bars after a breakout.
+## Reading order
 
-## Score contribution (into `score`)
-
-| Condition | Points |
-|---|---|
-| `vwap_distance_pct` in [−0.5, +1.0] with bullish structure | +1 |
-| `volume_vs_hour_avg` ≥ 1.2 on a breakout/continuation setup | +1 |
-| `abnormal_volume_multiple` ≥ 3 and `change_24h_pct` > 10 | −1 |
-| `vwap_distance_pct` > 3.0 | −1 |
-| `cgo_60` > 20 (continuation) | −1 |
-| `cgo_60` < −30 (mean reversion, volume confirmed) | +1 |
+1. **Chasing (prompt step 6).** Any of `feature_pack.abnormal_volume_multiple` above 3, `feature_pack.change_24h_pct` above 15, or `feature_pack.vwap_distance_pct` above 1.5 marks the entry as a chase: `wait_pullback` and −0.1 confidence. A volume surge after a large daily move is late participation, not confirmation; it never supports `now`.
+2. **Near fair value.** `feature_pack.vwap_distance_pct` roughly between −0.5 and +1.0 is a normal place to enter; it permits `now` when the prompt's step 3 trigger holds, and adds nothing beyond that.
+3. **Below the session average.** `feature_pack.vwap_distance_pct` below −1.5 fits only a `mean_reversion` setup (1h vote mean_reversion_long). With a trend vote it describes a weak day: prefer `flat` or `wait_confirmation`.
+4. **Breakout volume (prompt step 6).** `feature_pack.volume_vs_hour_avg` below 0.5 on a breakout → `wait_confirmation`. A breakout or continuation entry is better supported when `volume_vs_hour_avg` or `feature_pack.per_tf.15m.volume_ratio_20` is at least 1.2; without either, prefer `wait_confirmation` over `now`.
+5. **Holder cost, `cgo_60` (prompt step 6).**
+   - `cgo_60` at or above +3: overhang / greed side. Recent buyers sit on gains and profit-taking pressure is likely; −0.05 confidence and no `now` for `trend_continuation` or `breakout`.
+   - `cgo_60` at or below −3: many underwater holders; capitulation may be near and a rebound is possible. It supports a `mean_reversion` read only when the 4h regime of step 1 holds, and is never an entry reason by itself.
+   - Between −3 and +3: no adjustment.
+6. **Stop fragility.** VWAP is never a stop reference (`sl_reference` allows only zone, kijun, atr, none). If `feature_pack.vwap_distance_pct` is positive and larger than the chosen `stop_pct`, price can reach the stop before even revisiting the session average. Mention this in `invalidation` and prefer `wait_pullback`, but do not change `noise_check`: it is exactly `feature_pack.noise_ok_2pct` true AND `stop_pct` at or above `feature_pack.noise_floor_stop_pct`, and gate G1 recomputes it from those fields.
 
 ## Open positions
 
-- Price has fallen more than 1.0% below the session VWAP (`vwap_distance_pct` < −1.0) after an entry made above it, with `volume_vs_hour_avg` ≥ 1.5 → report the deterioration in `evidence`; set `exit_flag: true` only if the `position.thesis` text you receive mentions VWAP or a structure label (`smc_1h.structure`, `per_tf.1h.vote`) also turned bearish.
-- A spike in `abnormal_volume_multiple` ≥ 4 on a bar closing lower is a distribution warning; mention it in `exit_reason` when combined with a structure break.
+The `position` block carries `entry_price`, `stop_loss_price`, `take_profit_price`, `last_mark`, `unrealized_pct`, `bars_held` and `opened_ts`; it has no thesis and no confidence. Intraday fields never set `exit_flag` on their own; only the prompt's step 10 conditions do. Use them as context:
 
-## What NOT to do
+- `feature_pack.vwap_distance_pct` below −1.0 with `feature_pack.volume_vs_hour_avg` at or above 1.5 is selling pressure: name it in `invalidation`, and in `exit_reason` when a step 10 condition also fires.
+- `feature_pack.abnormal_volume_multiple` at or above 4 while `position.unrealized_pct` is falling suggests distribution; treat it the same way.
 
-- Do not reconstruct VWAP, TWAP or hourly volume profiles from `last_closes_1h`; those closes have no volume attached and are for shape only.
-- Do not use `change_24h_pct` as a momentum signal by itself; a large positive value is a chase warning, not a reason to buy.
-- Do not translate "below VWAP" into a short. Below-VWAP weakness is `flat`, `avoid` or `exit_flag`.
-- Do not request more bars, other intervals or tick data; the labels are all that exists.
-- Do not treat `None` labels as neutral confirmation; if `vwap_distance_pct` or the volume fields are missing, say so in `evidence` and keep `timing: "wait_confirmation"`.
+## What not to do
 
-## Output mapping summary
+- Do not rebuild VWAP or a volume profile from `feature_pack.last_closes_1h`; those closes carry no volume.
+- Do not use `feature_pack.change_24h_pct` as momentum; a large positive value is a chase warning, not a buy reason.
+- Do not translate below-VWAP weakness into a short. It is `flat`, `avoid`, a `wait_*` timing, or a holding's invalidation note.
+- Do not ask for more bars or tick data; the labels are all that exists.
+- Do not read null intraday fields as neutral confirmation. If `vwap_distance_pct` or the volume fields are null, say so and avoid `now`.
 
-`timing` (now / wait_pullback / wait_confirmation), `confidence` caps and adjustments, `score` ±1 per row above, `direction` downgrade on thin spikes, `noise_check: false` when the stop sits inside VWAP rotation, `invalidation` phrasing, `exit_flag` / `exit_reason` for positions, and `evidence` items such as `vwap_distance_pct: 0.4`, `volume_vs_hour_avg: 1.6`, `abnormal_volume_multiple: 3.4`, `cgo_60: -12`.
+## Evidence
+
+Each item is `<field path>: <value> — <짧은 한국어 해석>`, for example `feature_pack.vwap_distance_pct: 1.8 — 세션 VWAP 대비 과열, 추격 매수` or `feature_pack.cgo_60: -3.6 — 손실 보유자 다수, 반등 여지`. Intraday items rarely deserve more than one of the three slots. `invalidation` examples: a 15m close back below the session VWAP, or `feature_pack.volume_vs_hour_avg` staying below 1.0 after a breakout. Free text is Korean; enum values stay exactly as the schema spells them.

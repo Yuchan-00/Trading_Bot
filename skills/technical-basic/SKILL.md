@@ -1,55 +1,64 @@
 ---
 name: technical-basic
-description: 추세(EMA/ADX)·평균회귀(볼린저/RSI)·거래량(OBV) 3축 투표 규칙으로 feature_pack 라벨을 읽고 long/flat/avoid 방향과 셋업 유형을 정하는 기본 기술분석 절차
+description: 추세(EMA/ADX/MACD)·평균회귀(RSI/볼린저)·거래량(OBV) 3축 라벨을 시간대별로 읽어 레짐·셋업·타이밍을 정하는 기본 기술분석 절차 (점수·확신도·손절·목표는 역할 프롬프트 규칙을 따름)
 roles: [technical]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/technical-basic/SKILL.md (MIT)"
 license: MIT
 ---
-# Three-axis technical vote
+# Three-axis label read
 
-## When to apply
+## Purpose
 
-Use this on every call. It is your baseline read of `feature_pack.per_tf` before Ichimoku, candlestick, SMC or volatility refinements. The three axes are computed in code and labelled per timeframe (`per_tf.15m`, `per_tf.1h`, `per_tf.4h`, `per_tf.1d` when present). Combine the labels, do not recompute them. You never see candles beyond `last_closes_1h`, so any claim about a moving average, RSI or OBV must point at the label field carrying it.
+Baseline read before the other technical skills. Every indicator is already computed and labelled by code in `feature_pack.per_tf.<tf>` (keys `15m`, `1h`, `4h`, `1d`, only the ones available). You interpret labels; you never rebuild an indicator from `feature_pack.last_closes_1h`.
 
-## The three axes and their fields
+Precedence: your role prompt (technical.md) governs. The score recipe (step 7), confidence recipe (step 8), stop/target formulas (step 9), noise test (step 5) and exit conditions (step 10) live there and are not restated or changed here. This skill explains the labels and how to weigh them.
 
-| Axis | Fields | Bullish reading | Bearish / blocking reading |
+## The three axes
+
+Each `feature_pack.per_tf.<tf>` row carries:
+
+| Axis | Fields | Supports a long | Argues against |
 |---|---|---|---|
-| Trend | `ema_state`, `adx_14`, `macd_hist_sign`, `price_vs_ema20_pct` | `ema_state == bull_aligned` with `adx_14 > 20` (strong above 25) and `macd_hist_sign == pos` | `bear_aligned`, or `mixed` with `adx_14 < 20` (no trend to follow) |
-| Mean reversion | `rsi_14`, `rsi_5`, `bb_position` | `rsi_14 < 30` and `bb_position < 0.05` (stretched below the band) | `rsi_14 > 70` or `bb_position > 0.95` (stretched above: never buy here) |
-| Volume | `obv_trend`, `volume_ratio_20` | `obv_trend == up`; `volume_ratio_20 >= 1.0` confirms | `obv_trend == down`, or `volume_ratio_20 < 0.5` on a breakout bar (unconfirmed) |
+| Trend | `ema_state`, `adx_14`, `macd_hist_sign`, `price_vs_ema20_pct` | `ema_state` bull_aligned, `adx_14` above 20, `macd_hist_sign` pos | `ema_state` bear_aligned; mixed with `adx_14` below 20 is "no trend" |
+| Mean reversion | `rsi_14`, `rsi_5`, `bb_position` | `rsi_14` below 30 with `bb_position` below 0.05 (stretched under the lower band) | `rsi_14` above 70 or `bb_position` above 0.95 (stretched near or over the upper band) |
+| Volume | `obv_trend`, `volume_ratio_20` | `obv_trend` up; `volume_ratio_20` at or above 1.0 | `obv_trend` down; a breakout bar with `volume_ratio_20` below 0.5 |
 
-The code summarises each timeframe in `vote` with values `trend_up`, `trend_down`, `mean_reversion_long`, `mean_reversion_short`, `none`. Treat `vote` as the primary input and the raw labels as the explanation of it.
+The code condenses each row into `vote` (trend_up / trend_down / mean_reversion_long / mean_reversion_short / none) with conjunctive rules: trend_up needs bull_aligned, `adx_14` above 20 and `macd_hist_sign` pos (trend_down mirrors it); mean_reversion_long needs `rsi_14` below 30 and `bb_position` below 0.05; mean_reversion_short needs `rsi_14` above 70 and `bb_position` above 0.95. Treat `vote` as the primary fact and the raw labels as its explanation.
 
-## Procedure
+## How the timeframes divide the work
 
-1. Read the 4h row first. It sets the regime: `bull_aligned` allows new entries; `mixed` allows them only with `per_tf.1d.ema_state == bull_aligned` (the same condition code uses for `mtf_agreement`), otherwise `flat`; `bear_aligned` allows nothing new.
-2. Read the 1h row for the setup. `trend_up` → candidate `setup_type: trend_continuation`. `mean_reversion_long` → candidate `setup_type: mean_reversion`. `trend_down` or `mean_reversion_short` → `direction: avoid` for entries.
-3. Read the 15m row for timing. `trend_up` or `none` with `obv_trend != down` → `timing: now`. A 15m `trend_down` against a 1h long setup → `timing: wait_pullback` (do not buy into a falling intraday leg). `rsi_5 > 80` on 15m → `timing: wait_pullback`.
-4. Apply the volume gate. A long requires `obv_trend` of `up` or `flat` on 1h; `down` on 1h and 4h together downgrades the direction to `flat`.
-5. Apply the overbought veto. If 1h or 4h shows `rsi_14 > 70` or `bb_position > 0.95`, the direction is at most `flat` regardless of the trend axis. This is the one rule that overrides everything else on the long side.
-6. Copy `feature_pack.mtf_agreement` into the output field `mtf_agreement` unchanged. Do not derive your own version; the code definition is the contract the entry gate checks.
-7. Build `score` in −5..+5: start at 0; +2 for 4h `bull_aligned` (or 4h `mixed` with 1d `bull_aligned`); +1 for 1h `vote` in {`trend_up`, `mean_reversion_long`}; +1 for 1h `obv_trend == up`; +1 for 15m `vote != trend_down`. Mirror with negatives for the bearish readings. A long needs `score >= 3`; `score <= 0` means `direction: flat`; `score <= -3` means `direction: avoid`.
-8. Set `confidence` with the role prompt's step 8 recipe only (0.50 base, +0.10 `mtf_agreement`, the Ichimoku/SMC increments named there, step 5-6 deductions, cap 0.90). `adx_14` and `volume_ratio_20` inform `score` and `timing`, not confidence. A missing `per_tf.4h` or `unknown` axis falls under the prompt's data check (`flat`, confidence ≤ 0.3). Do not inflate a marginal read past 0.55.
+- **4h = regime.** `feature_pack.per_tf.4h.ema_state` bull_aligned permits a new long; mixed permits one only when `feature_pack.per_tf.1d.ema_state` is bull_aligned (the same condition code uses for `mtf_agreement`); bear_aligned permits nothing new. The Ichimoku cloud condition of prompt step 1 must also hold.
+- **1h = setup.** `feature_pack.per_tf.1h.vote` maps to `setup_type` as in prompt step 2: trend_up → trend_continuation, mean_reversion_long → mean_reversion, trend_down or mean_reversion_short → no new entry. Breakout is decided by the SMC rule in step 2, not by this skill.
+- **15m = entry bar.** `feature_pack.per_tf.15m.vote` trend_down against a 1h long setup means do not buy into a falling intraday leg: no `now`, use `wait_pullback`. A 15m `rsi_5` above 80 is a stretch worth naming in `invalidation`; prompt steps 3–6 set `timing`.
 
-## Stop and target
+## Weighing rules inside the prompt steps
 
-- Mean-reversion long: stop below the band excursion. Use `atr_pct_1h`: `stop_pct = min(2.0, 1.5 * atr_pct_1h)`, `sl_reference: atr`, `stop_candidate_price = price * (1 - stop_pct/100)`. Target the band midpoint: `tp_pct = min(4.0, 2 * stop_pct)`.
-- Trend continuation: prefer a structural level from the SMC labels if one sits within 2% (`sl_reference: zone`); otherwise the ATR rule above. Target `tp_pct` at most 4.0 and at least 1.5 × `stop_pct`; if that ratio cannot be met inside the caps, set `timing: wait_pullback` instead of widening the target.
-- `noise_check` is true only when `1.5 * atr_pct_1h < 2.0`, i.e. the cap-level stop sits outside one normal hourly swing. When it is false, the entry cannot pass, so say so in `invalidation` and keep `direction: flat`.
+1. **Volume gate.** A long wants `feature_pack.per_tf.1h.obv_trend` up or flat. When 1h and 4h `obv_trend` are both down, the volume axis contradicts the trend axis; keep the step 7 score unchanged, name the contradiction in `invalidation` and prefer `flat` or a `wait_*` timing.
+2. **Overbought caution.** On 1h, `rsi_14` above 70 or `bb_position` above 0.95 while the vote is still trend_up means the move is extended: no `now` (use `wait_pullback`). If both conditions hold the code vote is already mean_reversion_short and prompt step 2 forbids an entry.
+3. **Trend strength.** `adx_14` and `volume_ratio_20` shape timing and your trust in the vote; they add no confidence increment of their own. Confidence comes only from the prompt's step 8 recipe.
+4. **mtf_agreement.** Copy `feature_pack.mtf_agreement` unchanged into the output. Never derive your own version; the gate checks the code definition.
+5. **Missing rows.** A missing `feature_pack.per_tf.4h` or an `unknown` `ema_state` triggers the prompt's data check (step 0). Missing is never neutral.
+
+## Stops and noise
+
+Use the prompt's step 9 formulas only: zone stop when the SMC demand zone qualifies, otherwise `stop_pct` = min(1.5 × `feature_pack.atr_pct_1h`, 2.0) with `sl_reference` atr, and `tp_pct` = min(4.0, max(2 × `stop_pct`, 1.5 × `stop_pct` + 0.75)). Net R:R = (`tp_pct` − 0.30) / (`stop_pct` + 0.30) must be at least 1.5; if a closer target breaks it, tighten the stop only, never widen it.
+
+`noise_check` is `feature_pack.noise_ok_2pct` true AND `stop_pct` at or above `feature_pack.noise_floor_stop_pct`. Do not substitute your own ATR arithmetic: code gate G1 recomputes the same test, so a pass the fields do not support is simply wrong. When it is false, confidence is at most 0.50 and timing is `wait_pullback`.
 
 ## Open positions
 
-When the payload carries a position, the question changes from "enter?" to "is the structure that justified the entry still intact?". Set `exit_flag: true` with a Korean `exit_reason` when 1h `vote` has flipped to `trend_down` or `mean_reversion_short`, when 4h `ema_state` turned `bear_aligned`, or when the stored invalidation text is now satisfied by the labels. A merely `mixed` 4h with an intact 1h read is a hold, not an exit.
+The payload's `position` block has `entry_price`, `stop_loss_price`, `take_profit_price`, `last_mark`, `unrealized_pct`, `bars_held`, `opened_ts` and nothing else: no thesis, no confidence. Your hold/exit read rests on the feature pack and those numbers.
+
+Set `exit_flag` true only on the prompt's step 10 conditions. Three-axis deterioration that falls short of them (1h vote flipping to trend_down while the 4h cloud still holds, 4h `ema_state` turning mixed or bear_aligned) is not an exit by itself: name it in `invalidation` as the condition that would become one. A mixed 4h with an intact 1h read is a hold.
 
 ## What not to do
 
-- Do not infer a trend from `last_closes_1h` when `ema_state` disagrees; the closes are context for the stop, not a second indicator.
-- Do not output `direction: long` on a `mean_reversion_short` or `trend_down` 1h vote because "it is oversold on 15m".
-- Do not describe anything as a short, a sell signal to profit from, or a hedge. Bearish evidence becomes `flat`, `avoid`, or `exit_flag`.
-- Do not quote numbers that are not in the pack, and do not round a threshold in your favour.
+- Do not infer a trend from `feature_pack.last_closes_1h` when `ema_state` disagrees; the closes are context only.
+- Do not call a long on a trend_down or mean_reversion_short 1h vote because the 15m looks oversold.
+- Do not describe anything as a short or a hedge. Bearish evidence becomes `flat`, `avoid`, a `wait_*` timing, or `exit_flag`.
+- Do not quote a number absent from the payload or round a threshold in your favour.
 
-## Output discipline
+## Evidence
 
-Every entry in `evidence` (max 3) names the field it rests on, for example `per_tf.1h.vote: trend_up`, `per_tf.4h.ema_state: bull_aligned`, `per_tf.15m.obv_trend: up`. `invalidation` is one Korean sentence in market terms that a later cycle can check against the same labels (which field, which value flips the read). `exit_reason` and `invalidation` are Korean; enum fields keep their English values exactly as listed in the schema.
+At most three items, each `<field path>: <value> — <짧은 한국어 해석>`, with the full path, for example `feature_pack.per_tf.1h.vote: trend_up — 1시간 추세 상승 투표` or `feature_pack.per_tf.4h.ema_state: bull_aligned — 4시간 정배열`. `invalidation` is one Korean sentence naming the field and value whose change voids the read. All free text is Korean; enum values stay exactly as the schema spells them.

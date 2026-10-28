@@ -1,68 +1,86 @@
 ---
 name: trade-journal
-description: 코드가 계산한 네 가지 행동 편향 심각도(처분효과·과매매·추격·앵커링)와 청산 기록을 읽어, 저널은 사후분석·일일 리뷰를 쓰고 리스크 관리자는 확신도 하한·진입 중단으로 반영하는 매매일지 규약
+description: 코드가 계산한 네 가지 행동 편향 심각도(처분효과·과매매·추격·앵커링)와 청산 기록을 읽어, 저널은 사후분석·일일 리뷰를 쓰고 리스크 관리자는 역할 프롬프트의 확신도 하한·진입 중단 규칙 안에서 반영하는 매매일지 규약
 roles: [risk_manager, journal]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/trade-journal/SKILL.md (MIT)"
 license: MIT
 ---
-# Trade journal: reading the bot's own behaviour back to it
+# Trade journal: feeding the bot's own behaviour back to it
 
-## Why this exists
+## Purpose
 
-The journal table turns closed trades into four behavioural diagnoses with severities so the two readers can react: the journal explains, the risk manager tightens. You never compute these numbers; they arrive as labelled fields and your job is to interpret them.
+Code turns closed trades into four behaviour diagnoses, each with a severity. The journal explains them and the risk manager tightens on them. You never compute these numbers. You read the labels and interpret them. Your role prompt holds the binding rules: floors, pause conditions, the lesson-tag order and the action-item list. This skill adds the reading.
 
-## The four diagnostics (code-computed, fixed definitions)
+## Where the severities sit (SPEC v2.1 §20.3a)
 
-All four are computed over closed trades only; open positions never count. Severity enum: `none` / `mild` / `severe` / `insufficient_sample`.
+- risk_manager: `account_pack.bias_severities.{disposition, overtrading, chasing, anchoring}` and `account_pack.noise_trade_share` (null when fewer than 5 trades).
+- journal (daily): `metrics_table.bias_severities.*`, `metrics_table.attribution_buckets.*`, `metrics_table.by_exit_reason.*`.
+- journal (post_trade): there are no severities. Use `trade.*`, `trade.thesis.*`, `thesis_history[]` and `verdicts.*`.
 
-| key | metric | mild | severe |
+## The four diagnoses (fixed code definitions)
+
+Code computes them over closed trades only. Each takes one of `none`, `mild`, `severe` or `insufficient_sample`.
+
+| key | what code measures | mild | severe |
 |---|---|---|---|
-| `disposition` | mean hold time of losers ÷ mean hold time of winners | ≥ 1.2 | ≥ 1.5 |
-| `overtrading` | closed trades per calendar day | > 8 | > 12 |
-| `chasing` | share of entries placed after a 1h move of +3% or more | > 30% | > 50% |
-| `anchoring` | share of exits within ±0.3% of the entry price | > 30% | — |
+| `disposition` | average hold time of losing trades divided by that of winning trades | ≥ 1.2 | ≥ 1.5 |
+| `overtrading` | closed trades per active day | > 8 | > 12 |
+| `chasing` | share of entries made after a 1h return of +3% or more | > 30% | > 50% |
+| `anchoring` | share of exits within ±0.3% of the entry price | > 30% | > 50% |
 
-Fewer than 20 closed trades → every key is `insufficient_sample`. That value means "unknown", not "fine".
+With fewer than 20 closed trades, or too little data for one key, that key reads `insufficient_sample`. Read it as unknown, never as fine.
 
-Reading them: `disposition` severe with many `time_stop` exits means the thesis review is too lenient; `overtrading` above 8 a day with max 3 positions means entries are recycled through cooldowns; `chasing` means the spike filters and the head's `debias.chasing_spike` are leaking; `anchoring` means positions are closed to get out flat rather than on the thesis.
+What each one says about the process:
+- `disposition`: losers are held longer than winners, so the thesis review is lenient.
+- `overtrading`: entries are being recycled through cooldowns.
+- `chasing`: spike filters and the head's `debias.chasing_spike` are leaking.
+- `anchoring`: exits are being made to get out flat rather than on the thesis.
 
-## risk_manager: how the severities change your output
+## risk_manager: how the severities feed your output
 
-The severities come in `account_pack.bias_severities` (keys above) together with `account_pack.noise_trade_share`. Apply them once per call, before judging individual candidates:
+Apply them once per call, before the candidates. The prompt's section 3A sets the numbers:
+- `chasing` or `overtrading` severe gives a `confidence_floor` of 0.75.
+- `decay_state` = decayed together with `overtrading` severe pauses entries.
+- No other severity or decay combination pauses entries; the prompt's other pause triggers (regime, drawdown, losses, exposure) still apply.
 
-1. `chasing` severe or `overtrading` severe → set `global.confidence_floor` to 0.75 (never below 0.65, never above 1.0) and say which key triggered it in `global.portfolio_note`.
-2. Both severe at once → in addition set `global.entries_paused: true` with `pause_reason` naming both fields. Open positions are still reviewed as usual.
-3. `chasing` mild → any candidate whose `technical.timing` is not `now`, or whose `bear.strongest_point` describes a spike already under way, is downgraded from `approve` to `conditional` with a condition in `conditions[]` that the entry waits for `technical.timing` = `now`. You receive no 24h change or volume figures; the scanner's spike exclusion handles those in code.
-4. `disposition` severe → when scoring open positions, treat every `weakening` assumption as one notch worse in `positions[].assumption_status[]` and name the severity in `positions[].reason`. Do not invent broken assumptions; only tighten the ambiguity.
-5. `anchoring` mild or severe → in `required_monitoring[]` of each approved candidate write that the exit must be judged on the thesis, not on `unrealized_pct` near zero.
-6. `insufficient_sample` → change nothing; mention only that the sample is below 20 if the floor needs explaining.
+Gate G3 applies the same inputs again in code.
 
-Record what you applied in `risk_note` (Korean, ≤ 2 sentences).
+Beyond those numbers, the severities shape your wording and conditions:
+
+1. `chasing` mild or severe: a candidate whose `candidates[].bear.strongest_point` describes a spike already under way gets an entry in `conditions[]` saying "candidates[].technical.timing: now 확인 후 진입". You have no 24h change figure, so do not cite one.
+2. `disposition` severe: when you re-assess open positions, an ambiguous or null field never resolves to `holding`; it is at least `weakening`. Name the severity in `positions[].reason`. Do not invent broken assumptions.
+3. `anchoring` mild or severe: in each approved candidate's `required_monitoring[]`, write that the exit is judged on the thesis, not on `unrealized_pct` near zero.
+4. `account_pack.noise_trade_share` is high: stops are sitting inside noise. Say so in `risk_note` and keep the noise checks strict. Never widen a stop beyond `technical.stop_pct`.
+5. `insufficient_sample`: change nothing, and mention the small sample only if a floor needs explaining.
+
+Record what you applied in `risk_note` (Korean, at most 2 sentences), in the format "<field path>: <value> — <짧은 한국어 해석>".
 
 ## journal: post-trade review
 
-For each closed trade you receive `trade` (entry, exit, fees, `pnl_pct`, `bars_held`, `reason` ∈ `stop_loss` / `take_profit` / `time_stop` / `head_sell` / `kill_switch` / `manual` / `partial`), the thesis snapshot, the cycle-by-cycle health history and the bull/bear/risk verdicts. Produce `JournalPostTrade`:
+Follow the prompt's steps 1 to 6, which set the assumption order, the `broken_assumption` rule, the `near_miss_rules` list and the `lesson_tag` order, where the first match wins. Reading notes:
 
-- `summary_bullets` (3 to 5, Korean): what the entry assumed, what happened, how it ended. Numbers come only from `trade`.
-- `assumptions_at_exit[]`: one entry per stored assumption with `status` from the last health evaluation; use `unknown` when the history has no reading.
-- `broken_assumption`: the first assumption whose status reached `broken`, or `null`.
-- `near_miss_rules[]`: hard rules the trade brushed against (stop within 0.3% of being hit, `bars_held` within 4 bars of the 96-bar time stop). Empty if none.
-- `lesson` (≤ 2 sentences) and `lesson_tag`: pick the enum from the evidence, not the P&L. A winner that exited on `time_stop` is `time_stop`, not `good_exit`. A loser whose entry followed a +3% hourly run is `chased_spike` even if the thesis also broke.
-- `telegram_text` (≤ 400 characters, Korean): symbol, result, the tag, one line of lesson.
+- A winner that closed on `time_stop` is tagged `time_stop`, not `good_exit`.
+- The chasing evidence in a post-trade review is `verdicts.head.debias_chasing_spike`, or a spike named in `verdicts.bear.strongest_point`. No pre-entry return field is present, so do not claim one.
+- A loss where every `thesis_history[].assumption_status` stayed `holding` points to the stop or to noise, not to the thesis.
+- Take numbers only from `trade.*` and `thesis_history[]`.
 
 ## journal: daily review
 
-The daily call gives you `metrics_table` and `closed_count`. Produce `JournalDaily`:
+- Cite the severities as `metrics_table.bias_severities.<key>`, and pair each one with the bucket that shows its effect:
+  - `chasing` with `metrics_table.attribution_buckets.stop_losses`;
+  - `disposition` with `metrics_table.attribution_buckets.time_stops`;
+  - `anchoring` with `metrics_table.attribution_buckets.noise_trades`.
+- Action items follow the prompt's step 10: `closed_count` ≥ 20, `decay_state` ≠ `insufficient_sample`, tightening only, and only on the prompt's configurable list. Use these mappings:
+  - `chasing` severe → raise the confidence floor or lower the number of candidates per cycle;
+  - `overtrading` severe → more cooldown cycles;
+  - `disposition` severe → no parameter to tune; report it as a thesis-discipline risk;
+  - `anchoring` → same, no parameter.
+- If every severity is `none` and `metrics_table.by_exit_reason.kill_switch` holds the losses, the code decided the day. Propose nothing and say so in `abstain_reason`.
 
-- If `closed_count` < 20: `abstain_reason` set, `do_not_change_yet: true`, `action_items` empty, `risks` still ≥ 3.
-- Otherwise `what_worked` / `what_failed` each cite a `metrics_table` key with its value, `risks` ≥ 3 and `action_items` ≥ 2 as `{param, from_value, to_value, reason}`. Only propose parameters that exist in the bot's config (cooldown cycles, confidence floor, candidates per cycle, time-stop bars, minimum volume ratio). Suggested mappings: `chasing` severe → raise the scanner's spike exclusion or require `timing: wait_pullback`; `overtrading` severe → extend the cooldown; `disposition` severe → shorten the time stop; `anchoring` → nothing to tune, flag it as a thesis-discipline issue.
-- When every severity is `none`, or `by_exit_reason` shows the losses sitting in `kill_switch` (the code decided the day), propose no action items and say so in `abstain_reason`; `do_not_change_yet` then becomes true by the prompt's rule.
-- `telegram_text` (Korean): P&L, hit rate, the worst severity, and whether action items exist.
+## Do not
 
-## What not to do
-
-- Do not compute win rate, hold ratios, chase shares or any statistic yourself; if a number is not in the input, write "자료 없음" rather than estimating.
-- Do not read `insufficient_sample` as healthy, and do not call for parameter changes from it.
-- Do not recommend shorting, hedging, adding to losers or widening the 2% stop / 4% take-profit; none of these exist in this bot.
-- Do not let a profitable day soften a `severe` severity; the diagnosis is about process, not outcome.
+- Do not compute win rates, hold ratios, chase shares or any other statistic. Write "자료 없음" when a number is absent.
+- Do not treat `insufficient_sample` as healthy, and do not tune parameters from it.
+- Do not suggest shorting, hedging, averaging down, or widening the 2% stop or the 4% take-profit.
+- Do not let a profitable day soften a `severe` reading. The diagnosis is about process, not outcome.

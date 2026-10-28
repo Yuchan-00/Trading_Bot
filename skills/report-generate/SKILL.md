@@ -1,6 +1,6 @@
 ---
 name: report-generate
-description: 코드가 계산한 청산 기록·일일 지표표를 결론 우선·숫자 근거·양면 서술·행동 가능한 항목으로 압축해 사후분석과 일일 리뷰(텔레그램 요약 포함)를 쓰는 보고서 작성 규약
+description: 코드가 계산한 청산 기록·일일 지표표를 결론 우선·필드 근거·양면 서술·행동 가능한 항목으로 압축해 사후분석과 일일 리뷰(텔레그램 요약 포함)를 쓰는 보고서 작성 규약(절차·태그 순서는 역할 프롬프트 우선)
 roles: [journal]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/report-generate/SKILL.md (MIT)"
@@ -8,53 +8,77 @@ license: MIT
 ---
 # Report writing discipline for the journal role
 
-## Why this exists
+## Purpose
 
-You fill two fixed JSON schemas (`JournalPostTrade`, `JournalDaily`) whose text fields are rendered to Telegram and the dashboard. This skill is the writing discipline: conclusion first, every claim tied to a code-produced number, both sides argued, ranges instead of false precision, and a bounded action or an explicit refusal to act.
+You fill two fixed schemas, `JournalPostTrade` and `JournalDaily`. Their text goes to Telegram and the dashboard. Your role prompt sets the order of steps, the lesson-tag order, the abstain rule and the layout of `telegram_text`. This skill sets how the text is written: conclusion first, every claim tied to a code-computed field, both sides argued, hedged forward statements, and either a bounded action or an explicit refusal to act.
 
-## When to apply
+## Inputs by mode (SPEC v2.1 §20.3a.7)
 
-- After every closed trade: input is the closed trade record, the stored thesis snapshot, the cycle-by-cycle thesis-health history, the bull/bear/risk verdicts and the exit reason.
-- Once a day: input is the code-computed metrics table (returns, BTC buy-and-hold benchmark, win rate, profit factor, Sharpe/Sortino/Calmar, max drawdown, bias severities, attribution buckets, gate statistics, decay state, LLM calls and cost) plus `closed_count`.
+- post_trade:
+  - `trade.*`, including `trade.trade_id`, `trade.reason`, `trade.pnl_pct`, `trade.bars_held` and `trade.confidence`;
+  - `trade.thesis.{reasons, assumptions, red_lines, horizon_bars}`;
+  - `thesis_history[]` with `{cycle, health, assumption_status, red_line_hits, action, exit_flag, unrealized_pct}`;
+  - `verdicts.{technical, bull, bear, risk, head, channel_agreement, news_risk_after_entry}`.
+- daily: `closed_count` and `metrics_table.*` (returns, trade_stats, by_exit_reason, by_symbol, by_setup, attribution_buckets, bias_severities, decay_state, gate_stats, llm, halts).
 
-## Core rules
+Do not cite a field from the other mode. The daily table does not exist in a post-trade call, and the reverse is also true.
 
-1. **Conclusion first.** The first `summary_bullets` element is the verdict in one sentence: a good or bad outcome of a good or bad decision. Three to five bullets, each stating a position (good / bad / unclear); never "mixed" without saying which side weighs more.
-2. **Every claim cites a field.** Each bullet, `what_worked` / `what_failed` entry or risk names the input field it rests on and quotes its value (`trade.pnl_pct`, `trade.bars_held`, `trade.reason`, `trade_stats.profit_factor`, `returns.max_drawdown_pct`, `bias_severities.chasing`). A sentence you cannot anchor to a field is deleted, not softened.
-3. **Chain the logic.** "Field X shows A, therefore judgment B, therefore action C." If a link is missing, stop at the last supported link and say so.
-4. **Argue both sides.** A winner still gets its luck factor named (did an assumption break while price saved it?). A loser still gets what was done correctly (stop respected, exit matched the thesis).
-5. **Ranges, not points.** Forward-looking statements use bands and hedged verbs ("may", "appears"), never "will" or "certain".
-6. **Numbers come only from the input.** Never compute returns, Sharpe, win rate or drawdown yourself, never extrapolate from the 20 hourly closes. If two fields disagree, report that as a risk instead of choosing one.
-7. **Internal consistency.** `telegram_text` must not contradict the bullets; `lesson_tag` must match `lesson`; `do_not_change_yet` must agree with whether `action_items` is empty.
+## Writing rules
 
-## Post-trade procedure (`JournalPostTrade`)
+1. **Conclusion first.** The first `summary_bullets` item is a one-sentence verdict. It classifies the trade as a good or bad decision with a good or bad outcome. Every bullet takes a side. "Mixed" is allowed only when you say which side weighs more.
+2. **Every claim cites a field.** Bullets, `what_worked`/`what_failed` items and risks each name their path and value. Examples: "trade.bars_held: 11 — 기간의 절반에 손절", "metrics_table.trade_stats.profit_factor: 0.94 — 경계 구간". If a sentence has no field behind it, delete it rather than soften it.
+3. **Chain the logic.** Field shows A, so judgement B, so action C. Where a link is missing, stop at the last supported step and say so.
+4. **Argue both sides.** A winner still names its luck: did an assumption break while price rescued the trade? A loser still names what went right: the stop was respected, or the exit matched the thesis.
+5. **Hedge the future.** Write "할 수 있다" or "보인다" about what comes next, never "반드시". Give bands, not point forecasts.
+6. **Numbers come only from the input.** Never compute returns, ratios, win rates, drawdowns or times. Never do timestamp arithmetic; quote `trade.bars_held`. When two fields disagree, report the disagreement as a risk.
+7. **Stay consistent.**
+   - `telegram_text` must not contradict the bullets.
+   - `lesson_tag` must match `lesson`.
+   - `do_not_change_yet` and `abstain_reason` must agree with whether `action_items` is empty, as prompt step 11 requires.
 
-1. Set `trade_id` from the record verbatim.
-2. `summary_bullets`: verdict first; then the stored entry rationale; the exit path (`trade.reason`, `bars_held`, `pnl_pct` after fees); and the thesis-health trajectory from the history (for example 8 -> 6 -> 3).
-3. `assumptions_at_exit`: one entry per stored assumption with its last known status, `unknown` when the history does not cover it. Never invent assumptions absent from the snapshot.
-4. `broken_assumption`: the assumption that failed first, or `null`.
-5. `near_miss_rules`: limits or gates that were nearly hit (stop distance, position count, daily loss, time stop), each with the field and the margin. Empty when nothing was close.
-6. `lesson`: at most two sentences, a reusable rule, not a story.
-7. `lesson_tag`: the dominant cause. `good_exit` only when the exit matched the thesis and no assumption was broken; `stop_too_tight` only when the stop fired while every assumption was still holding; `time_stop`, `regime_exit`, `risk_exit` follow the exit reason; `other` when evidence is thin.
-8. `telegram_text`: up to 400 characters, verdict + P&L + one-line lesson, no field names.
+## Post-trade writing
 
-## Daily procedure (`JournalDaily`)
+- `trade_id`: copy it verbatim.
+- `summary_bullets`:
+  - the verdict;
+  - what the entry rested on (`verdicts.bull.thesis_points`, `verdicts.head.decisive_factor`);
+  - the bear warning and whether it happened (`verdicts.bear.strongest_point`);
+  - the health path from the first to the last `thesis_history[].health`, for example 9 → 7 → 5;
+  - the exit (`trade.reason`, `trade.pnl_pct`, `trade.bars_held`).
+- `assumptions_at_exit`: one entry per stored assumption, taken from the last `thesis_history[].assumption_status`. Use `unknown` when there is no reading, and never add an assumption that is not stored.
+- `broken_assumption`, `near_miss_rules` and `lesson_tag`: apply the prompt's rules in its order. Write the reason for the tag into `lesson`.
+- `lesson`: at most two sentences. Give a rule that carries over to future trades, and name the field that would have caught the problem. It is a rule, not a story.
+- No performance grade here; grades belong only to the daily table.
 
-1. `summary_bullets`: day verdict first, then return versus BTC, trade count and win rate, cost and call count, decay state.
-2. `what_worked` / `what_failed`: each entry carries one table number. Attribution buckets and gate statistics are the main source; a gate that blocked candidates whose counterfactual outcome was negative belongs in `what_worked`.
-3. `risks`: at least three, each with a trigger observable in tomorrow's table (for example "profit factor below 0.9 flips decay state to decayed"). Sample size is always a risk while `closed_count` is below 30.
-4. Grade the run in one bullet from table fields only, and only when the sample supports it: Sharpe and profit factor bands need `closed_count` of at least 30, a win-rate statement needs at least 50; below those, write "표본 부족" instead of a grade. When allowed: strong when Sharpe above 1.5 and drawdown well inside the -3% caution rung; acceptable when Sharpe above 1.0 and drawdown short of -4.5%; watch when Sharpe between 0.5 and 1.0; weak when Sharpe below 0.5 or any drawdown-ladder rung was hit. A grade describes; it never justifies loosening a limit.
-5. `action_items`: each names a `param`, `from_value`, `to_value` and a `reason` tied to a table field. Proposals may only tighten or hold (higher confidence floor, smaller size, shorter time stop, pausing a setup type); never raise a hard cap. At least two items when you act at all.
-6. Abstain rule: when `closed_count` is below 20, or decay state or bias severities read `insufficient_sample`, leave `action_items` empty, set `do_not_change_yet` to `true` and give `abstain_reason`. Still report findings; just recommend no parameter change.
-7. `telegram_text`: day verdict, return versus BTC, trade count, one risk, one action or the abstain reason.
+## Daily writing
 
-## What not to do
+- `summary_bullets`:
+  - the day's verdict;
+  - `metrics_table.returns.day_pnl_pct` against `btc_buy_hold_pct`;
+  - `trade_stats.closed_today` with `win_rate`;
+  - `returns.max_drawdown_pct`;
+  - `llm.cost_usd` against `budget_usd`;
+  - `decay_state`.
+- `what_worked` / `what_failed`: one table number each.
+  - Attribution buckets and gate statistics are the main sources.
+  - The table has no counterfactual P&L, so do not praise a gate for losses it avoided.
+- `risks`: at least three. Each risk carries a trigger that tomorrow's table can show, for example "metrics_table.trade_stats.profit_factor 0.9 미만이면 decay_state decayed 전환 가능". While `closed_count` is below 30, the small sample is always one of the risks.
+- **Grade.** Give one bullet, built only from table fields and only when the sample allows:
+  - use the performance-attribution bands, which need `closed_count` ≥ 30 for ratios and ≥ 50 for win rate;
+  - below that, write "표본 부족";
+  - a drawdown at or past a ladder rung (`returns.max_drawdown_pct` 3, 4.5 or 6) caps the grade at "watch".
+- `action_items`: follow the prompt's step 10. Items tighten only, use the configurable list only, and each `reason` cites a table path. If you act, aim for at least two items, as the prompt says; if you cannot, give none and fill `abstain_reason`.
 
-- No narrative, headings or disclaimers inside fields; the schema is the format.
-- No performance grading inside the post-trade review; only the daily table is graded.
-- No "short", "hedge" or "leverage" suggestions; directional advice is limited to "enter less", "do not enter", "exit sooner".
-- No speculation about events the input does not contain.
+## Telegram
+
+Use the line order the prompt gives for each mode. Keep it to 400 characters or fewer, use plain Korean, and do not paste raw field paths into the phone text. Values with their meaning are enough.
+
+## Do not
+
+- Do not put headings, narrative or disclaimers inside fields. The schema is the format.
+- Do not suggest shorting, hedging or leverage. Directional advice is limited to entering less, not entering, or exiting sooner.
+- Do not speculate about events the input does not contain.
 
 ## Language
 
-All free-text fields are written in Korean; enum values, field names and the `trade_id` stay exactly as given.
+Write every free-text field in Korean. Keep enum values, field names and `trade_id` exactly as given.

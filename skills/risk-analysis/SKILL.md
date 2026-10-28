@@ -1,6 +1,6 @@
 ---
 name: risk-analysis
-description: 코드가 계산한 risk_pack(VaR/CVaR·실현변동성·첨도·CVaR 사이즈)과 account_pack(낙폭·일손익·연패)을 손절 거리·사이즈 상한·거부권으로 옮기는 손실 양수 규약, 스트레스 점검, 금지 규칙
+description: 코드가 계산한 risk_packs(VaR/CVaR·실현변동성·첨도·역변동성/CVaR 사이즈)와 account_pack(낙폭 단계·일손익·연패·노출)을 손절 적합성·사이즈·거부권 판단으로 읽는 법 — 손실 양수 규약, 일관성 점검, 꼬리 위험 해석 (수치 규칙은 역할 프롬프트를 따름)
 roles: [risk_manager]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/risk-analysis/SKILL.md (MIT)"
@@ -8,55 +8,56 @@ license: MIT
 ---
 # Risk measurement for the veto
 
-## When to apply
+## Paths
 
-Apply to every candidate and open position in the batch. All numbers are precomputed; you interpret and size against them. Per symbol the pack carries:
+risk_manager only: `risk_packs[symbol].var95_1h_pct`, `.var99_1h_pct`, `.cvar95_1h_pct`, `.rv_20_pct`, `.rv_60_pct`, `.daily_vol_pct`, `.hv_pct_rank`, `.kurtosis`, `.inverse_vol_size_pct`, `.cvar_size_pct`, `.stop_vs_atr_noise_ok`; `account_pack.daily_pnl_pct`, `.drawdown_pct`, `.drawdown_ladder_level`, `.exposure_pct`, `.position_count`, `.consecutive_losses`, `.decay_state`; `candidates[].technical.stop_pct`, `.tp_pct`, `.noise_check`; `positions[].unrealized_pct`.
 
-- `var95_1h_pct`, `var99_1h_pct`, `cvar95_1h_pct`: historical one-bar (1h) loss quantiles over the recent 200 bars, in percent
-- `rv_20_pct`, `rv_60_pct`: annualised realised volatility; `daily_vol_pct`: one-day volatility from 96 hourly returns
-- `hv_pct_rank`: where current volatility sits in its own history (0–100); `kurtosis` of hourly returns
-- `inverse_vol_size_pct` = min(10, 0.5 / daily_vol_pct × 100); `cvar_size_pct` = min(10, 0.15 / cvar95_1h_pct × 100)
-- `stop_vs_atr_noise_ok`: true when 1.5 × ATR% on 1h is still under the 2% stop ceiling
+Precedence: your role prompt governs. Its steps 1–3 (global), 4 (hard blocks), 6 (stop, target, R:R) and 7 (size) are the rules. This skill explains what the risk numbers mean and how to tell when they cannot be trusted. Never compute VaR, volatility or drawdown yourself; only the prompt's arithmetic is allowed.
 
-The `account_pack` gives `equity`, `daily_pnl_pct`, `drawdown_pct`, `drawdown_ladder_level`, `exposure_pct`, `position_count`, `consecutive_losses`, `cooldowns`, `decay_state`, `bias_severities`. Per-symbol packs sit under `risk_packs[<symbol>]`; `positions[]` carries no size or stop level.
+## What the fields mean
+
+- `var95_1h_pct`, `var99_1h_pct`, `cvar95_1h_pct`: historical one-hour loss quantiles over the last 200 hourly bars, in %. CVaR95 is the average loss on the worst 5% of hours.
+- `rv_20_pct`, `rv_60_pct`: annualised realised volatility over short and longer windows; `daily_vol_pct`: one-day volatility from the last 96 hourly returns.
+- `hv_pct_rank`: where current volatility sits in its own history (0–100); `kurtosis`: tail heaviness of hourly returns.
+- `inverse_vol_size_pct` and `cvar_size_pct`: code-made size suggestions (both capped at 10). The prompt's starting size is the smaller of the two and 10.
+- `stop_vs_atr_noise_ok`: the 1h ATR noise band fits inside the 2% stop ceiling.
+- `account_pack.drawdown_ladder_level`: normal / caution / block / stop_all. The account pack has no position sizes or stop levels.
 
 ## Sign convention
 
-Read every VaR/CVaR/drawdown number as a loss magnitude: larger positive means larger loss. Never flip signs in your reasoning. Sanity checks before trusting a pack:
+Every VaR, CVaR and drawdown number is a loss magnitude: larger positive means larger loss. Never flip signs in your reasoning.
 
-- `cvar95_1h_pct` ≥ `var95_1h_pct` and `var99_1h_pct` ≥ `var95_1h_pct` must hold; otherwise the symbol's risk numbers are unreliable and you `veto` citing the inconsistency, not a made-up figure.
-- CVaR usually runs 1.3–1.8× VaR. Above 2, a few violent bars dominate the tail; near 1, the window is suspiciously quiet (fresh listing, dead market).
+## Is the pack trustworthy?
 
-VaR is a quantile, not a ceiling: one bar in twenty loses more, unboundedly. Size against CVaR, never VaR.
+- Ordering must hold: `cvar95_1h_pct` ≥ `var95_1h_pct` and `var99_1h_pct` ≥ `var95_1h_pct`. If not, the symbol's risk numbers are inconsistent; treat the item as contradictory under the prompt's abstain policy and name the fields.
+- CVaR usually sits modestly above VaR95. A CVaR far above VaR means a few violent hours dominate the tail; one barely above VaR means the window is suspiciously quiet (new listing, dead market). Say which in `risk_note` or a condition.
+- VaR is a quantile, not a ceiling: one hour in twenty loses more, without bound. Never size from VaR alone; the prompt sizes from the CVaR-based and volatility-based suggestions.
+- `null` is unknown, never small. A null `cvar95_1h_pct` or `exec_cost_pct`, or a missing pack, is a hard veto (prompt step 4). Other nulls lower your `confidence`; never fill them with a normal-distribution guess or scale a 1h number to a day.
 
-## Procedure per candidate
+## Reading the tail against the stop
 
-1. **Stop versus tail.** The stop sits at most 2% below entry. If `cvar95_1h_pct` ≥ the proposed `stop_pct`, an ordinary bad hour stops the trade out; demand a wider stop up to the 2% cap or, if `stop_vs_atr_noise_ok` is false, `veto` ("stop inside noise"). If `var99_1h_pct` > 2%, say in `conditions` that the stop is a noise filter, not tail protection, and cut size.
-2. **Size from the tail.** Start from `cvar_size_pct` (budget: a one-bar CVaR event costs ≤ 0.15% of equity). Cross-check with `inverse_vol_size_pct`; take the smaller, then apply external haircuts (fused regime ×0.5, `drawdown_ladder_level` at the caution step (the −3% rung) ×0.5, `decay_state == decayed` → consider 0). The result is `max_size_pct`; it can never exceed 10 and the code will clamp it again.
-3. **Daily budget.** A stop hit costs about `size × stop_pct`. With `daily_pnl_pct` already negative, require `|daily_pnl_pct| + size × stop_pct / 100 ≤ 3` so a single loss cannot trigger the daily halt; otherwise shrink `max_size_pct` until it fits or `veto`.
-4. **Fat tails.** `kurtosis` > 3 is the norm for crypto; above 8, or with `hv_pct_rank` > 90, treat `var95_1h_pct` as understated by roughly one-third and size from `var99_1h_pct` instead of `cvar95_1h_pct` if it is larger.
-5. **Volatility trend.** `rv_20_pct` > 1.5 × `rv_60_pct` means the recent window is wilder than the 200-bar history that produced the VaR; the VaR is stale on the low side. Add a condition tied to `rv_20_pct` and lower size one notch.
-6. **Net reward.** No fee field exists; use the fixed friction: `rr_net_estimate` = (`take_profit_pct` − 0.30) / (`stop_pct` + 0.30). Below 1.5, `conditional` at best; the code gate re-checks net R:R.
+- The stop comes from the technical channel and is never widened. If `cvar95_1h_pct` is at or above the proposed `stop_pct`, an ordinary bad hour stops the trade out. You cannot fix that by widening; note it in `required_monitoring` or `risk_note`. The verdict itself follows the prompt's steps 6 and 9; this observation never changes it on its own.
+- `var99_1h_pct` above 2 means the stop filters noise but gives no tail protection: one gap can exceed it. Say so in `required_monitoring`.
+- Fat tails: crypto `kurtosis` is normally well above a normal distribution's. The prompt's haircut (`kurtosis` > 6 or `hv_pct_rank` > 70) is the only size change for it, and `hv_pct_rank` > 80 blocks stop tightening.
+- `rv_20_pct` clearly above `rv_60_pct` means the recent window is wilder than the 200-bar history behind the VaR, so the VaR understates current risk. Note it in `required_monitoring`; no extra size rule.
+- `stop_vs_atr_noise_ok` or `technical.noise_check` not true is a hard veto (step 4). Code gate G1 recomputes noise, so never claim a pass those fields do not show.
 
-## Stress check for the book
+## Net reward
 
-No simulation and no per-position weights exist, so use the book figure `account_pack.exposure_pct` with three shocks: −10% in one hour (flash), −20% in a day, −40% liquidity vacuum. Worst-case loss (% of equity) ≈ `exposure_pct` × shock / 100, no credit for stops (they gap; at −40% they do not fill). Add it to `daily_pnl_pct` and compare with the −3% daily halt and the ladder (−3% caution: size halved, −4.5% no entries, −6% full stop). If the flash case crosses the next rung, set `global.exposure_cap_pct` to the current `exposure_pct` and say so in `portfolio_note`.
+Net R:R = (`take_profit_pct` − 0.30) / (`stop_pct` + 0.30), with 0.30% for round-trip fees and slippage. At 1.5 or above it passes; below that, the only repair is tightening the stop as the prompt describes, otherwise veto.
+
+## Account state
+
+- The daily halt is at −3% `daily_pnl_pct`; the ladder runs normal → caution → block → stop_all. With `daily_pnl_pct` already negative, one more stop-out may reach the halt; mention that in `portfolio_note` instead of inventing a new size formula.
+- Assume every holding falls together in a shock: crisis correlations go to one and stops gap. `account_pack.exposure_pct` is the honest measure of what a market-wide flash drop can cost; state it plainly when the book is near its cap.
+- Low risk numbers permit size; they never create a reason to enter.
 
 ## Open positions
 
-You do not see a holding's stop, but none is wider than the 2% ceiling: if the symbol's `cvar95_1h_pct` exceeds 2 (or 2 + `unrealized_pct` when under water), one ordinary bad hour clears any stop it can have: `assumption_status` includes `weakening`, `health` ≤ 5, `action: trim`. A `red_line_hits` entry or `assumption_status` containing `broken` from the code means `health` ≤ 3 and `action: exit`.
+You see no stop for a holding, but none is wider than 2%. If the symbol's `cvar95_1h_pct` now exceeds what is left between `unrealized_pct` and a 2% loss, an ordinary bad hour clears any stop it can have: evidence that a risk-related assumption is `weakening`. Compute `health` and `action` with the prompt's formula and rules; a code `red_line_hits` entry goes into `red_lines_triggered` verbatim.
 
-## What not to do
+## Output
 
-- Do not compute VaR, volatility or drawdown yourself from `last_closes_1h` or account history. If a number is `null`, say the metric is unavailable and size as if the tail were wide (`max_size_pct` ≤ 5) or `veto`.
-- Do not assume normality to fill a missing figure, and do not scale 1h VaR to a day by √24; crypto hours are autocorrelated.
-- Do not treat a low VaR as bullish; low risk numbers permit size, never create a reason to enter.
-- Do not loosen anything the code has set: stop ≤ 2, TP ≤ 4, size ≤ 10, floor ≥ 0.65; your outputs can only tighten.
-
-## Output fields
-
-- `candidates[].verdict`: `veto` when steps 1 or 3 fail or the pack is inconsistent; `conditional` when any haircut applied; `approve` only when all six steps pass unchanged.
-- `max_size_pct`, `stop_pct`, `take_profit_pct`, `rr_net_estimate` carry the numbers from the procedure, inside their ranges.
-- `veto_reasons` / `conditions` / `required_monitoring`: Korean, each naming the field it rests on (e.g. `risk_packs[symbol].cvar95_1h_pct`, `account_pack.daily_pnl_pct`).
-- `global.exposure_cap_pct`, `global.confidence_floor`, `global.entries_paused`: from the stress and ladder checks; `portfolio_note` and `risk_note` in Korean, two sentences at most.
-- `confidence`: lower it when packs contain `null` fields or failed sanity checks; never claim certainty the numbers did not give.
+- `veto_reasons`, `conditions`, `required_monitoring`: Korean, each `"<field path>: <value> — <짧은 한국어 해석>"`, e.g. `"risk_packs[symbol].cvar95_1h_pct: 1.4 — 평범한 나쁜 1시간에도 손절 1.2% 도달 가능"`.
+- `confidence` measures input completeness and follows the prompt's caps: ≤ 0.3 when every channel of a candidate is missing, otherwise ≤ 0.4 when any `risk_packs[symbol]`, `bull` or `bear` is null; the lower cap wins. Failed sanity checks lower it further.
+- Never loosen a hard limit: stop ≤ 2, target ≤ 4, size ≤ 10, floor ≥ 0.65.

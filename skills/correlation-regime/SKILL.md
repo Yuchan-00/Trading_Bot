@@ -1,6 +1,6 @@
 ---
 name: correlation-regime
-description: 코드가 계산한 regime_pack(상관 밀도·fused·macro_alarm·name_alarm)을 "시장이 한 덩어리인가, 누가 먼저 깨졌는가"로 읽어 진입 중단·사이즈 축소·확신도 하한 상향으로 옮기는 절차와 금지 규칙
+description: 코드가 계산한 레짐 스냅샷(상관 밀도·fused·btc_shock·macro_alarm·name_alarm)을 "시장이 한 덩어리인가, 누가 먼저 깨졌는가"로 읽어 약세 변론가는 regime_flip 경로로, 리스크 관리자는 진입 중단·사이즈·확신도 하한·보유 재평가로 옮기는 법 (수치 규칙은 역할 프롬프트를 따름)
 roles: [bear, risk_manager]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/correlation-regime/SKILL.md (MIT)"
@@ -8,66 +8,69 @@ license: MIT
 ---
 # Correlation regime: one bloc or many?
 
-## When to apply
+## Paths per role
 
-Apply on every call that carries the regime snapshot, computed in code from the watchlist's 1h returns; you never compute correlations yourself. This text says `regime_pack`; cite your payload's key (`regime` for the risk_manager; per-symbol fields under `risk_packs[<symbol>]`). Its fields:
+- bear: `regime.btc_regime_4h`, `regime.fused`, `regime.density`, `regime.verdict`, `regime.btc_shock`, `regime.name_alarm_symbols`; `corr_to_open` (holding → corr); `hv_pct`. The bear payload has no `avg_pairwise_corr_1h` and no `corr_to_btc_1h`.
+- risk_manager: `regime.*` (the same six plus `regime.avg_pairwise_corr_1h`); `risk_packs[symbol].corr_to_open_positions`, `risk_packs[symbol].corr_to_btc_1h`, `risk_packs[symbol].hv_pct_rank`.
 
-- `avg_pairwise_corr_1h`: mean of all pairwise 1h return correlations over the recent window
-- `density`: share of pairs whose correlation clears 0.7 (an "edge")
-- `fused`: true when `avg_pairwise_corr_1h` > 0.8
-- `btc_regime_4h`: `bull` / `bear` / `range` / `unknown` from the reference coin's 4h trend labels
-- `btc_shock`: the reference coin's last 1h move exceeded 2× its own 1h ATR
-- `name_alarm_symbols`: symbols whose last 1h move exceeded 3× their own ATR while the reference coin moved less than 1× its ATR (idiosyncratic break)
-- `verdict`: `normal` / `fused` / `macro_alarm` (macro_alarm = `btc_shock` ∧ `fused`)
+Precedence: your role prompt governs. The bear's step 2 (`regime_flip` bands) and step 5 (verdict), and the risk manager's steps 1–3 (pause, floor, exposure cap), 7 (size) and 10–12 (holdings) are the rules. This skill explains what the fields mean and how to read them together; it adds no extra numbers.
 
-Diversification across three spot positions exists only while pairs move independently. When density climbs, the book becomes one bet on the market and a stop on one position is effectively a stop on all. When one asset breaks alone while the reference coin is quiet, that asset is the story, not the market.
+## What the fields mean
 
-## Reading the state
+All values are code-computed from the watchlist's 1h returns. You never compute a correlation and never infer one from which coins rose together.
 
-Read with hysteresis in mind: a value just under a line is not "calm".
+- `density`: share of symbol pairs whose 1h correlation is above 0.7.
+- `avg_pairwise_corr_1h` (risk only): mean pairwise correlation; `fused` is true when it is above 0.8.
+- `btc_regime_4h`: bull / bear / range / unknown, from BTC's 4h trend (BTC is the regime benchmark).
+- `btc_shock`: BTC's last 1h move exceeded twice its own 1h ATR%.
+- `name_alarm_symbols`: symbols whose last 1h move exceeded three times their own ATR% while BTC moved less than one ATR%: a break specific to that coin.
+- `verdict`: normal / fused / macro_alarm; macro_alarm means `btc_shock` and `fused` at once. Under macro_alarm the scanner already empties the candidate list, and name-alarm symbols are already excluded from entry.
 
-| `density` / `avg_pairwise_corr_1h` | State | Meaning for a long-only book |
-|---|---|---|
-| density < 0.45 and avg corr < 0.65 | defused | pairwise independence usable; normal sizing |
-| density 0.45–0.65 or avg corr 0.65–0.8 | warming (dead band) | do not add a third correlated position; treat as fused if `btc_regime_4h == bear` |
-| `fused == true` | fused | the book is one position; halve size, raise the confidence floor |
-| `verdict == macro_alarm` | crisis | no new entries; every holding is reviewed for exit |
+## Why it matters for a long-only book
 
-High density with a moderate average means a sub-cluster is fused while the rest is loose; apply the fused rule to any candidate whose `corr_to_open_positions` entries exceed 0.8.
+Three spot positions diversify only while they move independently. When density rises, the book behaves like one bet on the market, and a stop on one holding is effectively a stop on all of them. When one coin breaks alone while BTC is quiet, the story is that coin, not the market.
 
-## Attribution: who broke first
+Read the state, not a single number:
 
-The code does a crude first-mover test for you. Read it with the abstention discipline of the original method: prefer no name to a wrong name.
+- `fused` false and `density` below 0.45: pairwise independence is usable.
+- `density` 0.45 or higher without `fused`: warming. A sub-group may already move as one; look at the candidate's own correlation to holdings.
+- `fused` true: the book is one position. De-gross; do not liquidate on this alone.
+- `verdict` macro_alarm: crisis; no new entries, and every holding is reviewed.
 
-- `btc_shock` true and `fused` true → macro shock. Nobody is "the culprit"; the whole book is exposed.
-- `name_alarm_symbols` non-empty and `btc_shock` false → idiosyncratic break. The scanner already blocks the named symbol from entry; as a holding it is an exit candidate; anything correlated > 0.8 with it is contaminated.
-- `btc_shock` true, `fused` false → a reference-coin move not yet propagated; expect it within a few bars, so alts are in a "wait" state, not a calm one.
-- Nothing set → abstain from attribution; absence of an alarm is not evidence of safety.
+A value just under a line is not calm; mention it, but apply the prompt's thresholds exactly as written.
 
-The 3×ATR rule is coarse: read `name_alarm_symbols` as "watch or worse", not proof of collapse.
+## Who broke first
 
-## What a fused regime is NOT
+Prefer no attribution to a wrong one.
 
-The regime state cannot time a top: fusion is confirmed after the first leg down, and the source found that exiting on regime onset lost to a plain price stop. The defensible response is de-grossing: cut new exposure and let the code stops work. Liquidating every holding needs `macro_alarm` or a symbol-level reason, never `fused` alone.
+- `btc_shock` and `fused` both true: a market shock. No single culprit; the whole book is exposed.
+- `name_alarm_symbols` non-empty with `btc_shock` false: an idiosyncratic break. As a holding it is evidence against that thesis; anything strongly correlated with it is contaminated.
+- `btc_shock` true, `fused` false: a BTC move that has not yet spread; treat alts as "wait", not calm.
+- Nothing set: abstain. The absence of an alarm is not evidence of safety, and `verdict` normal says nothing about news, funding or liquidity.
 
-## What not to do
+The 3×ATR rule is coarse; read a name alarm as "watch or worse", not proof of collapse.
 
-- Do not derive correlation from `last_closes_1h` or from which symbols rose together; only `regime_pack`, `corr_to_open_positions` and `corr_to_btc_1h` are evidence.
-- Do not call a market "calm" because `verdict == normal`; the pack says nothing about news, funding or liquidity.
-- Do not turn `btc_regime_4h == bear` into a short or a hedge. The only expressions are no entry, smaller size, higher floor, or exit.
-- Do not loosen the code gates (empty candidate list on `macro_alarm`, half size on `fused`); your layer only tightens.
+## What a fused regime is not
 
-## Output: bear role
+Fusion is confirmed after the first leg down, so it cannot time a top, and exiting every holding on its onset tends to lose to the plain code stop. The sound response is to cut new exposure and let the stops work. A full exit needs `macro_alarm` or a symbol-level reason, never `fused` alone.
 
-- Add a `death_paths` entry with `family: regime_flip` whenever `fused` is true, `density` ≥ 0.45, or `btc_regime_4h == bear`. `observable_trigger` cites the field (`regime_pack.density`, `regime_pack.btc_shock`) and the confirming level; `probability_band` is `high` under `macro_alarm`, `mid` under `fused`, `low` in the dead band; `time_to_impact_bars` 1–8 for shocks, `null` for slow fusion.
-- A candidate with `corr_to_open` > 0.8 to any holding gets a `crowded_unwind` path: a stop on the holding is a stop on this entry too.
-- `verdict` is `decline` under `macro_alarm` and at most `survivable_if_monitored` under `fused`, with a `monitoring_conditions` line naming `regime_pack.verdict` returning to `normal`.
-- Put the regime read in `disconfirming_evidence` only when it contradicts a bullish technical label.
+## Bear use
 
-## Output: risk_manager role
+- A `regime_flip` path is mandatory when `regime.fused` is true, `regime.density` ≥ 0.45 or `regime.btc_regime_4h` is bear. Take `probability_band` and `time_to_impact_bars` from your prompt's step 2; `observable_trigger` names the regime field and level, e.g. `regime.btc_shock` true.
+- `hv_pct` above 80 means gaps through the stop are more likely; say so in the path description.
+- Any `corr_to_open` value above 0.8 seeds a `crowded_unwind` path: a stop on that holding is a stop on this entry.
+- Verdict follows your step 5: macro_alarm is a hard veto; under `fused` the best verdict is `survivable_if_monitored` with a monitoring condition on `regime.verdict`.
+- Warming `regime.density` is a valid counter in `disconfirming_evidence` against a bullish technical or momentum item.
+- Never turn a bear regime into a short or a hedge.
 
-- `global.entries_paused: true` with `pause_reason` citing `regime_pack.verdict` under `macro_alarm`.
-- Under `fused`: `global.confidence_floor` ≥ 0.75, each candidate's `max_size_pct` ≤ 5, `global.exposure_cap_pct` no higher than `account_pack.exposure_pct` plus one half-sized slot; `portfolio_note` (Korean) says the holdings move as one position.
-- In the dead band: `conditional` verdicts with a `conditions` entry tied to `regime_pack.density` < 0.45, and `correlation_note` naming the highest `corr_to_open_positions` value.
-- Holdings: a symbol in `name_alarm_symbols` gets `assumption_status` containing `broken`, `health` ≤ 3, `action: exit`; other holdings under `macro_alarm` get at least `weakening`, `health` ≤ 5, `trim` (the holding's stop level is not in the payload; do not reason about it).
-- Every claim in `veto_reasons`, `conditions`, `required_monitoring` and `reason` names a field under the payload's regime key or `risk_packs[<symbol>]`; free text in Korean, enum values exactly as the schema spells them.
+## Risk manager use
+
+- Global: macro_alarm pauses entries; `fused` raises the confidence floor and lowers the exposure cap; a bear `btc_regime_4h` raises the floor. Use the exact values in your prompt's steps 1–3 and name the regime field in `pause_reason` or `portfolio_note`.
+- Size: halve under `fused`, then apply the prompt's correlation haircuts from `risk_packs[symbol].corr_to_open_positions` and `corr_to_btc_1h` (step 7). Any |corr to a holding| above 0.8 is a veto (step 4).
+- Warming density without `fused`: add a `required_monitoring` item on `regime.density` and say in `portfolio_note` that diversification is thinner than the position count suggests.
+- Holdings: a held symbol in `regime.name_alarm_symbols`, or macro_alarm for every holding, is evidence against the stored assumptions. Mark the affected assumptions from that evidence, then compute `health` and `action` with the prompt's formula and rules (steps 10–12). The holding's stop level is not in the payload; do not reason about it.
+- Never loosen a code gate (empty candidates on macro_alarm, half size on fused); your layer only tightens.
+
+## Writing it down
+
+Every claim cites a field: `"<field path>: <value> — <짧은 한국어 해석>"`, e.g. `"regime.density: 0.58 — 종목 간 동조화가 진행 중"`. Free text is Korean; enum values stay exactly as the schema spells them.

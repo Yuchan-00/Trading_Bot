@@ -1,60 +1,60 @@
 ---
 name: ichimoku
-description: 일목균형표 삼중 필터(전환/기준선 교차·구름 위치·구름 방향)를 4h 레짐 + 1h 트리거로 읽어 롱 진입 허용 여부, 타이밍, 청산 신호를 정하는 절차
+description: 일목균형표 라벨(전환/기준선 교차·구름 위치·구름 방향·교차 강도)을 4h 레짐 + 1h 트리거로 읽어 롱 진입 허용, 타이밍, 보유 청산 신호를 정하는 절차 (점수·확신도·손절·목표는 역할 프롬프트 규칙을 따름)
 roles: [technical]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/ichimoku/SKILL.md (MIT)"
 license: MIT
 ---
-# Ichimoku triple filter
+# Ichimoku: cloud regime and cross trigger
 
-## When to apply
+## Purpose
 
-Apply whenever `feature_pack.ichimoku_4h` or `feature_pack.ichimoku_1h` is present. The code has already computed the five lines (Tenkan 9, Kijun 26, Senkou A = midpoint of the two shifted forward 26, Senkou B = 52-period midpoint shifted forward 26, Chikou = close shifted back 26) and reduced them to four labels per timeframe:
+Use whenever `feature_pack.ichimoku_4h` or `feature_pack.ichimoku_1h` is not null. Code has already built the lines (conversion 9, base 26, leading spans shifted 26 ahead, the second span from a 52-bar midpoint) and reduced each timeframe to four labels:
 
-- `tk_cross`: `bullish`, `bearish` or `none`, true only if the Tenkan/Kijun cross happened within the last 3 bars
-- `price_vs_cloud`: `above`, `inside`, `below`, `unknown`
-- `cloud_bullish`: true when Senkou A is above Senkou B at the current bar
-- `cross_strength`: `strong`, `medium`, `weak`, `none` (strong = the cross occurred on the favourable side of the cloud and the cloud direction agrees)
+- `tk_cross`: bullish / bearish / none. Only a conversion-base cross within the last 3 bars counts; an old cross reads none.
+- `price_vs_cloud`: above / inside / below / unknown.
+- `cloud_bullish`: true when the first leading span is above the second at the current bar; null if not computable.
+- `cross_strength`: strong / medium / weak / none. strong means the cross happened on the favourable side of the cloud and the cloud direction agrees.
 
-If a label is `unknown` or the block is null, the warm-up (78 bars) was not satisfied; treat the Ichimoku filter as absent (no trigger, no `timing: now`) rather than guessing.
+A null block or an `unknown` label means warm-up was not met: the Ichimoku filter is absent (no trigger, no `now`), never assumed favourable.
 
-## The rule in one line
+Precedence: your role prompt (technical.md) governs. Its step 1 (4h regime), step 3 (trigger), step 7 (score), step 8 (confidence), step 9 (stop/target) and step 10 (exits) are the rules; this skill explains how to read the labels inside them.
 
-A bullish read requires all three conditions at once: a bullish Tenkan/Kijun cross, price above the cloud, and a bullish cloud. Two out of three is "no signal", not "weak signal". The original engine fired only on cross events; our pack preserves that by limiting `tk_cross` to the last 3 bars, so a long-standing bullish structure without a fresh cross reads as `tk_cross: none` and supports a hold, not a new entry.
+## Core idea
 
-## Procedure
+The bullish case is three conditions together: a fresh bullish cross, price above the cloud, and a bullish cloud. Any two without the third is no signal, not a weak signal. A long-running bullish structure without a fresh cross supports holding, not a new entry.
 
-1. 4h block = regime. `price_vs_cloud == above` with `cloud_bullish == true` is the only state in which a new long is normally allowed. `inside` means the market is deciding: cap `direction` at `flat` unless the setup is `mean_reversion` and the 1h block is fully bullish. `below` means `direction: avoid` for entries.
-2. 1h block = trigger. `tk_cross == bullish` with `cross_strength` in {`strong`, `medium`} inside an allowed 4h regime → `timing: now`. A bullish 1h cross with `cross_strength == weak` (cross below the cloud) → `timing: wait_confirmation`. No fresh cross but `price_vs_cloud == above` and `cloud_bullish` → `timing: wait_pullback` for a trend setup (structure is fine, the entry bar is not here yet).
-3. Combine with the three-axis vote. Ichimoku agreement on both timeframes adds +1 to `score`; a 1h `tk_cross == bearish` subtracts 2; 4h `price_vs_cloud == below` subtracts 2. The resulting `score` still has to clear +3 for a long.
-4. Confidence. The role prompt's step 8 recipe is the only one you apply; Ichimoku's contribution to it is the +0.10 for 1h `cross_strength == strong`. Do not add increments of your own. Set `direction: flat` outright when the 1h cross is bearish, whatever the rest of the pack says.
-5. Setup type. A fresh bullish 1h cross with 4h above the cloud is `trend_continuation`. A bullish cross while 4h is `inside` and the 1h `bb_position` is near 0 is `mean_reversion`. A `strong` 1h cross immediately after `price_vs_cloud` changed from `inside` to `above` may be labelled `breakout`, but only if the volume axis (`obv_trend`, `volume_ratio_20`) confirms.
+## Reading order
 
-## Stop placement
+1. **4h regime (prompt step 1).** A new long needs `feature_pack.ichimoku_4h.price_vs_cloud` above together with the 4h EMA condition. above with `cloud_bullish` false is a thinner regime: trust it less and prefer `wait_confirmation`. inside with `cloud_bullish` true allows at most `wait_confirmation`; inside with a bearish cloud permits no new long. below means `avoid` for entries.
+2. **1h trigger (prompt step 3).** The trigger is `feature_pack.ichimoku_1h.tk_cross` bullish with `cross_strength` strong or medium, plus the 15m conditions the prompt lists. A bullish cross with `cross_strength` weak (it happened below or inside the cloud) is not a trigger: `wait_confirmation`. No fresh cross but 1h price above a bullish cloud means the structure is fine and the entry bar has not arrived: `wait_pullback` for a trend setup.
+3. **Bearish cross.** `feature_pack.ichimoku_1h.tk_cross` bearish means there is no trigger (prompt step 3), so never `now`; direction and timing still come from the prompt's steps 3 and 7.
+4. **Score and confidence.** The trigger is one of the +1/−1 votes in prompt step 7. The only Ichimoku confidence increment is the +0.10 in step 8 for `cross_strength` strong. Add nothing of your own.
+5. **Setup type.** A fresh strong or medium 1h cross with the 4h above a bullish cloud fits `trend_continuation`. Setup type still follows the prompt's step 2 mapping from `feature_pack.per_tf.1h.vote` and the SMC breakout rule; Ichimoku does not create a breakout label on its own.
 
-The Kijun line would be the natural stop for an Ichimoku entry, but the pack carries relationships only, never line prices, so the schema value `sl_reference: kijun` is not used. Therefore:
+## Stops and targets
 
-- Anchor the stop with `atr_pct_1h` (`stop_pct = min(2.0, 1.5 * atr_pct_1h)`, `sl_reference: atr`) or with a nearby SMC demand zone (`sl_reference: zone`). Never fabricate a Kijun value from `last_closes_1h`.
-- If the resulting `stop_pct` would exceed 2.0, the trade does not fit the cap: say so in `invalidation`, keep `direction: flat`, and let `timing: wait_pullback` express that a closer entry could work.
+A base-line stop would be natural, but the payload carries relationships only, never line prices. So `sl_reference` kijun is not used, and you never estimate a base-line value from `feature_pack.last_closes_1h`. Use the prompt's step 9: a qualifying SMC demand zone (`zone`) or `stop_pct` = min(1.5 × `feature_pack.atr_pct_1h`, 2.0) (`atr`), then `tp_pct` = min(4.0, max(2 × `stop_pct`, 1.5 × `stop_pct` + 0.75)) and net R:R = (`tp_pct` − 0.30) / (`stop_pct` + 0.30) of at least 1.5. The far cloud edge is not a number in the pack; do not cite it as a target.
 
-Targets follow the general rule: `tp_pct` at most 4.0 and at least 1.5 × `stop_pct`. The far cloud edge is not available as a number, so do not cite it as a target level.
+`noise_check` comes only from `feature_pack.noise_ok_2pct` and `feature_pack.noise_floor_stop_pct` (prompt step 5); a strong cross does not rescue a failing noise test.
 
 ## Open positions
 
-For a held position, the Ichimoku exit conditions match the role prompt's step 10 exactly:
+The `position` block carries prices, `unrealized_pct` and `bars_held` but no thesis or confidence. The Ichimoku exits are exactly those of prompt step 10:
 
-1. 1h `tk_cross == bearish` with `cross_strength == strong` → `exit_flag: true`, `exit_reason` in Korean naming the cross.
-2. 4h `price_vs_cloud` moved to `below` together with `per_tf.1h.vote == trend_down` → `exit_flag: true` (regime lost and confirmed).
-3. 4h `below` with an intact 1h vote, 4h `inside` with `cloud_bullish == false`, or a `medium`/`weak` bearish 1h cross → not an exit by itself; note it in `invalidation` as the condition that would become one, and allow no add-on (`timing: wait_confirmation`).
+1. `feature_pack.ichimoku_1h.tk_cross` bearish with `cross_strength` strong → `exit_flag` true, Korean `exit_reason` naming the cross.
+2. `feature_pack.ichimoku_4h.price_vs_cloud` below together with `feature_pack.per_tf.1h.vote` trend_down → `exit_flag` true.
+
+Weaker deterioration is not an exit by itself: 4h below with an intact 1h vote, 4h inside with a bearish cloud, or a medium/weak bearish 1h cross. Record it in `invalidation` as the condition that would become an exit, and give no `now` timing.
 
 ## What not to do
 
-- Do not treat a bearish triple filter as a short setup; it is `avoid` for entries and an exit cue for holdings.
-- Do not read a bullish cloud alone as bullish. Cloud direction without the cross and price position is one condition of three.
-- Do not promote `cross_strength: weak` to `medium` because other indicators look good; the label is computed from the cloud position at the cross bar and is not negotiable.
-- Do not mention the Chikou span as evidence: the pack does not expose it.
+- Do not treat a bearish filter as a short setup; it means `avoid` for entries and an exit cue for holdings.
+- Do not read a bullish cloud alone as bullish; it is one condition of three.
+- Do not promote `cross_strength` weak to medium because other labels look good.
+- Do not cite the lagging span: the pack does not expose it.
 
-## Output discipline
+## Evidence
 
-`evidence` items name the field, for example `ichimoku_4h.price_vs_cloud: above`, `ichimoku_1h.tk_cross: bullish`, `ichimoku_1h.cross_strength: strong`. `invalidation` is one Korean sentence such as "1h 전환선이 기준선을 하향 교차하거나 4h 가격이 구름 아래로 내려가면 무효" expressed in terms of these labels. `mtf_agreement` is copied from the pack, not re-derived from Ichimoku.
+Each item is `<field path>: <value> — <짧은 한국어 해석>`, for example `feature_pack.ichimoku_4h.price_vs_cloud: above — 4시간 구름 위` or `feature_pack.ichimoku_1h.cross_strength: strong — 구름 위 강한 교차`. `invalidation` is one Korean sentence in label terms, such as a 1h bearish cross or the 4h price moving below the cloud. `mtf_agreement` is copied from `feature_pack.mtf_agreement`, never re-derived from Ichimoku.

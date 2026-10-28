@@ -1,70 +1,78 @@
 ---
 name: thesis-tracker
-description: 진입 시 반증 가능한 논지(이유·가정·레드라인·기간)를 쓰고 매 사이클 가정 상태로 건강도 10 − 3·broken − 2·impaired − 1·weakening − 5·red_line 을 매겨 hold/trim/exit 를 정하는 포지션 추적 규약
+description: 진입 시 반증 가능한 논지(이유·가정·레드라인·기간)를 쓰고, 매 사이클 리스크 관리자가 자기 payload 의 필드로 가정을 다시 판정해 건강도와 hold/trim/exit 를 정하는 포지션 추적 규약(공식·행동표는 역할 프롬프트 우선)
 roles: [risk_manager, head]
 version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/thesis-tracker/SKILL.md (MIT)"
 license: MIT
 ---
-# Thesis tracking: write the exit before the entry, then audit it every cycle
+# Thesis tracking: commit to the exit before the entry
 
-## Why this exists
+## Purpose
 
-A position without a written thesis gets judged by its P&L, which produces two classic errors: holding a broken idea because it is "only down a bit", and dumping a working idea after one red bar. The fix is to commit at entry to the conditions under which the idea is wrong, then check those and nothing else, every cycle.
+Without a written thesis, P&L ends up judging the position, which leads to two mistakes: keeping a dead idea because the loss is small, and dropping a live idea after one bad bar. The cure is to write down at entry what would prove the idea wrong, then check exactly that every cycle. Price is the code stop's job. The thesis is yours.
 
-## head: writing the thesis on every BUY
+Formulas, thresholds and action tables live in your role prompt, which wins over this skill.
 
-Fill `decisions[].thesis` for every `action: "BUY"`; a BUY with empty `assumptions` is rejected by the code.
+## Who sees what (SPEC v2.1 §20.3a)
 
-- `reasons` (2 to 3 lines, Korean): each line is "because <input field> shows <value> → therefore <judgement>"; a line citing no field is not a reason.
-- `assumptions` (2 to 4 lines, Korean): falsifiable within the horizon and re-checkable by the risk manager, who sees for an open position only `technical` (`direction`, `mtf_agreement`, `score`, `exit_flag`, `evidence`), `flow_blocks[symbol]` (`block_new_longs`, `cascade_risk`, `stop_inside_cascade`), `news_risk_symbols`, `regime` (`fused`, `btc_regime_4h`, `name_alarm_symbols`) and `risk_packs[symbol]`. Name one of those fields in every assumption. Good: "technical.direction stays long with mtf_agreement true", "flow_blocks.block_new_longs stays false", "regime.fused stays false". Bad: "momentum continues". If you cannot write two checkable assumptions, the answer is HOLD.
-- `red_lines`: numeric and beyond the code stop. Metrics are fixed by the schema: `price`, `unrealized_pct`, `funding_rate`, `btc_return_1h_pct`, `composite_sentiment`, `hours_held`. Include one `price` or `unrealized_pct` line inside the stop distance that means the idea failed before the stop (e.g. `unrealized_pct < -1.2` with a 2.0 stop), one external line (`funding_rate > 0.0005` or `btc_return_1h_pct < -2`), and one `hours_held` line equal to the horizon so a stalled trade is reviewed.
-- `horizon_bars`: 15-minute bars the setup needs, from `bull.expected_horizon_bars`, or the bear's `time_to_impact_bars` on a `high`-band death path when that is shorter.
+The head writes the thesis using its own paths. A later cycle re-checks it with different ones. Write each assumption so that the risk manager can still test it.
 
-Also populate `reevaluation_triggers` with the one observable that would reopen the decision before any red line (typically the bear's `strongest_point` turned into a field condition).
+- head (candidates): `approved[].technical.*` (including `technical.labels.*`), `approved[].flow.*`, `approved[].news.*`, `approved[].risk.*`, `approved[].gate.*`, `regime.*`, `sentiment.composite.score_0_100`, `sentiment.event_signal[symbol].combined_score`.
+- head (held): `flagged_positions[].{thesis, red_line_hits, health_history, risk, technical, flag_reason}`. Its `risk` is the risk manager's `RiskPositionView`, and its `technical` is only `{exit_flag, exit_reason}`.
+- risk_manager (held): `positions[].{mark, unrealized_pct, bars_held, thesis, prev_assumption_status, red_line_hits, health_history, technical}` plus the book-level `regime.*`, `risk_packs[symbol].*`, `flow_blocks[symbol].*` and `news_risk_symbols`. A held position comes with no technical direction, score, thesis or confidence; `positions[].technical` carries only `exit_flag` and `exit_reason`.
 
-For a flagged open position, decide SELL or HOLD from the risk manager's `positions[]` view, not from price: `health` ≤ 4 for two consecutive cycles or any `red_lines_triggered` entry is a SELL with `confidence` ≥ 0.65; a healthy thesis with negative `unrealized_pct` is a HOLD with `debias.anchored_to_entry` false.
+Once a position is open, the head's paths map to the risk manager's like this:
 
-## risk_manager: re-scoring every open position
-
-Red lines are the only part the code evaluates: copy `red_line_hits[]` verbatim. Assumption status is your judgement, one per stored assumption, in order, from the field that assumption names:
-
-| status | the named field |
+| written by head | re-checked by risk_manager |
 |---|---|
-| `holding` | reads as the assumption states |
-| `weakening` | is `null`, or still agrees while a second field moved against it (e.g. `technical.direction` long but `score` fell to 0 or below; `bars_held` past `horizon_bars` × 0.75 without the target) |
-| `impaired` | contradicts the assumption this cycle while `technical.exit_flag` is false |
-| `broken` | contradicts it and a hard signal confirms: `exit_flag` true, the symbol in `news_risk_symbols` or `regime.name_alarm_symbols`, `flow_blocks.block_new_longs` or `stop_inside_cascade` true |
+| `technical.*` (mtf_agreement, direction, timing) | `positions[].technical.exit_flag` / `exit_reason` |
+| `flow.block_new_longs`, `flow.stop_inside_cascade`, `flow.cascade_risk` | `flow_blocks[symbol].*`, same keys |
+| `flow.crowding_risk`, `flow.posture` | no direct field; judge it from `flow_blocks[symbol].*` |
+| `news.risk_event_for_symbol` | is the symbol in `news_risk_symbols` |
+| `regime.*` | `regime.*`, same keys |
+| `risk.*` sizing context | `risk_packs[symbol].*` |
 
-An assumption that names no field you can see is `weakening`, never `holding`; say so in `reason`. When `health_history` fell last cycle and no field improved, do not raise a status.
+## head: writing the thesis on a BUY
 
-1. Compute `health` = 10 − 3 × (broken) − 2 × (impaired) − 1 × (weakening) − 5 × (red lines triggered), clamped to 1..10.
-2. Map to `action`:
+An empty `assumptions` list leaves nothing to re-assess; write the 2–4 the prompt asks for. Field counts, the red-line rules and the horizon clamp come from your prompt, steps 9 and 10.
 
-| health | action |
+- `reasons`: each one uses the form "<field path>: <value> — <짧은 한국어 해석>". A reason that cites no field is not a reason.
+- `assumptions`: each must be falsifiable within the horizon and must name a field from the table above. Prefer fields the risk manager sees under the same name: `regime.btc_regime_4h` stays bull, `regime.fused` stays false, `flow.block_new_longs` stays false, `news.risk_event_for_symbol` stays false. An assumption about `technical.mtf_agreement` can later be judged only through `exit_flag`, so pair it with one that has a direct field. If you cannot write two checkable assumptions, HOLD.
+- `red_lines`: use the schema metrics only, and make each one stricter than the code stop. Follow the prompt: a `price` line sits above the stop price, `hours_held` > `horizon_bars` / 4 is the time line, and `funding_rate` is the raw 8h decimal. Never use the code stop itself as a red line.
+- `horizon_bars`: take it from the prompt's setup table (15-minute bars), clamped and halved as step 9 says.
+- `reevaluation_triggers`: the bear's and the risk manager's monitoring items, written as field tests.
+
+For a flagged position, apply the prompt's SELL list to `flagged_positions[].red_line_hits`, `risk.action`, `health_history` and `risk.assumption_status`. Never decide from `unrealized_pct`. A healthy thesis showing a loss is a HOLD with `debias.anchored_to_entry` false.
+
+## risk_manager: judging each stored assumption again
+
+`prev_assumption_status` is your own assessment from the previous cycle, and it may be null. It is not a code result. Judge every assumption now, keep the stored order, and use the mapping table above.
+
+| status | what the mapped field shows this cycle |
 |---|---|
-| 8–10 | `hold` |
-| 6–7 | `hold`, `reason` names the weakening assumption and what would downgrade it |
-| 4–5 | `trim` |
-| 1–3, or any `red_lines_triggered` | `exit` |
+| `holding` | it reads as the assumption states |
+| `weakening` | it is null, or it agrees while a related field moved against it, or the assumption names no field you can see (say so in `reason`) |
+| `impaired` | it contradicts the assumption and no hard signal confirms |
+| `broken` | it contradicts the assumption and a hard signal confirms: `positions[].technical.exit_flag` true, the symbol in `news_risk_symbols` or `regime.name_alarm_symbols`, or `flow_blocks[symbol].block_new_longs` / `stop_inside_cascade` true |
 
-3. Cross-check the technical channel: `technical.exit_flag` true with `health` ≥ 8 means thesis and chart disagree; downgrade to `trim` and cite both fields in `reason`. The code executes `exit` only after a red line or two consecutive cycles at ≤ 4; do not force it by overstating a status.
+Upgrade a status only when a cited field now supports it. If `health_history` fell last cycle and no field improved, do not raise any status.
 
-## Distinguishing thesis from price
+For `red_lines_triggered`, copy `red_line_hits` verbatim. Compute `health` and choose `action` with the prompt's formula and table (section 3C). Do not inflate a status to force an exit.
 
-A position at −1.5% with every assumption `holding` stays `hold`; the code stop judges price. A position at +1% with an `impaired` structure assumption is `trim` or `exit`. Write `reason` so the Telegram reader sees the assumption, not the P&L ("technical.direction flat 전환으로 가정 2 impaired", not "−1.5% 손실").
+## Thesis versus price
 
-## What not to do
+At −1.5% with every assumption holding, nothing changes; the code stop handles price. At +1% with a broken assumption, trim or exit. In `reason`, name the assumption and its field ("positions[].technical.exit_flag: true — 가정 2 broken"), not the P&L.
 
-- Do not write assumptions about earnings, valuation, regulation outlooks or anything the payload cannot show.
-- Do not recommend adding to a position; "add" does not exist here (no averaging, no pyramiding). The health ladder tops out at `hold`.
-- Do not re-score from price alone or from `last_closes_1h`; the named fields and the red-line hits are the evidence.
-- Do not soften a `broken` because the trade is in profit, or harden a `weakening` because it is in loss.
-- Do not put the code stop itself as a red line; red lines are additional conditions.
-- Do not express a bearish re-read as anything but `trim` / `exit` / "no entry"; there is no short side.
+## Do not
+
+- Do not write assumptions the payloads cannot show (earnings, valuation, regulation).
+- Do not suggest adding to a position. There is no averaging or pyramiding, so the ladder stops at `hold`.
+- Do not re-score from price alone.
+- Do not soften a broken assumption because the trade is in profit, or harden a weakening one because it is in loss.
+- Do not express a bearish read as anything except trim, exit or no entry. This is spot only, so there is no short.
 
 ## Output mapping
 
-head: `decisions[].thesis.{reasons, assumptions, red_lines, horizon_bars}`, `reevaluation_triggers[]`, `decisions[].action` SELL/HOLD for flagged positions with `rationale` (Korean, ≤ 60 words) naming the assumption that decided it, `debias.anchored_to_entry`.
-
-risk_manager: `positions[].assumption_status[]` (stored order), `positions[].red_lines_triggered[]` (`red_line_hits` verbatim), `positions[].health` (1..10 by the formula), `positions[].action` (`hold` / `trim` / `exit`), `positions[].reason` (Korean, one or two sentences citing the field), and a line in `risk_note` when any position is below 5.
+- head: `decisions[].thesis.{reasons, assumptions, red_lines, horizon_bars}`, `reevaluation_triggers[]`, SELL/HOLD on flagged symbols with a Korean `rationale` that names the deciding assumption, and `debias.anchored_to_entry`.
+- risk_manager: `positions[].assumption_status[]` (in stored order), `red_lines_triggered[]`, `health`, `action`, and a Korean `reason` that cites the field.

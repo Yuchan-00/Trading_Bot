@@ -6,65 +6,57 @@ version: 1
 source: "adapted from HKUDS/Vibe-Trading agent/src/skills/investor-lenses/SKILL.md (MIT)"
 license: MIT
 ---
-# Reasoning lenses — pendulum, inversion, stacking
+# Reasoning lenses: pendulum, inversion, stacking
 
-A lens is a fixed order of questions plus veto rules, applied *after* the evidence is frozen. Only three lenses survive here, because the other nine need financial statements the bot never sees. No investor names appear in any output; a verdict is "under this procedure", never "someone would buy this".
+A lens is a fixed order of questions applied after the evidence is frozen. Only three lenses fit a bot that sees prices, derivatives data and headlines but no financial statements. No investor names appear in any output. Every number, band and veto level lives in your role prompt; this skill supplies the order of thought, and where the two differ the role prompt governs.
 
-## Rules shared by every role
+## Shared rules
 
-1. The evidence is the labelled JSON you received. Do not reinterpret it into numbers that are not there.
-2. A hard veto is not weighed against positives. When one fires, stop scoring and report it.
-3. "Unknown is not low." A probability you cannot assess is `unknown`, never `low`.
-4. Never average two verdicts or two confidences. Disagreement is information; locate it.
-5. Every claim names the input field it rests on. A claim without a field is dropped.
+1. The evidence is the labelled JSON you received; never turn it into numbers that are not there.
+2. A hard veto is not traded off against positives. When one fires, stop weighing and report it.
+3. Unknown is not low. A band you could not assess is `unknown`.
+4. Never average two verdicts or two confidences. A disagreement is information; locate it.
+5. Every claim names the payload path it rests on, written as `"<field path>: <value> — <짧은 한국어 해석>"` wherever the schema has an evidence-like list. A claim with no path is dropped.
 
-## derivatives_flow: pendulum (posture)
+Paths per role, in one line each:
+- derivatives_flow: `flow_packs[symbol].*` and `thresholds.*`.
+- bear: `technical.*`, `feature_extract.*`, `flow.*`, `news_events[]`, `news_context.*`, `event_signal.*`, `sentiment.*`, `scanner_row.factor_table.*`, `scanner_row.liquidity.*`, `regime.*`, `position.*`, `corr_to_open`, `hv_pct`.
+- head: per `approved[]` entry `technical.*` (feature labels under `technical.labels.*`), `flow.*`, `news.*`, `bull.*`, `bear.*`, `risk.*`, `gate.*`; cycle-wide `sentiment.composite.*`, `sentiment.event_signal[symbol].*`, `regime.*`, `account_pack.*`, `abstained_channels`.
 
-Apply to each symbol in the batch. You take the temperature of positioning, never forecast a turn.
+## derivatives_flow: the pendulum
 
-Observable families, each from `flow_pack`:
-- Funding: `funding_regime` (`extreme_long` means > +0.05%/8h, `squeeze` means < −0.02%/8h), `funding_annualized_pct`.
-- Leverage build: `oi_change_24h_pct`, `oi_funding_label` (`leveraged_long_buildup` = OI +5% with funding > +0.03%).
-- Positioning: `ls_label` (`crowded_long` > 2.0, `crowded_short` < 0.8), `perp_premium_pct`.
-- Behaviour: `divergence_flags`, `cascade_risk`, `nearest_long_liq_below_pct`.
+You read the temperature of positioning; you never forecast the turn.
 
-Procedure:
-1. Count how many families point the same way. `posture` may be `euphoria` or `capitulation` only when at least three families agree; `greed`/`fear` needs two; one family alone yields `neutral` with `confidence` ≤ 0.5.
-2. Map posture to action, not timing: `euphoria` → `crowding_risk: "high"`, `flow_bias: "avoid"`, and `block_new_longs: true` with `block_reason` naming the fields; `greed` → `crowding_risk` at least `moderate`; `fear` → `flow_bias: "neutral"` unless a washout is present; `capitulation` → the only bullish reading, expressed through `washout_setup`.
-3. `washout_setup: true` requires all of: `oi_funding_label == "deleveraging"`, `funding_regime` in {`negative`, `squeeze`}, `cascade_risk != "high"`, and `data_confidence == "high"`. Otherwise it is false even if the posture is `capitulation`.
-4. Extremes persist. A `euphoria` reading is a reason to refuse new longs, never a claim that price falls next bar; say so in `market_wide_note`.
+1. Count families pointing the same way. The families are the four your role prompt names (funding, open interest, long/short ratio, premium), read from `flow_packs[symbol].funding_regime`, `.oi_funding_label`, `.ls_label` and `.perp_premium_pct`. Use the agreement counts in your role prompt to choose between `neutral`, `greed`/`fear` and `euphoria`/`capitulation`.
+2. Posture is a level, not a clock. Crowds can stay at an extreme for many cycles; an `euphoria` reading is a reason to refuse longs, never a claim that price falls next bar. Say so in `market_wide_note` when most of the batch is hot.
+3. Posture does not set the flags by itself. `crowding_risk`, `block_new_longs` and `washout_setup` follow the explicit conditions in your role prompt; the pendulum only tells you which side of them you are probably on.
+4. The one bullish reading is the flushed crowd, and it is expressed only through `washout_setup`, which rests on funding and open interest, never on clusters.
+5. Estimated liquidation clusters (`.est_liq_clusters`, `.nearest_long_liq_below_pct`) are projections at fixed distances from a VWAP. They may block or warn; they never justify an entry, and their spacing never escalates `cascade_risk` (copy the pack value as your prompt says).
 
-Do not: infer posture from `oir_1pct` or `spread_bps` alone (they are not positioning), set `washout_setup` on `data_confidence: "low"`, or let a bullish posture override `stop_inside_cascade`.
+Do not infer posture from `.oir_1pct` or `.spread_bps` alone; they describe the book, not positioning.
 
-## bear: inversion (death paths)
+## bear: inversion
 
-You are a veto layer, not a mirror of the bull. The question is how this long dies within the time-stop window (the next 96 bars), given that the hard stop bounds loss at 2% *unless* price jumps through it.
+Assume the long was entered and ask how it dies before its horizon ends. Ordinary noise inside the stop is not a death; a jump through the stop, or a stop-out before the thesis had time, is.
 
-Procedure:
-1. Restate the implied thesis as one falsifiable sentence from `technical.setup_type`, `technical.invalidation` and `flow.flow_bias`. If it cannot be stated, that is the first path (`family: "other"`).
-2. Enumerate at least three `death_paths` from *different* `family` values. Standard mappings:
-   - `liquidation_cascade`: `flow.nearest_long_liq_cluster_pct_below` ≤ 2, `flow.cascade_risk`, `flow.stop_inside_cascade`.
-   - `news_shock`: `news.risk_event`, negative `news.events[].score` ≤ −0.5, `feed_health_note` showing a broken feed.
-   - `regime_flip`: `regime_pack.btc_regime_4h`, `regime_pack.fused`, `corr_to_btc_1h` > 0.8, `hv_pct` > 80.
-   - `crowded_unwind`: `flow.posture` in {`greed`, `euphoria`}, `flow.crowding_risk`, `composite_sentiment` > 80, `feature.cgo_60` > 20 (percent above the 60-bar VWAP).
-   - `data_incident`: any channel that abstained, `flow.data_confidence: "low"`, a `technical.confidence` below 0.55.
-3. Each path carries `observable_trigger` (a field and a level), `probability_band`, and `time_to_impact_bars` (`None` only when truly unknowable). A worry without an observable trigger is not a path; name it in `strongest_point` only if it is the real objection.
-4. Hard vetoes → `verdict: "decline"`: a path with gap-through-stop potential (cascade within 2% or live `risk_event`) rated `high`; a `high` path with no trigger the bot can watch; or a thesis that cannot be stated.
-5. Otherwise choose `survivable` when every `high`/`mid` path has a trigger already listed in `monitoring_conditions`, else `survivable_if_monitored` and fill `monitoring_conditions` with those triggers.
-6. `disconfirming_evidence` must contain one entry per positive you can see in the packs (a trend vote, a washout flag, a catalyst). `what_would_disprove_bear` names the observation that would retire your strongest path.
+1. State the implied thesis in one falsifiable sentence from `technical.setup_type`, `technical.invalidation` and `flow.flow_bias`. If you cannot, that failure is itself the first path.
+2. Walk the families in turn and look for the field that would carry each death: `liquidation_cascade` (`flow.stop_inside_cascade`, `flow.nearest_long_liq_cluster_pct_below`, `flow.cascade_risk`); `news_shock` (`news_context.risk_event_for_symbol`, `news_events[].score` with `stale` false, `news_context.feed_health_note`); `regime_flip` (`regime.verdict`, `regime.btc_regime_4h`, `regime.fused`, `regime.density`, `regime.btc_shock`, `hv_pct`); `crowded_unwind` (`flow.posture`, `flow.crowding_risk`, `sentiment.score_0_100`, `feature_extract.cgo_60` ≥ +3, `scanner_row.factor_table.funding_z`, `corr_to_open`); `data_incident` (any `null` channel, `flow.confidence`, `technical.confidence`, `technical.noise_check`, `scanner_row.liquidity.ok`). Band levels and bar ranges are in your role prompt.
+3. Each path needs an observable trigger: a field and a level the bot can watch. A worry with no trigger is not a path.
+4. Distinct families, not variants. Five phrasings of "funding is hot" are one path.
+5. Turn every visible positive against itself: for each one, name the field that weakens it. If none exists, that positive is what would disprove you.
+6. A bearish verdict means "no entry" or "exit". There is no short.
 
-Do not: list five variants of one worry, decline because "crypto is risky", confuse ordinary volatility (covered by the 2% stop) with gap risk, or rate a path `low` because you did not examine it.
+Do not decline because "crypto is risky", and do not rate a path `low` because you did not look at it.
 
 ## head: stacking and disagreement
 
-You receive bull, bear and risk independently. Treat them as three lenses that are allowed to disagree.
+Bull, bear and risk arrive independently. Treat them as three lenses that are allowed to disagree.
 
-Procedure:
-1. Read each in isolation; note its strongest point before comparing.
-2. Classify every bull-versus-bear conflict into exactly one `disagreement_class`: `horizon` (same facts, different bar count — compare `bull.expected_horizon_bars` with `bear.death_paths[].time_to_impact_bars`), `caliber` (they measure different things, e.g. `feature.cgo_60` versus `flow.posture`), `risk_preference` (same expected outcome, different tolerance for a 2% stop-out), `information` (one side needs a field that is missing or abstained). Use `none` only when verdicts agree.
+1. Read each alone and note its strongest point before comparing.
+2. Classify the bull-versus-bear conflict into one `disagreement_class`: `horizon` (same facts, different clocks: compare `bull.expected_horizon_bars` with `bear.death_paths[].time_to_impact_bars`); `caliber` (they measure different things, e.g. `technical.labels.cgo_60` against `flow.posture`); `risk_preference` (same expected path, different tolerance for a stop-out); `information` (one side relies on a field that is `null` or abstained). Use `none` only when the verdicts agree.
 3. Quote the losing side's single best sentence verbatim in `losing_side_strongest_point`. If you cannot state it fairly, do not trade.
-4. `decisive_factor` names the field that settled the class, not the side that "won on points". A 2-to-1 count of arguments is not evidence.
-5. `confidence` ≤ min(`bull.confidence`, `risk.confidence`) + 0.05, and never above the cycle's `confidence_floor` rule. A risk `veto` or `bear.verdict: "decline"` is final; a `news.risk_event` symbol is never `BUY`.
-6. On `BUY`, write `thesis.assumptions` as checkable market sentences tied to `red_lines` metrics (`price`, `unrealized_pct`, `funding_rate`, `btc_return_1h_pct`, `composite_sentiment`, `hours_held`); the bear's monitored triggers belong in `reevaluation_triggers`.
+4. `decisive_factor` names the field that settled the class, never the side with more arguments. A two-to-one count is not evidence.
+5. Confidence comes from your role prompt (it starts from min(`bull.confidence`, `risk.risk_confidence`) + 0.05 and must clear max(`risk.confidence_floor`, `gate.confidence_floor`)). A risk veto or a bear `decline` never reaches you as a buy; `news.risk_event_for_symbol` true is never `BUY`.
+6. On a `BUY`, the bear's watchable triggers become `reevaluation_triggers`, and the thesis assumptions are checkable sentences tied to the allowed `red_lines` metrics.
 
-Do not: pick the side whose action you prefer and then rationalise (lens shopping), blend confidences, or treat two channels agreeing on the same candles as independent confirmation.
+Do not pick the side whose action you prefer and then rationalise it, do not blend confidences, and do not count two channels reading the same candles as independent confirmation.

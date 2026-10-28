@@ -858,8 +858,24 @@ def _save_cache(path: Path, candles: Sequence[Candle]) -> None:
         log.warning("캐시 쓰기 실패 %s: %s", path, e)
 
 
-def _fetch_candles(cfg: BacktestConfig, market: Any) -> dict[str, dict[str, list[Candle]]]:
-    """종목·시간대별 캔들을 캐시(JSON) 우선으로 가져온다. 거래소 limit 상한으로 부족하면 경고."""
+def _cache_is_stale(candles: Sequence[Candle], timeframe: str, now_ms: int) -> bool:
+    """캐시의 마지막 봉이 ``now - 2×시간대`` 보다 오래됐으면 낡은 캐시다.
+
+    캐시 키(``<sym>_<tf>_<limit>``)에는 종료 시점이 없으므로, 몇 주 뒤 같은 ``--days`` 로 다시
+    돌리면 옛 구간을 그대로 재사용하게 된다. 마지막 봉이 최신이 아니면 캐시 미스로 취급한다.
+    """
+    return candles[-1].ts < now_ms - 2 * timeframe_ms(timeframe)
+
+
+def _fetch_candles(
+    cfg: BacktestConfig, market: Any, now_ms: int | None = None
+) -> dict[str, dict[str, list[Candle]]]:
+    """종목·시간대별 캔들을 캐시(JSON) 우선으로 가져온다. 거래소 limit 상한으로 부족하면 경고.
+
+    캐시는 마지막 봉이 ``now_ms - 2×시간대`` 이후일 때만 재사용한다(낡은 구간 재사용 방지).
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     out: dict[str, dict[str, list[Candle]]] = {}
     cache_dir = Path(cfg.cache_dir)
     tfs = (cfg.timeframe, *[tf for tf in HIGHER_TIMEFRAMES if tf != cfg.timeframe])
@@ -870,6 +886,12 @@ def _fetch_candles(cfg: BacktestConfig, market: Any) -> dict[str, dict[str, list
             limit = int(cfg.days) * _bars_per_day(tf) + window
             path = cache_dir / _cache_name(sym, tf, limit)
             candles = _load_cache(path) if path.exists() else None
+            if candles is not None and _cache_is_stale(candles, tf, now_ms):
+                log.info(
+                    "%s %s: 캐시 %s 가 낡음(마지막 봉 %.1f일 전) → 다시 조회",
+                    sym, tf, path.name, (now_ms - candles[-1].ts) / _MS_PER_DAY,
+                )
+                candles = None
             if candles is None:
                 candles = list(market.fetch_ohlcv(sym, tf, limit))
                 _save_cache(path, candles)

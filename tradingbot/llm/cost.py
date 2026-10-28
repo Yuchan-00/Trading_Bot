@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import threading
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 logger = logging.getLogger("tradingbot.llm.cost")
 
@@ -25,12 +26,46 @@ PRICES_USD_PER_MTOK: dict[str, tuple[float, float, float]] = {
     "claude-sonnet-5-5": (2.0, 0.20, 10.0),
     "claude-haiku-5-5": (0.10, 0.01, 0.50),
 }
-# 미지 모델은 가장 비싼(opus) 단가로 보수 추정한다.
-FALLBACK_PRICE_MODEL = "claude-opus-5-5"
+# 미지 모델은 보수 추정한다(SPEC §8.2). config 는 날짜 접미사 없는 임의의 ``claude-*`` id 를 받으므로
+# (예: claude-fable-5-1 $10/$50, claude-opus-5 $5/$25) Opus 5.5 단가($4/$20)는 '가장 비싼' 값이 아니다.
+# 그래서 미지 모델은 FALLBACK_PRICE_MODEL 단가가 아니라 아래 상한과 표의 모든 단가 중 항목별 최댓값으로 잡는다.
+FALLBACK_PRICE_MODEL = "claude-opus-5-5"  # 하위호환용 이름(로그·외부 참조). 실제 미지 모델 단가는 아래 상한.
+# 설정 가능한 Claude 모델 중 가장 비싼 공개 단가(claude-fable-5-1: in $10 / cache-read $1 / out $50 per MTok).
+UNKNOWN_MODEL_PRICE_CEILING: tuple[float, float, float] = (10.0, 1.0, 50.0)
 # 캐시 쓰기 토큰 단가 = input 단가 × 배수 (5m: 1.25x, 1h: 2x).
 CACHE_WRITE_MULTIPLIER: dict[str, float] = {"5m": 1.25, "1h": 2.0}
 
 _MTOK = 1_000_000.0
+
+# 문자수/4 토큰 추정의 여유 배수(새 토크나이저는 같은 텍스트에 ~30% 더 많은 토큰을 쓸 수 있다).
+TOKENIZER_MARGIN = 1.3
+
+
+def project_call_cost(
+    ledger: Any,
+    model: str,
+    system_chars: int,
+    user_chars: int,
+    max_tokens: int,
+    *,
+    cache_ttl: str = "1h",
+) -> float:
+    """호출 전 예산 검사용 **최악** 예상 비용(USD).
+
+    - 토큰 수 = ceil(문자수/4 × ``TOKENIZER_MARGIN``)
+    - system 블록은 콜드 캐시(시간의 첫 호출·재시작 직후)에서 캐시 쓰기로 과금되므로 input 단가 ×
+      ``CACHE_WRITE_MULTIPLIER``(백엔드 ttl 과 원장 ttl 중 큰 쪽)
+    - 출력은 ``max_tokens`` 전부
+    ``ledger.estimate(model, input, cached, output)`` 만 쓰므로 가짜 원장에도 동작한다. 러너의 예산 예약도
+    이 함수를 쓰면 두 추정이 어긋나지 않는다.
+    """
+    sys_tok = math.ceil(max(0, int(system_chars)) / 4 * TOKENIZER_MARGIN)
+    user_tok = math.ceil(max(0, int(user_chars)) / 4 * TOKENIZER_MARGIN)
+    mult = max(
+        CACHE_WRITE_MULTIPLIER.get(str(cache_ttl), max(CACHE_WRITE_MULTIPLIER.values())),
+        CACHE_WRITE_MULTIPLIER.get(str(getattr(ledger, "cache_ttl", cache_ttl)), max(CACHE_WRITE_MULTIPLIER.values())),
+    )
+    return float(ledger.estimate(model, math.ceil(sys_tok * mult) + user_tok, 0, max(0, int(max_tokens))))
 
 
 class BudgetExceeded(Exception):
@@ -127,7 +162,7 @@ class CostLedger:
 
     # ------------------------------------------------------------------ 단가
     def price_for(self, model: str) -> tuple[float, float, float]:
-        """정확히 일치 → 접두사 일치(가장 긴 것) → opus 단가."""
+        """정확히 일치 → 접두사 일치(가장 긴 것) → 보수 상한(``_fallback_price``)."""
         if model in self.prices:
             return self.prices[model]
         best: str | None = None
@@ -136,8 +171,18 @@ class CostLedger:
                 best = key
         if best is not None:
             return self.prices[best]
-        logger.warning("미지 모델 %r: %s 단가로 보수 추정", model, FALLBACK_PRICE_MODEL)
-        return self.prices.get(FALLBACK_PRICE_MODEL, PRICES_USD_PER_MTOK[FALLBACK_PRICE_MODEL])
+        fallback = self._fallback_price()
+        logger.warning("미지 모델 %r: 상한 단가 %s 로 보수 추정", model, fallback)
+        return fallback
+
+    def _fallback_price(self) -> tuple[float, float, float]:
+        """미지 모델 단가: 상한 상수와 (덮어쓴 것 포함) 모든 알려진 단가의 항목별 최댓값 — 절대 과소 추정하지 않는다."""
+        candidates = [UNKNOWN_MODEL_PRICE_CEILING, *self.prices.values()]
+        return (
+            max(float(c[0]) for c in candidates),
+            max(float(c[1]) for c in candidates),
+            max(float(c[2]) for c in candidates),
+        )
 
     def estimate(self, model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
         p_in, p_cached, p_out = self.price_for(model)
@@ -186,8 +231,16 @@ class CostLedger:
             self._by_date[date] = self._by_date.get(date, 0.0) + cost
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
+                with self.path.open("a+b") as fh:
+                    # 크래시로 잘린 마지막 줄(개행 없음) 뒤에 바로 붙이면 이번 정상 기록까지 손상 줄로 합쳐져
+                    # 재시작 시 버려진다(지출 과소 복원). 마지막 바이트가 개행이 아니면 개행을 먼저 쓴다.
+                    prefix = b""
+                    end = fh.seek(0, os.SEEK_END)
+                    if end > 0:
+                        fh.seek(end - 1)
+                        if fh.read(1) != b"\n":
+                            prefix = b"\n"
+                    fh.write(prefix + (line + "\n").encode("utf-8"))
             except OSError as e:
                 # 상태 저장 실패는 멈춘다(SPEC §0): 삼키면 재시작 후 합계가 0 으로 복원돼 월 예산을 조용히 넘긴다.
                 logger.error("비용 원장 쓰기 실패 %s: %s", self.path, e)

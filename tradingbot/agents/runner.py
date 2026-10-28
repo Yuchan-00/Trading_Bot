@@ -30,7 +30,7 @@ from pydantic import BaseModel, ValidationError
 from tradingbot.agents.roles import ROLES, RoleSpec, get_role
 from tradingbot.config import Settings
 from tradingbot.llm.backend import AgentBackend, AgentResult
-from tradingbot.llm.cost import BudgetExceeded
+from tradingbot.llm.cost import BudgetExceeded, project_call_cost
 from tradingbot.skills import SkillRegistry
 
 log = logging.getLogger("tradingbot.agents.runner")
@@ -165,7 +165,9 @@ class AgentRunner:
         try:
             model_name = self.settings.model_for(spec.tier)
             user_text = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-            projected = float(ledger.estimate(model_name, len(system) // 4 + len(user_text) // 4, 0, spec.max_tokens))
+            # 백엔드 호출 전 검사와 같은 최악 추정(캐시 쓰기 단가 + 토크나이저 여유) — 두 추정이 어긋나지 않게
+            projected = project_call_cost(ledger, model_name, len(system), len(user_text), spec.max_tokens,
+                                          cache_ttl=str(getattr(self.backend, "cache_ttl", "1h")))
         except Exception as exc:  # noqa: BLE001 - 추정 실패 시 예약 없이 백엔드 자체 검사에 맡긴다
             log.warning("예산 예약 추정 실패 role=%s type=%s", spec.role_id, type(exc).__name__)
             return None

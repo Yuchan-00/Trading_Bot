@@ -7,6 +7,9 @@
 - ``Notifier``           ``TradeEvent``를 한국어로 포맷해 보낸다. ``async_send=True``면 큐에 넣고 즉시 반환하고
                          데몬 워커 스레드가 전송한다. 실패하면 1s/3s/9s 간격으로 재시도하고(지연은 주입 가능),
                          끝내 실패하면 ``failed_log``(jsonl)에 이벤트와 오류를 남기고 ERROR 로그를 낸다.
+                         HTTP 429(flood control)면 ``retry_after``(본문 parameters.retry_after 또는 Retry-After
+                         헤더)만큼 기다리고(최대 ``RATE_LIMIT_MAX_WAIT_S``), 그 재시도는 재시도 예산에서 빼지 않는다
+                         (단, 레이트 리밋 추가 시도는 ``RATE_LIMIT_MAX_EXTRA_ATTEMPTS``회까지).
 
 불변식: 알림 실패는 절대 호출자(사이클)로 전파되지 않는다. ``notify()``는 예외를 던지지 않는다.
 """
@@ -31,6 +34,9 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 TELEGRAM_MAX_TEXT = 4096
 DEFAULT_RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0, 9.0)
 THESIS_MAX_CHARS = 200
+RATE_LIMIT_MAX_WAIT_S = 60.0          # 429 retry_after 대기 상한
+RATE_LIMIT_MAX_EXTRA_ATTEMPTS = 5     # 429 로 인한 추가 시도 상한(재시도 예산과 별도)
+REVIEW_TEXT_MAX_CHARS = 1000          # 일일 리뷰 본문(저널 telegram_text ≤400자 + 날짜 접두) 상한, 줄바꿈 유지
 
 EMOJI: dict[str, str] = {
     "entry": "🟢",
@@ -45,7 +51,11 @@ EMOJI: dict[str, str] = {
     "startup": "▶️",
     "shutdown": "⏹",
     "llm_paused": "⏸",
+    "post_trade_review": "📝",
 }
+
+# 체결 후 상태 저장 실패(extra.state_saved == False) 경고 줄 — 진입/청산 메시지 헤더 바로 아래에 붙인다
+STATE_SAVE_WARNING = "⚠️ 상태 저장 실패 — 체결은 됐으나 장부 미저장, 수동 확인 필요"
 
 EXIT_REASON_KO: dict[str, str] = {
     "stop_loss": "손절",
@@ -62,6 +72,46 @@ class TransportError(Exception):
     """전송 실패. 메시지에 비밀값이 들어 있지 않다."""
 
 
+class TransportRateLimited(TransportError):
+    """HTTP 429. ``retry_after``(초)는 서버가 요구한 대기 시간(알 수 없으면 None)."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: object) -> float | None:
+    """retry_after 값(초) 해석. 숫자·숫자 문자열만 받는다. 음수/NaN/해석 불가 → None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        f = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if f != f or f < 0 or f == float("inf"):
+        return None
+    return f
+
+
+def _retry_after_from_body(body: object) -> float | None:
+    """Bot API 오류 본문(dict / JSON str·bytes)에서 parameters.retry_after 를 꺼낸다."""
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = bytes(body).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(body, dict):
+        params = body.get("parameters")
+        if isinstance(params, dict):
+            return _parse_retry_after(params.get("retry_after"))
+    return None
+
+
 # ---------------------------------------------------------------- 전송
 @runtime_checkable
 class Transport(Protocol):
@@ -69,8 +119,11 @@ class Transport(Protocol):
         ...
 
 
-def _urllib_post(url: str, payload: dict, timeout_s: float) -> int:
-    """기본 HTTP POST(JSON). 상태 코드를 돌려준다. HTTPError도 상태 코드로 바꾼다."""
+def _urllib_post(url: str, payload: dict, timeout_s: float) -> int | tuple[int, float | None]:
+    """기본 HTTP POST(JSON). 상태 코드를 돌려준다. HTTPError도 상태 코드로 바꾼다.
+
+    HTTP 429면 ``(429, retry_after)`` 를 돌려준다(본문 parameters.retry_after 우선, 없으면 Retry-After 헤더).
+    """
     import urllib.error
     import urllib.request
 
@@ -82,7 +135,23 @@ def _urllib_post(url: str, payload: dict, timeout_s: float) -> int:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 - https 고정
             return int(resp.status)
     except urllib.error.HTTPError as e:
-        return int(e.code)
+        code = int(e.code)
+        if code != 429:
+            return code
+        retry_after: float | None = None
+        try:
+            raw = e.read()
+        except Exception:  # noqa: BLE001 - 본문이 없거나 읽기 실패
+            raw = None
+        if raw:
+            retry_after = _retry_after_from_body(raw)
+        if retry_after is None:
+            try:
+                headers = e.headers if e.headers is not None else e.hdrs
+                retry_after = _parse_retry_after(headers.get("Retry-After") if headers is not None else None)
+            except Exception:  # noqa: BLE001
+                retry_after = None
+        return (code, retry_after)
 
 
 class TelegramTransport:
@@ -90,6 +159,8 @@ class TelegramTransport:
 
     parse_mode는 쓰지 않는다(이스케이프 문제 회피). ``disable_web_page_preview=True``.
     ``http_post(url, payload) -> status_code``를 주입하면 네트워크 없이 테스트할 수 있다.
+    ``http_post`` 는 ``(status_code, extra)`` 를 돌려줄 수도 있다. extra 는 retry_after(초, 숫자) 또는
+    Bot API 응답 본문(dict / JSON str·bytes)이며, 429일 때 ``TransportRateLimited.retry_after`` 로 쓰인다.
     """
 
     def __init__(
@@ -97,7 +168,7 @@ class TelegramTransport:
         token: str,
         chat_id: str,
         *,
-        http_post: Callable[[str, dict], int] | None = None,
+        http_post: Callable[[str, dict], object] | None = None,
         timeout_s: float = 10,
     ) -> None:
         if not token:
@@ -147,10 +218,23 @@ class TelegramTransport:
             raise TransportError(
                 f"텔레그램 전송 실패: {type(e).__name__}: {self._scrub(str(e))}"
             ) from None
+        extra: object = None
+        if isinstance(status, (tuple, list)) and len(status) == 2:
+            status, extra = status[0], status[1]
         try:
-            status_int = int(status)
+            if isinstance(status, bool):
+                raise TypeError("bool status")
+            status_int = int(status)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             raise TransportError(f"텔레그램 응답 상태를 해석할 수 없음: {self._scrub(repr(status))}") from None
+        if status_int == 429:
+            if isinstance(extra, (int, float, str)) and not isinstance(extra, bool) \
+                    and _parse_retry_after(extra) is not None:
+                retry_after = _parse_retry_after(extra)
+            else:
+                retry_after = _retry_after_from_body(extra)
+            suffix = f" (retry_after={retry_after:g}s)" if retry_after is not None else ""
+            raise TransportRateLimited(f"텔레그램 응답 상태 429{suffix}", retry_after)
         if status_int != 200:
             raise TransportError(f"텔레그램 응답 상태 {status_int}")
         log.debug("텔레그램 전송 완료 (%d자)", len(text))
@@ -198,6 +282,15 @@ def _fmt_amount(x: float | None) -> str:
         return "-"
     s = f"{x:,.8f}".rstrip("0").rstrip(".")
     return s or "0"
+
+
+def _truncate_multiline(s: str | None, limit: int) -> str:
+    """줄바꿈을 유지하며 줄마다 공백을 정리하고 ``limit`` 자로 자른다(빈 줄 제거)."""
+    lines = [" ".join(line.split()) for line in (s or "").splitlines()]
+    out = "\n".join(line for line in lines if line)
+    if len(out) <= limit:
+        return out
+    return out[: limit - 1] + "…"
 
 
 def _truncate(s: str | None, limit: int = THESIS_MAX_CHARS) -> str:
@@ -388,29 +481,57 @@ class Notifier:
             return True
         attempts = self.retries + 1
         last_error = "unknown"
-        for i in range(attempts):
+        i = 0                 # 재시도 예산을 쓰는 실패 횟수
+        tries = 0             # 실제 시도 횟수
+        rate_limited_extra = 0
+        while i < attempts:
+            tries += 1
             try:
                 transport.send(text)
             except Exception as e:  # noqa: BLE001
                 last_error = f"{type(e).__name__}: {self._scrub_error(transport, str(e))}"
+                retry_after = self._retry_after_of(e)
+                if retry_after is not None and rate_limited_extra < RATE_LIMIT_MAX_EXTRA_ATTEMPTS:
+                    # 429: 서버가 요구한 시간만큼 기다리고, 재시도 예산은 쓰지 않는다
+                    rate_limited_extra += 1
+                    delay = min(max(self._delay_for(i), retry_after), RATE_LIMIT_MAX_WAIT_S)
+                    log.warning(
+                        "알림 전송 레이트 리밋 (kind=%s): %s — %.1fs 후 재시도 (%d/%d)",
+                        event.kind, last_error, delay, rate_limited_extra, RATE_LIMIT_MAX_EXTRA_ATTEMPTS,
+                    )
+                    self._safe_sleep(delay)
+                    continue
                 if i < attempts - 1:
                     delay = self._delay_for(i)
+                    if retry_after is not None:
+                        delay = min(max(delay, retry_after), RATE_LIMIT_MAX_WAIT_S)
                     log.warning(
                         "알림 전송 실패 (%d/%d, kind=%s): %s — %.1fs 후 재시도",
                         i + 1, attempts, event.kind, last_error, delay,
                     )
-                    try:
-                        self._sleep(delay)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    self._safe_sleep(delay)
+                i += 1
                 continue
             self.sent_count += 1
-            log.debug("알림 전송 성공 (kind=%s, 시도 %d)", event.kind, i + 1)
+            log.debug("알림 전송 성공 (kind=%s, 시도 %d)", event.kind, tries)
             return True
         self.failed_count += 1
-        log.error("알림 최종 실패 (kind=%s, 시도 %d회): %s", event.kind, attempts, last_error)
-        self._record_failure(event, text, last_error, attempts)
+        log.error("알림 최종 실패 (kind=%s, 시도 %d회): %s", event.kind, tries, last_error)
+        self._record_failure(event, text, last_error, tries)
         return False
+
+    def _safe_sleep(self, delay: float) -> None:
+        try:
+            self._sleep(delay)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _retry_after_of(exc: BaseException) -> float | None:
+        """레이트 리밋 예외이고 retry_after(초)를 알면 그 값, 아니면 None(일반 실패로 취급: 기본 지연·예산 소모)."""
+        if not isinstance(exc, TransportRateLimited):
+            return None
+        return _parse_retry_after(getattr(exc, "retry_after", None))
 
     @staticmethod
     def _scrub_error(transport: object, message: str) -> str:
@@ -468,6 +589,21 @@ class Notifier:
 
 
 # ---------------------------------------------------------------- 종류별 포맷
+def _state_save_failed(e: TradeEvent) -> bool:
+    """체결 후 상태 저장이 실패했다고 표시된 이벤트인가(``extra.state_saved is False``)."""
+    return (e.extra or {}).get("state_saved") is False
+
+
+def _add_state_save_warning(lines: list[str], e: TradeEvent) -> None:
+    """상태 저장 실패 경고 줄을 헤더 바로 아래에 넣는다(이미 본문에 같은 경고가 있으면 생략)."""
+    if not _state_save_failed(e):
+        return
+    if any(STATE_SAVE_WARNING in line for line in lines) or STATE_SAVE_WARNING in (e.thesis or "") \
+            or STATE_SAVE_WARNING in (e.reason or ""):
+        return
+    lines.insert(1, STATE_SAVE_WARNING)
+
+
 def _format_entry(e: TradeEvent) -> str:
     lines = [_header(EMOJI["entry"], "진입", e)]
     qty_line = f"수량 {_fmt_amount(e.base_amount)} @ {_fmt_price(e.price)}"
@@ -488,10 +624,31 @@ def _format_entry(e: TradeEvent) -> str:
         lines.append(f"확신도 {e.confidence:.2f}")
     if e.thesis:
         lines.append(f"근거: {_truncate(e.thesis)}")
+    _add_state_save_warning(lines, e)
+    return "\n".join(lines)
+
+
+def _format_post_trade_review(e: TradeEvent, review: str) -> str:
+    """전량 청산 뒤 사후분석 후속 알림(cycle ``extra.post_trade_review`` + ``extra.follow_up``).
+
+    청산 알림이 이미 수량·가격·손익을 보냈으므로 그 줄은 반복하지 않는다. 사후분석 문구는 줄바꿈을 유지한다.
+    """
+    head = _header(EMOJI["post_trade_review"], "사후분석", e)
+    reason = (e.reason or "").strip()
+    if reason and "\n" not in reason and len(reason) <= 40:
+        head += f" {EXIT_REASON_KO.get(reason, reason)}"
+    lines = [head]
+    if e.pnl_pct is not None:
+        lines.append(f"손익 {_fmt_pct(e.pnl_pct)}")
+    lines.append(_truncate_multiline(review, REVIEW_TEXT_MAX_CHARS) or "-")
     return "\n".join(lines)
 
 
 def _format_exit(e: TradeEvent, *, partial: bool = False) -> str:
+    ex = e.extra or {}
+    review = ex.get("post_trade_review")
+    if not partial and ex.get("follow_up") and isinstance(review, str) and review.strip():
+        return _format_post_trade_review(e, review)
     pnl = e.pnl_quote
     if partial:
         emoji, title = EMOJI["partial_exit"], "부분 청산"
@@ -512,6 +669,7 @@ def _format_exit(e: TradeEvent, *, partial: bool = False) -> str:
     lines.append(body)
     if e.equity is not None:
         lines.append(f"자본 {_fmt_quote(e.equity)}")
+    _add_state_save_warning(lines, e)
     return "\n".join(lines)
 
 
@@ -557,6 +715,14 @@ def _format_budget_exceeded(e: TradeEvent) -> str:
 
 def _format_daily_summary(e: TradeEvent) -> str:
     ex = e.extra or {}
+    if ex.get("heartbeat"):
+        # main.run_loop 4시간 하트비트 — 진짜 일일 요약(UTC 롤오버)과 구분되는 제목
+        lines = [_header("💓", "하트비트", e, with_symbol=False)]
+        if e.equity is not None:
+            lines.append(f"자본 {_fmt_quote(e.equity)}")
+        if e.reason:
+            lines.append(_truncate(e.reason))
+        return "\n".join(lines)
     title = "일일 요약"
     date = ex.get("date")
     if date:
@@ -585,7 +751,11 @@ def _format_daily_summary(e: TradeEvent) -> str:
     if isinstance(cost, (int, float)):
         lines.append(f"LLM 비용 ${cost:,.2f}")
     if e.reason and not date:
-        lines.append(_truncate(e.reason))
+        if ex.get("review_date"):
+            # 일일 리뷰(cycle._maybe_daily_review): 저널 telegram_text(≤400자, 줄 단위)를 줄바꿈째 보존
+            lines.append(_truncate_multiline(e.reason, REVIEW_TEXT_MAX_CHARS))
+        else:
+            lines.append(_truncate(e.reason))
     return "\n".join(lines)
 
 
@@ -661,7 +831,9 @@ __all__ = [
     "EMOJI",
     "EXIT_REASON_KO",
     "Notifier",
+    "STATE_SAVE_WARNING",
     "TelegramTransport",
     "Transport",
     "TransportError",
+    "TransportRateLimited",
 ]

@@ -9,6 +9,8 @@
   ``control/CLEAR``를 만든다. 실제 kill_switch 반영은 ``cycle``이 다음 사이클에 파일을 읽어서 한다.
 - **토큰**: 두 쓰기 요청은 ``X-Dashboard-Token`` 헤더가 ``control/dashboard_token`` 내용과 같아야 한다.
   ``create_app``이 파일이 없으면 ``secrets.token_urlsafe(24)``로 만든다. 토큰은 로그에 가린 형태로만 나온다.
+  토큰 파일은 처음부터 0600 으로 생성한다(``os.open``). 권한을 좁힐 수 없으면 경고를 남긴다.
+- **Host 검증**: 루프백 이름과 ``DASHBOARD_HOST`` 외의 Host 헤더는 400 (DNS 리바인딩 방어).
 - 응답 JSON은 결정적(``sort_keys=True, ensure_ascii=False``).
 """
 from __future__ import annotations
@@ -20,6 +22,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,6 +31,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from tradingbot import risk
 from tradingbot.config import HardLimits, Settings, mask_secret
@@ -343,6 +347,31 @@ def _backtest_summary(path: Path) -> dict | None:
     return {"name": path.name, "mtime_ms": mtime, "summary": summary}
 
 
+# ---------------------------------------------------------------- Host 허용 목록
+#: 루프백 이름. ``testserver`` 는 starlette/fastapi ``TestClient`` 의 기본 Host 다(공개 DNS 로 등록될 수 없는
+#: 단일 레이블 이름이라 리바인딩 공격자가 쓸 수 없다).
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]", "testserver")
+_WILDCARD_BIND = ("0.0.0.0", "::", "[::]", "*", "")
+
+
+def _allowed_hosts(settings: Settings) -> list[str]:
+    """대시보드가 받아들일 Host 헤더 목록 (포트는 TrustedHostMiddleware 가 떼고 비교한다).
+
+    ``DASHBOARD_HOST`` 가 와일드카드(0.0.0.0/::)면 사용자가 일부러 네트워크에 노출한 것이고 실제 접속
+    주소를 알 수 없으므로 Host 검증을 끈다(경고 로그). 그 외에는 루프백 + 설정된 호스트만 허용한다.
+    """
+    host = (getattr(settings, "dashboard_host", "") or "").strip()
+    if host in _WILDCARD_BIND:
+        log.warning("DASHBOARD_HOST=%r (와일드카드 바인딩) — Host 헤더 검증을 하지 않습니다", host)
+        return ["*"]
+    allowed = list(_LOOPBACK_HOSTS)
+    bare = host.strip("[]")
+    for h in (bare, f"[{bare}]" if ":" in bare else ""):
+        if h and h not in allowed:
+            allowed.append(h)
+    return allowed
+
+
 # ---------------------------------------------------------------- 앱
 def create_app(settings: Settings, data_dir: Path) -> FastAPI:
     """읽기 전용 대시보드 앱을 만든다. ``control/dashboard_token``이 없으면 생성한다."""
@@ -366,17 +395,44 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             log.warning("토큰 파일 읽기 실패 %s: %s", token_path, type(e).__name__)
         return None
 
+    def _ensure_token_private() -> None:
+        """기존 토큰 파일이 group/other 접근 가능하면 0600 으로 좁힌다. 실패하면 경고를 남긴다."""
+        try:
+            mode = stat.S_IMODE(token_path.stat().st_mode)
+        except OSError:
+            return
+        if mode & 0o077 == 0:
+            return
+        try:
+            token_path.chmod(0o600)
+            log.warning("대시보드 토큰 파일 권한 %s -> 0600 으로 좁힘: %s", oct(mode), token_path)
+        except OSError as e:
+            log.warning("대시보드 토큰 파일 권한(%s)을 좁히지 못함 %s: %s — 다른 사용자가 읽을 수 있음",
+                        oct(mode), token_path, type(e).__name__)
+
     # 토큰 준비 (파일 권한은 소유자만 읽기). 비었거나 깨진(UTF-8 아님) 파일은 새로 만든다.
+    # 파일은 처음부터 0600 으로 *생성*한다(os.open). umask 권한으로 만든 뒤 chmod 하면 그 사이에
+    # 토큰이 group/other 에게 읽힐 수 있다(sysrev SEC-1/SEC-2).
     try:
         control_dir.mkdir(parents=True, exist_ok=True)
         if _read_token_file() is None:
             token = secrets.token_urlsafe(24)
-            token_path.write_text(token + "\n", encoding="utf-8")
             try:
-                token_path.chmod(0o600)
-            except OSError:
+                token_path.unlink()  # 비었거나 깨진 기존 파일: 옛 권한을 물려받지 않도록 지운다
+            except FileNotFoundError:
                 pass
-            log.info("대시보드 토큰 생성: %s (%s)", token_path, mask_secret(token))
+            created = False
+            try:
+                fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.close(fd)
+                created = True
+            except FileExistsError:
+                pass  # 다른 프로세스가 방금 만들었다 → 그 토큰을 쓴다
+            if created:
+                # 내용은 0600 으로 이미 존재하는 빈 파일에 쓴다(O_TRUNC 는 권한을 바꾸지 않는다).
+                token_path.write_text(token + "\n", encoding="utf-8")
+                log.info("대시보드 토큰 생성: %s (%s)", token_path, mask_secret(token))
+        _ensure_token_private()
     except OSError as e:
         log.error("control 디렉터리/토큰 준비 실패 %s: %s", control_dir, e)
 
@@ -390,6 +446,12 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
     )
     app.state.settings = settings
     app.state.data_dir = data_dir
+
+    # Host 헤더 검증 (DNS 리바인딩 방어, sysrev SEC-3). 루프백 바인딩만으로는 악성 페이지가
+    # attacker.example → 127.0.0.1 로 리바인딩해 같은 출처가 되는 것을 막지 못한다.
+    allowed_hosts = _allowed_hosts(settings)
+    app.state.allowed_hosts = allowed_hosts
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
     # ------------------------------------------------------------ 내부 도우미
     def _load_state() -> BotState | None:

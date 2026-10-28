@@ -438,7 +438,10 @@ def test_news_seen_headlines_not_reanalysed_and_store_persists(make_runner, tmp_
     # 이전 이벤트는 bull/bear 에 여전히 전달된다(24h 이내)
     bull_p = payloads_for(backend2, "bull")[0]
     assert len(bull_p["news_events"]) == 2
-    assert bull_p["news_context"] is None       # 이번 사이클 뉴스 채널 호출 없음
+    # §20.3a.4: 새 헤드라인 없음 ≠ 기권 → news_context 는 null 이 아니다(market_tone 만 null, 총괄 news 블록과 같은 상태)
+    assert bull_p["news_context"] is not None
+    assert bull_p["news_context"]["market_tone"] is None
+    assert bull_p["news_context"]["risk_event_for_symbol"] is False
     # 한 개라도 새 헤드라인이면 그것만 보낸다
     runner3, backend3 = make_runner(happy_responses())
     run(runner3, make_scan(news=[*items, news_item("ETH 새 소식")]), store=NewsStore(path), now=NOW + 30 * 60_000)

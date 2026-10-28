@@ -35,6 +35,8 @@ RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY_S = 0.5
 DEPTH_BAND_PCT = 0.01  # 호가 깊이 집계 범위(최우선 호가 대비 1%)
 PAPER_AMOUNT_DECIMALS = 8
+OHLCV_PAGE_LIMIT = 1000  # ccxt binance 현물 klines 1회 상한(maxLimit). 이보다 큰 limit 은 since 로 페이지 조회
+_TF_UNIT_MS = {"s": 1_000, "m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
 
 
 # ---------------------------------------------------------------- 예외
@@ -232,6 +234,16 @@ def _order_not_found_types() -> tuple[type[BaseException], ...]:
 
 
 # ---------------------------------------------------------------- 데이터 파싱(공유)
+def _timeframe_ms(timeframe: str) -> int | None:
+    """'15m'·'1h'·'1d'·'1w' -> 밀리초. 알 수 없는 형식('1M' 등)은 None(페이지 조회 불가 → 단일 호출)."""
+    tf = str(timeframe or "").strip()
+    unit = tf[-1:]
+    if unit not in _TF_UNIT_MS or not tf[:-1].isdigit():
+        return None
+    n = int(tf[:-1])
+    return n * _TF_UNIT_MS[unit] if n > 0 else None
+
+
 def _parse_candles(rows: Any, *, drop_last: bool) -> list[Candle]:
     """ccxt OHLCV 행 -> Candle. ts 오름차순·중복 제거(같은 ts는 뒤 행 우선). drop_last면 마지막(미완) 봉 제거."""
     by_ts: dict[int, Candle] = {}
@@ -416,6 +428,7 @@ class _CcxtBase:
         self._clock_ms = clock_ms if clock_ms is not None else _now_ms
         self._futures_factory = futures_factory
         self._futures: Any | None = None
+        self._perp_marks: dict[str, tuple[int, float]] = {}   # symbol → (ts, markPrice) — fetch_futures_context 부산물
         self._markets: dict | None = None
         self._ex = exchange if exchange is not None else self._build_exchange(settings, with_keys=with_keys)
         self._configure_exchange(self._ex, sandbox=sandbox)
@@ -504,11 +517,39 @@ class _CcxtBase:
 
     # -- MarketData ---------------------------------------------------
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[Candle]:
-        """완료 봉만 반환. ``limit+1``을 받아 마지막(미완) 봉을 버린다. ts 오름차순·중복 제거."""
+        """완료 봉만 반환. ``limit+1``을 받아 마지막(미완) 봉을 버린다. ts 오름차순·중복 제거.
+
+        ``limit+1`` 이 거래소 1회 상한(1000)을 넘으면 ``since`` 로 페이지 조회한다(백테스트 장기간)."""
         if not isinstance(limit, int) or limit <= 0:
             raise OrderValidationError(f"limit은 양의 정수여야 함: {limit!r}")
-        rows = self._retry("fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, None, limit + 1)
-        return _parse_candles(rows, drop_last=True)
+        tf_ms = _timeframe_ms(timeframe)
+        if limit + 1 <= OHLCV_PAGE_LIMIT or tf_ms is None:
+            rows = self._retry("fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, None, limit + 1)
+            return _parse_candles(rows, drop_last=True)
+        return self._fetch_ohlcv_paged(symbol, timeframe, limit, tf_ms)
+
+    def _fetch_ohlcv_paged(self, symbol: str, timeframe: str, limit: int, tf_ms: int) -> list[Candle]:
+        """거래소 1회 상한(``OHLCV_PAGE_LIMIT``)을 넘는 ``limit`` — 백테스트 ``--days 90`` 등.
+
+        ``since = 현재 미완 봉 시작 - limit*tf`` 부터 1000봉씩 앞으로 넘기며 모은다. ts 중복 제거,
+        미완 봉(시작 >= 현재 봉 시작) 제거 후 최근 ``limit`` 개만 반환. 진전이 없거나 빈 응답이면 중단."""
+        open_ts = (int(self._clock_ms()) // tf_ms) * tf_ms   # 아직 닫히지 않은 봉의 시작
+        since = open_ts - limit * tf_ms
+        rows: list[Any] = []
+        max_pages = limit // OHLCV_PAGE_LIMIT + 3
+        for _ in range(max_pages):
+            batch = self._retry("fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, since, OHLCV_PAGE_LIMIT)
+            if not batch:
+                break
+            rows.extend(batch)
+            stamps = [t for t in (_as_int_ms(r[0]) if isinstance(r, (list, tuple)) and r else None for r in batch)
+                      if t is not None]
+            last_ts = max(stamps) if stamps else None
+            if last_ts is None or last_ts < since or last_ts + tf_ms >= open_ts:
+                break
+            since = last_ts + tf_ms
+        candles = [c for c in _parse_candles(rows, drop_last=False) if c.ts < open_ts]
+        return candles[-limit:]
 
     def fetch_ticker(self, symbol: str) -> Ticker:
         raw = self._retry("fetch_ticker", self._ex.fetch_ticker, symbol)
@@ -545,6 +586,22 @@ class _CcxtBase:
             log.info("%s 마크가격 조회 실패: %s", symbol, _scrub_exception(e, self._settings))
         return None
 
+    def fetch_perp_mark(self, symbol: str) -> float | None:
+        """무기한 선물 마크가격(SPEC §17 perp_premium_pct 용, ``MarketData`` 프로토콜 밖의 선택 확장).
+
+        직전 ``fetch_futures_context`` 의 펀딩비 응답 markPrice 를 60초 동안 재사용하고, 없으면
+        ``fetch_mark_price`` 로 보조 조회한다. 어떤 실패에도 예외 없이 None."""
+        try:
+            hit = self._perp_marks.get(symbol)
+            if hit is not None and 0 <= self._clock_ms() - hit[0] <= 60_000:
+                return hit[1]
+            base, quote = split_symbol(symbol)
+            px = self._fetch_mark_price(self._futures_client(), f"{base}/{quote}:{quote}", symbol)
+            return px if px is not None and px > 0 else None
+        except Exception as e:
+            log.info("%s 마크가격 조회 실패: %s", symbol, _scrub_exception(e, self._settings))
+            return None
+
     def fetch_futures_context(self, symbol: str) -> FuturesContext | None:
         """binanceusdm 공개 데이터(펀딩비·미결제약정·롱숏비). 어떤 실패에도 예외 없이 None."""
         try:
@@ -563,6 +620,8 @@ class _CcxtBase:
                         mark_px = _as_float(fr_info.get("markPrice"))
             except Exception as e:
                 log.info("%s 펀딩비 조회 실패: %s", symbol, _scrub_exception(e, self._settings))
+            if mark_px is not None and mark_px > 0:
+                self._perp_marks[symbol] = (self._clock_ms(), mark_px)
             try:
                 o = client.fetch_open_interest(fsym)
                 if isinstance(o, dict):

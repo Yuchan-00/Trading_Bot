@@ -843,9 +843,29 @@ class TestCodeMetrics:
         assert m["sortino"] == pytest.approx(mean / dd * math.sqrt(365))
         assert m["max_drawdown_pct"] == pytest.approx(10.0)
         assert m["total_return_pct"] == pytest.approx(8.9)
-        ann = 1.089 ** (365 / 3) - 1
-        assert m["calmar"] == pytest.approx(ann / 0.10)
+        assert m["calmar"] is None          # 일수익률 3개 < MIN_CALMAR_DAYS → 연율화하지 않는다
         assert m["equity_start"] == 100.0 and m["equity_end"] == 108.9
+
+    def test_calmar_known_value_with_enough_days(self):
+        n = J.MIN_CALMAR_DAYS
+        curve = [100.0, 90.0] + [90.0 * (1.005 ** i) for i in range(1, n)]   # 일수익률 n 개
+        m = J.code_metrics([], curve, None)
+        assert m["n_days"] == n
+        growth = curve[-1] / curve[0]
+        ann = growth ** (365 / n) - 1
+        assert m["max_drawdown_pct"] == pytest.approx(10.0)
+        assert m["calmar"] == pytest.approx(ann / 0.10)
+
+    def test_calmar_none_below_min_days(self):
+        n = J.MIN_CALMAR_DAYS - 1
+        curve = [100.0, 90.0] + [90.0 * (1.005 ** i) for i in range(1, n)]
+        m = J.code_metrics([], curve, None)
+        assert m["n_days"] == n and m["max_drawdown_pct"] > 0
+        assert m["calmar"] is None
+
+    def test_calmar_single_day_is_none(self):
+        m = J.code_metrics([], [100.0, 99.957], None)        # 하루치 −0.043% → ^365 연율화하면 ≈ −338
+        assert m["n_days"] == 1 and m["calmar"] is None
 
     def test_monotonic_curve(self):
         m = J.code_metrics([], [100.0, 101.0, 102.0, 103.0], None)

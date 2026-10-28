@@ -74,6 +74,7 @@ NOISE_SHARE_WINDOW = 20
 NOISE_SHARE_MIN = 5
 
 PERIODS_PER_YEAR = 365.0                      # 일 수익률 연율화
+MIN_CALMAR_DAYS = 30                          # calmar(연율화 수익률/MDD)는 일수익률 표본이 이만큼 쌓이기 전에는 None
 PF_INFINITE_CAP = 999.0                       # 손실 없는 PF(무한대)를 daily payload 에 싣는 상한값(null=데이터 없음과 구분)
 DEFAULT_CYCLE_MINUTES = 15                    # daily_review 가 state 미갱신 시 통계를 직접 계산할 때 쓰는 사이클 길이
 TELEGRAM_MAX_CHARS = 400
@@ -643,7 +644,8 @@ def code_metrics(
       avg_win_pct, avg_loss_pct(음수), expectancy_pct(=평균 pnl_pct), expectancy_quote, total_pnl_quote,
       avg_bars_held, by_exit_reason/by_symbol/by_setup({"count","pnl_pct_sum"}), attribution_buckets, noise_trade_share.
     - 자본곡선(일 단위 표본 가정): total_return_pct, max_drawdown_pct(양수 %), sharpe·sortino(일수익률 × √365),
-      calmar(연율화 수익률 / MDD), n_days.
+      calmar(연율화 수익률 / MDD — 일수익률 ``MIN_CALMAR_DAYS`` 개 미만이면 None: 며칠치를 ^365 로 연율화하면
+      −338 같은 무의미한 값이 된다), n_days.
     - BTC: ``btc_curve`` 가 같은 길이일 때 btc_buy_hold_pct, excess_vs_btc_pct, btc_max_drawdown_pct. 아니면 None.
     """
     trades = list(trades or [])
@@ -683,7 +685,7 @@ def code_metrics(
     total_ret = (curve[-1] / curve[0] - 1.0) * 100.0 if len(curve) >= 2 and curve[0] > 0 else None
     mdd = max_drawdown_pct(curve) if len(curve) >= 2 else None
     calmar: float | None = None
-    if total_ret is not None and mdd is not None and mdd > 0 and len(rets) >= 1:
+    if total_ret is not None and mdd is not None and mdd > 0 and len(rets) >= MIN_CALMAR_DAYS:
         growth = curve[-1] / curve[0]
         if growth > 0:
             ann = growth ** (PERIODS_PER_YEAR / len(rets)) - 1.0
@@ -1230,7 +1232,7 @@ def code_daily_summary(metrics_table: Mapping[str, Any], closed_count: int) -> s
 
 
 __all__ = [
-    "JournalState", "JOURNAL_STATE_FILE", "HARD_LIMITS_PAYLOAD", "MIN_SAMPLE",
+    "JournalState", "JOURNAL_STATE_FILE", "HARD_LIMITS_PAYLOAD", "MIN_SAMPLE", "MIN_CALMAR_DAYS",
     "journal_state_path", "load_journal_state", "save_journal_state", "append_journal_log",
     "evaluate_red_lines", "red_line_metrics", "bias_severities", "decay_state", "profit_factor",
     "disposition_ratio", "trades_per_day", "noise_trade_share", "refresh_stats", "code_metrics",

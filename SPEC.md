@@ -276,7 +276,7 @@ PRICES_USD_PER_MTOK = {  # (input, cached_input, output). 2026-10 기준. 값은
 class BudgetExceeded(Exception): ...
 class CostLedger:
     def __init__(self, path: Path, daily_budget_usd: float, monthly_budget_usd: float, *, now: Callable[[], datetime] | None = None)
-    def estimate(self, model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float      # 미지 모델은 opus 가격으로 보수 추정
+    def estimate(self, model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float      # 미지 모델은 알려진 최고 단가로 보수 추정(상한 $10/$1/$50 per MTok과 표의 항목별 최댓값)
     def record(self, *, role: str, model: str, input_tokens: int, cached_tokens: int, output_tokens: int, cache_write_tokens: int = 0, request_id: str | None = None) -> float   # jsonl append, 반환 cost
     def spent_today(self) -> float ; def spent_month(self) -> float
     def check(self, projected_cost_usd: float = 0.0) -> None    # 초과(또는 초과 예상)면 BudgetExceeded
@@ -288,9 +288,13 @@ class CostLedger:
 ```python
 class AnthropicBackend(AgentBackend):
     def __init__(self, settings: Settings, ledger: CostLedger, *, client: anthropic.Anthropic | None = None, cache_ttl: Literal["5m","1h"] = "1h")
-    # client 기본: anthropic.Anthropic(api_key=settings.anthropic_api_key, max_retries=2, timeout=timeout 기본 60)
+    # client 기본: anthropic.Anthropic(api_key=settings.anthropic_api_key, max_retries=0, timeout=timeout 기본 60)
+    #   재시도는 SDK 가 아니라 백엔드가 한다: 재시도 가능한 오류만 최대 2회, 역할 timeout(그리고 set_deadline 으로 받은 사이클 기한) 안에서만.
+    #   타임아웃 뒤에는 재시도하지 않는다. 주입된 client 는 자체 정책을 가진 것으로 보고 백엔드 재시도 0회.
     # complete():
-    #   1) ledger.check(projected = estimate(model, len(system)/4 + len(payload)/4, 0, max_tokens))  -> BudgetExceeded는 그대로 전파(호출자가 LLM 일시정지 처리)
+    #   1) ledger.check(projected = project_call_cost(...))  -> BudgetExceeded는 그대로 전파(호출자가 LLM 일시정지 처리)
+    #      최악값: 토큰 = ceil(문자수/4 × 1.3 토크나이저 여유), system 은 캐시 쓰기 단가(input × 1.25/2.0, ttl 5m/1h), 출력은 max_tokens 전부.
+    #      러너의 병렬 예산 예약도 같은 project_call_cost 를 쓴다.
     #   2) client.messages.create(model=settings.model_for(tier), max_tokens=max_tokens,
     #        system=[{"type":"text","text":system,"cache_control":{"type":"ephemeral","ttl":cache_ttl}}],
     #        messages=[{"role":"user","content": json.dumps(user_payload, ensure_ascii=False, sort_keys=True)}],
@@ -630,7 +634,10 @@ class AgentRunner:
 class CandidateContext(BaseModel): symbol: str; candidate: Candidate; technical: TechnicalOutput | None; flow: FlowSymbolView | None; bull: BullOutput | None; bear: BearOutput | None; risk: RiskCandidateVerdict | None; gates: list[GateDecision]; dropped_at: str | None
 class PositionContext(BaseModel): symbol: str; technical: TechnicalOutput | None; risk: RiskPositionView | None; red_line_hits: list[str]; health_history: list[int]; flagged_for_head: bool; flag_reason: str | None
 class PipelineResult(BaseModel): candidates: list[CandidateContext]; positions: list[PositionContext]; news: NewsOutput | None; flow: FlowOutput | None; risk_global: RiskGlobal | None; head: HeadOutput | None; abstained: list[str]; llm_calls: int; llm_cost_usd: float; gate_log: list[GateDecision]; head_skipped_reason: str | None
-def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: AgentRunner, journal_state: JournalState, now_ms: int, *, news_store: NewsStore) -> PipelineResult
+def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: AgentRunner, journal_state: JournalState, now_ms: int, *, news_store: NewsStore, should_stop: Callable[[str], bool] | None = None) -> PipelineResult
+# should_stop(stage): cycle 이 넘기는 사이클 기한 검사. 단계 경계("debate"·"risk_manager"·"head" 앞)에서 True 면 남은 LLM 단계를 HOLD 로
+#   (head_skipped_reason="cycle_deadline", 살아 있던 후보 dropped_at="cycle_deadline", abstained 에 "cycle_deadline"; LLM 일시정지 없음).
+#   cycle 은 파이프라인 동안 backend.set_deadline(기한 - 경과 - 25s) 를 걸고 끝나면 set_deadline(None).
 ```
 규칙: 분석가 3종은 `run_many` 로 동시에(technical 은 후보∪보유 각각, flow 1회, news 는 새 헤드라인 있을 때만); 모두 끝난 뒤 G1; 살아남은 후보에 bull·bear 를 **한 번의 run_many** 로; G2; risk_manager 1회(후보 생존 또는 보유 있음); G3; head 는 승인/조건부 후보 ≥1 또는 플래그 포지션 ≥1 일 때만 1회. `BudgetExceeded` 가 어느 단계에서든 나면 그 시점까지의 결과로 HOLD 처리하고 `abstained` 에 "budget" 기록(예외는 cycle 로 전파해 LLM 일시정지 처리). 어떤 역할 출력도 다른 분석가의 입력이 되지 않는다(bull/bear/risk/head 만 상위 출력을 본다).
 

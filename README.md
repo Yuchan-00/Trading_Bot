@@ -56,7 +56,8 @@ Python 3.11 이상. 패키지: `anthropic`, `ccxt`, `pydantic`, `fastapi`, `feed
 ```dotenv
 MODE=paper                      # paper | testnet | live
 ANTHROPIC_API_KEY=sk-ant-...    # https://console.anthropic.com
-AGENT_BACKEND=anthropic         # mock 이면 LLM 없이 오프라인 실행(보수적 HOLD)
+AGENT_BACKEND=anthropic         # mock 이면 LLM 없이 실행(시세·뉴스는 --offline-fixture 없으면 여전히 네트워크 필요)
+MOCK_SCENARIO=conservative      # AGENT_BACKEND=mock 일 때만: conservative(HOLD) | approve(진입 경로)
 MODEL_ANALYSIS=claude-haiku-5-5  # 기술·파생·뉴스·저널
 MODEL_RESEARCH=claude-sonnet-5-5 # 강세·약세·리스크
 MODEL_HEAD=claude-opus-5-5       # 총괄
@@ -84,6 +85,10 @@ python -m tradingbot.main run --once     # 1사이클만
 ```
 
 ```bash
+python -m tradingbot.main run --cycle-minutes 5   # 사이클 주기(분) 덮어쓰기 (CYCLE_MINUTES 대신)
+```
+
+```bash
 python -m tradingbot.main dashboard      # http://127.0.0.1:8787
 ```
 
@@ -99,7 +104,23 @@ python -m tradingbot.main status         # 상태 요약
 python -m tradingbot.main stop --reason "수동 정지"   # 다음 사이클에 킬스위치
 ```
 
-키 없이 동작을 확인하려면: `MODE=paper AGENT_BACKEND=mock` 으로 `run --once` (보수적 HOLD). 합성 시세로 돌리는 `--offline-fixture` 옵션은 구현 후 이 문서를 갱신합니다.
+```bash
+python -m tradingbot.main clear-stop     # control/STOP 삭제 + control/CLEAR 작성 → 다음 사이클에 킬스위치 해제
+```
+
+킬스위치는 자동으로 풀리지 않습니다. `stop`(또는 낙폭 사다리 −6% 자동 STOP_ALL)으로 멈춘 뒤 거래를 재개하려면 사람이 `clear-stop`(또는 대시보드 **해제(CLEAR)** 버튼)을 실행해야 합니다.
+
+키·네트워크 없이 동작을 확인하려면 `--offline-fixture`(paper 전용)를 씁니다. ccxt 시세 대신 결정적 합성 시세를 쓰고 뉴스 조회를 끄며, 백엔드는 mock 으로 강제되고 텔레그램 전송은 꺼집니다. 데이터는 실제 paper 기록을 오염시키지 않도록 `<DATA_DIR>/offline_fixture/` 에 따로 씁니다.
+
+```bash
+MODE=paper AGENT_BACKEND=mock MOCK_SCENARIO=approve python -m tradingbot.main run --once --offline-fixture       # 진입 경로
+```
+
+```bash
+MODE=paper AGENT_BACKEND=mock MOCK_SCENARIO=conservative python -m tradingbot.main run --once --offline-fixture  # 보수적 HOLD 경로
+```
+
+`--offline-fixture` 없이 `AGENT_BACKEND=mock` 만 쓰면 LLM 호출만 빠질 뿐, 시세(Binance/ccxt)와 뉴스(RSS)는 그대로 네트워크로 가져옵니다.
 
 ### 한 사이클에서 일어나는 일
 1. **G0 사전점검(코드)**: 킬스위치, 낙폭 사다리, 당일 손실, 연속 손실, LLM 일시정지, 예산, 데이터 품질, 펀딩 정산 분(00/08/16 UTC ±1분 신규 주문 금지).
@@ -115,11 +136,11 @@ python -m tradingbot.main stop --reason "수동 정지"   # 다음 사이클에 
 
 진입 · 청산(모든 사유와 손익) · 부분체결/거부/거래소 오류 · 게이트에 의한 강등(총괄 BUY→HOLD, 리스크 거부, 약세 킬) · 중단/해제(일일 한도, 연속 손실, 낙폭 사다리, 킬스위치) · 레짐 전환 · 뉴스 risk_event · 포지션 건강도 하락 · 일일 리뷰(00:05 UTC) · 시작/종료/오류/LLM 일시정지 · 하트비트(4시간).
 
-알림은 큐에 넣고 별도 스레드가 보내므로 텔레그램 장애가 거래를 막지 않습니다. 실패한 메시지는 `logs/notify_failed.jsonl`에 남습니다.
+알림은 큐에 넣고 별도 스레드가 보내므로 텔레그램 장애가 거래를 막지 않습니다. 실패한 메시지는 `logs/failed_notifications.jsonl`에 남습니다.
 
 ## 6. 대시보드
 
-`python -m tradingbot.main dashboard` 후 브라우저에서 `http://127.0.0.1:8787`. 외부 CDN 없이 동작하며 파일만 읽습니다(상태·포지션·결정·거래·비용·백테스트·자본 스파크라인). **STOP** 버튼은 `control/dashboard_token` 파일의 토큰을 입력해야 동작하고, `control/STOP` 파일을 만들어 다음 사이클에 킬스위치를 켭니다.
+`python -m tradingbot.main dashboard` 후 브라우저에서 `http://127.0.0.1:8787`. 외부 CDN 없이 동작하며 파일만 읽습니다(상태·포지션·결정·거래·비용·백테스트·자본 스파크라인). **STOP** 버튼은 `control/dashboard_token` 파일의 토큰을 입력해야 동작하고, `control/STOP` 파일을 만들어 다음 사이클에 킬스위치를 켭니다. **해제(CLEAR)** 버튼(같은 토큰 필요)은 `control/STOP`을 지우고 `control/CLEAR`를 만들어 다음 사이클에 킬스위치를 풉니다 — CLI의 `clear-stop`과 같습니다.
 
 ## 7. 스킬과 역할
 

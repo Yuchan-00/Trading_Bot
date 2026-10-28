@@ -22,6 +22,7 @@ LLM 돈을 쓰기 전에 도는 결정적 데이터·피처 계층이다. 한 �
 부가 상태(메모리, ``cache_dir`` 가 있으면 ``scanner_history.json`` 에 원자적으로 저장):
 - 종목별 선물 관측 이력(펀딩·OI·롱숏비) 7일 — ``funding_7d_mean``·``funding_z``·``oi_change_24h`` 계산용
   (``MarketData`` 에는 펀딩 이력 API 가 없다. ``market.fetch_funding_history(symbol)`` 이 있으면 그것을 쓴다).
+- 무기한 선물 마크가격도 프로토콜에 없다. ``market.fetch_perp_mark(symbol)`` 이 있으면 ``perp_premium_pct`` 계산에 쓴다.
 - 유니버스 평균 롱숏비 이력 — 종합심리 ``ls_pctile`` 용.
 
 뉴스: ``news_fetcher`` 가 None 이면 **뉴스를 조회하지 않는다**(오프라인 안전). 실운용은
@@ -478,6 +479,7 @@ class _SymData:
     candles: dict[str, list[Candle]] = field(default_factory=dict)
     orderbook: OrderBookSummary | None = None
     futures: FuturesContext | None = None
+    perp_mark: float | None = None
     indicators: dict[str, IndicatorSet] = field(default_factory=dict)
     quality: QualityReport | None = None
     feature_pack: FeaturePack | None = None
@@ -601,7 +603,20 @@ class Scanner:
         except Exception as e:  # 프로토콜상 예외 금지지만 방어
             log.info("%s 선물 컨텍스트 실패: %s", symbol, type(e).__name__)
             d.futures = None
+        d.perp_mark = self._perp_mark(symbol)
         return d
+
+    def _perp_mark(self, symbol: str) -> float | None:
+        """무기한 선물 마크가격(SPEC §17 perp_premium_pct 용). ``MarketData`` 프로토콜(동결 계약)에는 없으므로
+        ``market.fetch_perp_mark(symbol)`` 이 있으면 그것을 쓴다. 미지원·실패·비양수면 None(프리미엄 null)."""
+        fn = getattr(self.market, "fetch_perp_mark", None)
+        if not callable(fn):
+            return None
+        try:
+            return _pos(fn(symbol))
+        except Exception as e:
+            log.info("%s 선물 마크가격 조회 실패: %s", symbol, type(e).__name__)
+            return None
 
     # ------------------------------------------------------------ 선물 이력
     def _record_flow(self, symbol: str, fut: FuturesContext | None, now_ms: int) -> None:
@@ -725,7 +740,7 @@ class Scanner:
                 hist_now = d.funding_prior + ([_num(d.futures.funding_rate)] if d.futures is not None
                                               and _num(d.futures.funding_rate) is not None else [])
                 d.flow_pack = build_flow_pack(sym, d.futures, hist_now, d.orderbook, d.ticker,  # type: ignore[arg-type]
-                                              None, d.candles.get("1h", []), self._prev_oi(sym, now_ms))
+                                              d.perp_mark, d.candles.get("1h", []), self._prev_oi(sym, now_ms))
             except Exception as e:
                 log.warning("%s 피처 계산 실패: %s", sym, type(e).__name__)
                 skipped.append({"symbol": sym, "reason": f"feature_error:{type(e).__name__}"})

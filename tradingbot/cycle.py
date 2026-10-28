@@ -1,20 +1,31 @@
 """한 사이클 실행기 (SPEC §15 골격 + §22 확정 순서, v2.1).
 
 ``Cycle.run_once()`` 순서(고정)
-1. 잠금(``bot.lock``) 확인·갱신, ``control/STOP`` → kill, ``control/CLEAR`` → kill 해제(파일 삭제).
-2. 상태(메모리의 Portfolio) 사이클 증가, 날짜 롤오버(전일 ``daily_summary`` notify) +
-   저널 일일 리뷰(00:05 UTC 이후 첫 사이클).
-3. ``Scanner.scan`` → 마크 갱신, equity·peak 갱신, 낙폭 사다리(−6% 이면 ``set_kill("drawdown_stop_all")`` + notify).
+1. 잠금(``bot.lock``) 확인·갱신, ``control/STOP`` → kill, ``control/CLEAR`` → kill 해제(낙폭 정지 해제면 최고자본
+   재설정까지 같은 저장에) → 저장 → notify → 파일 삭제(삭제 실패는 알림을 막지 않는다).
+2. 상태(메모리의 Portfolio) 사이클 증가, 날짜 롤오버(전일 ``daily_summary`` notify), 저널 상태 ↔ 장부 대사
+   (``Position.thesis`` 로 논지 복구, 미보유 심볼 항목 정리).
+3. ``Scanner.scan``(testnet/live 는 거래소 자본 기준 ``planned_notional``; 뉴스 피드가 없으면 묵은 headline_polarity
+   제거) → 마크 갱신, equity·peak 갱신, 낙폭 사다리(−6% 이면 ``set_kill("drawdown_stop_all")`` + notify) →
+   일별 자본 곡선 기록 → testnet/live 거래소 잔고 대사(유령 포지션 정리) → 저널 일일 리뷰(00:05 UTC 이후 첫 사이클).
 4. **코드 청산**: 보유마다 ``risk.check_exits`` → market_sell → ``close_position`` → ``save`` → notify(exit)
-   → 저널 사후분석(실패 무시).
-5. G0. 실패면 결정 로그·보고서 쓰고 종료(LLM 0회).
+   → 저널 사후분석(실패 무시) → notify(사후분석 문구).
+5. G0(새 중단·해제는 notify). 실패면 결정 로그·보고서 쓰고 종료(LLM 0회).
 6. ``run_pipeline``. ``BudgetExceeded``(→ ``PipelineResult.budget_exceeded``) → ``pause_llm(다음 UTC 자정)`` +
    notify(budget_exceeded); 인증 오류 기권 다수 → ``pause_llm(60분)`` + notify(llm_paused).
    risk_manager 가 돈 뒤 보유 종목의 ``thesis_history``·``prev_assumption_status`` 를 저널 상태에 기록한다.
-7. head 결정 처리: SELL(보유) → 매도(risk action ``trim`` 이면 50%, 그 외 전량)·저장·notify(exit, head_sell);
-   BUY → G4 → OrderPlan → market_buy → ``open_position``(논지 JSON) + 저널에 구조화 논지·진입 판단 스냅샷 →
-   ``save`` → notify(entry). G4 강등은 notify(order_rejected, "gate_downgrade: ..."). HOLD 는 로그만.
+7. head 결정 처리: SELL(보유) → 매도(risk action ``trim`` 이고 코드 청산 사유(레드라인·이름 경보·기술 exit·risk exit)가
+   없을 때만 50%, 그 외 전량; 50% 몫이나 잔량이 최소 주문 금액 미만이면 전량)·저장·notify(exit, head_sell);
+   BUY → G4 → OrderPlan → market_buy → ``open_position``(논지 JSON) → ``save`` → notify(entry) → 저널에 구조화
+   논지·진입 판단 스냅샷(실패해도 체결·저장·알림에 영향 없음). G4 강등은 notify(order_rejected, "gate_downgrade: ...").
+   HOLD 는 로그만.
 8. 결정 로그(``logs/decisions.jsonl``), 사이클 보고서(``logs/cycles/``), 상태 저장, ``CycleSummary`` 반환.
+
+체결 안전장치(testnet/live)
+- 주문 뒤 브로커가 예외를 내도 주문 전후 거래소 잔고 변화로 체결을 확인하면 그 체결로 기록한다(손절 없는 고아 보유·
+  유령 포지션 방지). 장부 밖 보유(팔 수 있는 크기)가 있는 종목은 사지 않는다.
+- 매도 뒤 팔 수 없는 잔량(정밀도·최소 금액 미만)은 전량 청산으로 기록한다(잔량 상각, 슬롯 점유 방지).
+- 체결 뒤 상태 저장이 실패해도 체결 알림(경고 포함)을 보내고 ``StateSaveError`` 를 전파한다.
 
 에러 정책
 - 모든 단계는 ``try/except`` 로 감싸 로그 + ``error`` 이벤트 notify 후 다음 단계로 간다.
@@ -29,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 import traceback
 from collections.abc import Callable, Mapping
@@ -38,6 +50,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tradingbot import features as F
 from tradingbot import gates as G
 from tradingbot import journal as J
 from tradingbot import reports
@@ -45,15 +58,15 @@ from tradingbot import risk
 from tradingbot.agents import payloads as P
 from tradingbot.agents.pipeline import CandidateContext, NewsStore, PipelineResult, effective_gate, run_pipeline
 from tradingbot.agents.runner import AgentRunner, _raised_from_cost_ledger
-from tradingbot.agents.schemas import HeadDecision
+from tradingbot.agents.schemas import HeadDecision, Thesis
 from tradingbot.config import ConfigError, HardLimits, Settings, mask_secret
-from tradingbot.exchange import Broker, MarketData
+from tradingbot.exchange import Broker, MarketData, OrderValidationError
 from tradingbot.journal import JournalState
 from tradingbot.llm.backend import AgentBackend
 from tradingbot.llm.cost import BudgetExceeded, CostLedger
-from tradingbot.models import ClosedTrade, ExitReason, OrderRequest, Position, TradeEvent
-from tradingbot.notify import Notifier
-from tradingbot.portfolio import CorruptStateError, Portfolio
+from tradingbot.models import ClosedTrade, ExitReason, Fill, OrderRequest, Position, TradeEvent
+from tradingbot.notify import STATE_SAVE_WARNING, Notifier  # noqa: F401 - STATE_SAVE_WARNING 재노출(호환)
+from tradingbot.portfolio import PARTIAL_FILL_TOLERANCE, CorruptStateError, Portfolio
 from tradingbot.scanner import ScanResult, Scanner
 from tradingbot.skills import SkillRegistry
 
@@ -82,11 +95,25 @@ NEWS_STORE_FILENAME = "news_store.json"
 CACHE_DIRNAME = "cache"
 
 CYCLE_DEADLINE_S = 300.0                 # 사이클 기한(5분)
+LLM_DEADLINE_RESERVE_S = 25.0            # 백엔드 LLM 기한 = 사이클 기한 - 경과 - 이 몫(매수·주문·저장용)
 AUTH_PAUSE_MINUTES = 60                  # 인증 오류 → LLM 60분 일시정지
 TRIM_FRACTION = 0.5                      # risk action "trim" + head SELL → 50% 매도
 DAILY_REVIEW_AFTER = dtime(0, 5)         # 일일 리뷰는 00:05 UTC 이후 첫 사이클
 DEADLINE_REASON = "cycle_deadline"
 MAX_ERROR_TEXT = 200
+BTC_SYMBOL = "BTC/USDT"
+
+NEWS_TONE_TTL_MS = 24 * 3_600_000        # market_tone 유효기간(뉴스 이벤트와 같은 24h) — 지나면 headline_polarity=None
+EQUITY_SERIES_FILENAME = "equity_daily.json"   # 일별 시작 자본·BTC 종가·LLM 호출 카운터(일일 리뷰 지표용)
+EQUITY_SERIES_CAP = 800                  # 보관할 일별 점 개수 상한
+LLM_COUNTER_DAYS = 60                    # 일별 LLM 카운터 보관 일수
+MIN_DAYS_FOR_ANNUALISED = J.MIN_CALMAR_DAYS  # calmar(연율화)는 일수익률 표본이 이만큼 쌓이기 전에는 null(journal 과 같은 값)
+RECONCILE_TOLERANCE = 0.01               # testnet/live: 거래소 base 가 장부보다 1% 넘게 적으면 장부를 맞춘다
+RECONCILE_STRIKES = 2                    # 같은 부족이 연속 2사이클 관찰되면 대사
+RECOVERY_MIN_SHARE = 0.01                # 주문 예외 뒤 잔고 변화가 요청 규모의 1% 이상이면 체결로 본다
+# G0 중단 알림에서 뺄 코드: 포지션 수·펀딩 창은 일상적, 킬스위치·예산·LLM 일시정지는 각자 알림이 따로 있다
+HALT_SILENT_CODES = frozenset({"max_positions", "funding_window", "kill_switch", "drawdown_stop_all",
+                               "llm_budget", "llm_paused"})
 
 
 # ======================================================================= 예외·요약
@@ -297,7 +324,14 @@ class Cycle:
         self.news_store = news_store if news_store is not None else NewsStore(self.data_dir / NEWS_STORE_FILENAME)
         self.journal_state = journal_state if journal_state is not None else J.load_journal_state(self.data_dir)
         self._last_market_tone: float | None = None
+        self._last_market_tone_ts: int | None = None
         self._finished_day: Any = None            # 마지막 롤오버로 끝난 DailyStats(일일 리뷰용)
+        self._active_halts: set[str] = set()      # 지금 걸려 있는(알림 보낸) G0 중단 코드
+        self._lifted_halts: set[str] = set()      # 이 프로세스에서 해제 알림을 보낸 코드(다시 걸리면 다시 알림)
+        self._consumed_control: dict[str, int] = {}   # 처리했지만 삭제 실패한 control 파일 kind → ts
+        self._reconcile_strikes: dict[str, int] = {}  # 거래소 잔고 < 장부 가 연속 관찰된 횟수(일시 오류 방지)
+        self.series_path = self.data_dir / EQUITY_SERIES_FILENAME
+        self._series: dict[str, Any] = self._load_series()
         self._secrets = tuple(s for s in (settings.anthropic_api_key, settings.binance_api_key,
                                           settings.binance_api_secret, settings.telegram_bot_token) if s)
 
@@ -413,6 +447,269 @@ class Cycle:
             bal[base] = bal.get(base, 0.0) + max(0.0, float(pos.base_amount))
         self.broker.set_balances(bal)  # type: ignore[attr-defined]
 
+    # ------------------------------------------------------------ 거래소 잔고 도우미(testnet/live)
+    @property
+    def _exchange_mode(self) -> bool:
+        return self.settings.mode != "paper"
+
+    def _safe_free_base(self, symbol: str) -> float | None:
+        try:
+            v = float(self.broker.free_base(symbol))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s 가용 base 조회 실패 type=%s", symbol, type(exc).__name__)
+            return None
+        return v if math.isfinite(v) and v >= 0 else None
+
+    def _safe_free_quote(self) -> float | None:
+        try:
+            v = float(self.broker.free_quote())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("가용 quote 조회 실패 type=%s", type(exc).__name__)
+            return None
+        return v if math.isfinite(v) and v >= 0 else None
+
+    def _min_order(self, symbol: str) -> float:
+        try:
+            v = float(self.broker.min_order_usdt(symbol))
+            if math.isfinite(v) and v > 0:
+                return v
+        except Exception:  # noqa: BLE001
+            pass
+        return float(HardLimits.MIN_ORDER_USDT)
+
+    def _rounded(self, symbol: str, amount: float) -> float:
+        """거래소 정밀도로 내린 수량(양수가 아니거나 변환 불가면 0)."""
+        if not _pos(amount):
+            return 0.0
+        try:
+            v = float(self.broker.amount_to_precision(symbol, float(amount)))
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return v if math.isfinite(v) and v > 0 else 0.0
+
+    def _sellable(self, symbol: str, amount: float, price: float | None) -> bool:
+        """그 수량을 따로 팔 수 있는가(정밀도 내림 후 0 이 아니고, 가격을 알면 최소 주문 금액 이상)."""
+        r = self._rounded(symbol, amount)
+        if r <= 0:
+            return False
+        if _pos(price) and r * float(price) < self._min_order(symbol):  # type: ignore[arg-type]
+            return False
+        return True
+
+    def _planned_notional(self) -> float | None:
+        """testnet/live: 리스크 팩 충격 추정용 계획 주문액 = (거래소 free quote + 보유 평가액) × MAX_POSITION_PCT.
+
+        paper 는 None(스캐너가 상태의 가상 잔고로 추정한다).
+        """
+        if not self._exchange_mode:
+            return None
+        q = self._safe_free_quote()
+        if q is None:
+            return None
+        eq = q
+        for pos in self.state.positions.values():
+            px = _pos(pos.last_mark) or _pos(pos.entry_price) or 0.0
+            eq += max(0.0, float(pos.base_amount)) * px
+        return eq * HardLimits.MAX_POSITION_PCT if eq > 0 else None
+
+    # ------------------------------------------------------------ 뉴스 톤(headline_polarity)
+    def _clear_tone(self) -> None:
+        self._last_market_tone = None
+        self._last_market_tone_ts = None
+
+    def _current_tone(self, run: _Run) -> float | None:
+        """마지막 market_tone(24h 이내만). 지나면 지운다(SPEC §18: 없으면 None)."""
+        ts = self._last_market_tone_ts
+        if self._last_market_tone is not None and (ts is None or run.now_ms - ts > NEWS_TONE_TTL_MS):
+            log.info("market_tone 만료(%s) — headline_polarity 없음", ts)
+            self._clear_tone()
+        return self._last_market_tone
+
+    def _apply_news_availability(self, run: _Run) -> None:
+        """뉴스 피드가 없으면(news_available=False) 묵은 톤을 지우고 종합심리에서 headline_polarity 를 뺀다."""
+        scan = run.scan
+        if scan is None or scan.news_available:
+            return
+        self._clear_tone()
+        sent = scan.sentiment
+        comps = dict(sent.components or {})
+        if comps.get("headline_polarity") is None:
+            return
+        comps["headline_polarity"] = None
+        norm = {k: float(v) for k, v in comps.items() if k in F._SENTIMENT_WEIGHTS and _finite(v)}
+        if norm:
+            wsum = sum(F._SENTIMENT_WEIGHTS[k] for k in norm)
+            score: float | None = sum(F._SENTIMENT_WEIGHTS[k] * v for k, v in norm.items()) / wsum
+        else:
+            score = None
+        new = sent.model_copy(update={"components": comps, "score_0_100": score,
+                                      "label": F.sentiment_label(score)})
+        run.scan = scan.model_copy(update={"sentiment": new})
+        log.info("뉴스 피드 없음 — 종합심리에서 묵은 headline_polarity 제거")
+
+    # ------------------------------------------------------------ 일별 자본 곡선(일일 리뷰 지표)
+    def _load_series(self) -> dict[str, Any]:
+        empty: dict[str, Any] = {"points": [], "llm": {}}
+        p = self.series_path
+        if not p.is_file():
+            return empty
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("일별 자본 곡선 파일을 읽지 못함(%s) — 새로 시작", type(exc).__name__)
+            return empty
+        if not isinstance(obj, Mapping):
+            return empty
+        pts = [dict(x) for x in obj.get("points") or [] if isinstance(x, Mapping)
+               and isinstance(x.get("date"), str) and _pos(x.get("equity"))]
+        llm = {str(k): dict(v) for k, v in (obj.get("llm") or {}).items() if isinstance(v, Mapping)}
+        return {"points": sorted(pts, key=lambda x: x["date"]), "llm": llm}
+
+    def _save_series(self, run: _Run) -> None:
+        p = self.series_path
+        tmp = p.with_name(p.name + ".tmp")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(self._series, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as exc:
+            # 보조 상태 — 사이클을 멈추지 않는다
+            run.errors.append(f"equity_series_save: {type(exc).__name__}")
+            log.error("일별 자본 곡선 저장 실패 type=%s", type(exc).__name__)
+
+    def _record_day_point(self, run: _Run) -> None:
+        """그날 첫 사이클의 자본(=전날 마감 자본)과 BTC 시세를 일별 곡선에 남긴다."""
+        if not _pos(run.equity):
+            return
+        today = run.now.strftime("%Y-%m-%d")
+        pts: list[dict] = self._series["points"]
+        if pts and pts[-1]["date"] >= today:
+            return
+        btc = _pos(run.scan.marks.get(BTC_SYMBOL)) if run.scan is not None else None
+        pts.append({"date": today, "ts": run.now_ms, "equity": float(run.equity), "btc": btc})
+        if len(pts) > EQUITY_SERIES_CAP:
+            del pts[: len(pts) - EQUITY_SERIES_CAP]
+        self._save_series(run)
+
+    def _count_llm(self, run: _Run) -> None:
+        """당일 LLM 호출·기권 수 누적(일일 리뷰 ``metrics_table.llm``)."""
+        today = run.now.strftime("%Y-%m-%d")
+        llm: dict[str, dict] = self._series["llm"]
+        c = llm.setdefault(today, {"calls": 0, "abstain": 0})
+        res = run.result
+        if res is not None:
+            c["calls"] = int(c.get("calls", 0)) + int(res.llm_calls)
+            c["abstain"] = int(c.get("abstain", 0)) + len(res.abstained)
+        for k in sorted(llm)[:-LLM_COUNTER_DAYS]:
+            llm.pop(k, None)
+        self._save_series(run)
+
+    # ------------------------------------------------------------ 대사(reconciliation)
+    def _reconcile_journal(self, run: _Run) -> None:
+        """저널 상태를 장부(state.positions)에 맞춘다(재시작·충돌·저널 파일 손상 뒤에도 레드라인이 살아 있게).
+
+        - 보유 중인데 저널 논지가 없으면 ``Position.thesis`` JSON 에서 복구한다(빈 thesis_history·entry_verdicts).
+        - 보유하지 않는 심볼의 저널 항목(청산 후 정리 전에 죽은 경우)은 코드 사후분석 기록을 남기고 지운다.
+        """
+        js = self.journal_state
+        held = self.state.positions
+        changed = False
+        for sym, pos in sorted(held.items()):
+            if sym in js.thesis:
+                continue
+            try:
+                th = Thesis.model_validate(json.loads(pos.thesis))
+            except Exception:  # noqa: BLE001 - 논지 JSON 이 없거나 형식이 다르면 복구할 것이 없다
+                continue
+            js.thesis[sym] = th
+            if sym not in js.entry_verdicts:
+                js.entry_verdicts[sym] = J.normalize_entry_verdicts(None)
+            js.thesis_history.setdefault(sym, [])
+            js.health_history.setdefault(sym, [])
+            js.news_risk_after_entry.setdefault(sym, [])
+            changed = True
+            log.warning("%s 저널 논지 없음 — 포지션 논지에서 복구(레드라인 %d개)", sym, len(th.red_lines))
+        orphans: set[str] = set()
+        for d in (js.thesis, js.entry_verdicts, js.thesis_history, js.prev_assumption_status,
+                  js.news_risk_after_entry, js.health_history):
+            orphans |= {k for k in d if k not in held}
+        for sym in sorted(orphans):
+            trade = next((t for t in reversed(self.state.closed_trades) if t.symbol == sym), None)
+            if trade is not None:
+                try:
+                    reports.append_journal(self.journal_path, trade,
+                                           {"code_summary": J.code_post_trade_summary(trade), "llm": False,
+                                            "reconciled": True})
+                except (OSError, TypeError, ValueError) as exc:
+                    run.errors.append(f"journal_log:{sym}: {type(exc).__name__}")
+            J.clear_symbol(js, sym)
+            changed = True
+            log.warning("%s 미보유 심볼의 저널 항목 정리(청산 후 정리 누락)", sym)
+        if changed:
+            self._save_journal(run)
+
+    def _reconcile_exchange(self, run: _Run) -> None:
+        """testnet/live: 보유 종목의 거래소 base 잔고가 장부보다 적으면 장부를 거래소에 맞춘다.
+
+        (매도 체결 뒤 응답 오류·수동 매도 등으로 생긴 유령 포지션이 자본에 이중 계상되고 슬롯을 점유하지 않게.)
+        팔 수 있는 잔량이 남으면 부족분만, 아니면 전량을 시세 기준으로 ``manual`` 청산 기록하고 알린다.
+        """
+        if not self._exchange_mode:
+            return
+        for sym in sorted(self.state.positions):
+            pos = self.state.positions.get(sym)
+            if pos is None:
+                continue
+            free = self._safe_free_base(sym)
+            if free is None:
+                continue
+            book = float(pos.base_amount)
+            if free >= book * (1.0 - RECONCILE_TOLERANCE):
+                self._reconcile_strikes.pop(sym, None)
+                continue
+            strikes = self._reconcile_strikes.get(sym, 0) + 1
+            self._reconcile_strikes[sym] = strikes
+            if strikes < RECONCILE_STRIKES:
+                # 잔고 조회의 일시 오류로 실제 보유를 지우지 않게 연속 관찰된 뒤에만 장부를 맞춘다
+                log.warning("%s 거래소 잔고 %.8g < 장부 %.8g — 다음 사이클에 다시 확인", sym, free, book)
+                continue
+            self._reconcile_strikes.pop(sym, None)
+            mark = self._mark_for(run, pos) or float(pos.entry_price)
+            gone = book if not self._sellable(sym, free, mark) else book - free
+            text = (f"reconcile: 거래소 {sym} 잔고 {free:.8g} < 장부 {book:.8g} — 장부에서 {gone:.8g} 를 "
+                    f"시세 {mark:.6g} 기준으로 정리(수동 확인 필요)")
+            log.error(text)
+            run.errors.append(f"reconcile:{sym}: {text}")
+            self._notify(self._event("error", run, symbol=sym, reason=text, extra={"stage": "reconcile"}))
+            fill = Fill(order_id=f"reconcile-{run.now_ms}", symbol=sym, side="sell", base_amount=gone, price=mark,
+                        quote_amount=gone * mark, ts=run.now_ms, raw={"reconcile": True})
+            self._stage(run, f"reconcile:{sym}", lambda s=sym, f=fill: self._book_sell(
+                run, s, f, "manual", requested_reason="manual", note="거래소 잔고 대사"))
+
+    # ------------------------------------------------------------ G0 중단 알림
+    def _notify_halts(self, run: _Run, g0: G.GateDecision | None) -> None:
+        """G0 중단(당일 −3%·연속 손실·낙폭 차단 등)이 새로 걸리면 한 번, 풀리면 한 번 알린다(DESIGN §7)."""
+        if g0 is None:
+            return
+        js = self.journal_state
+        codes = [] if g0.passed else [c for c in G.reason_codes(g0) if c not in HALT_SILENT_CODES]
+        current = set(codes)
+        new = [c for c in dict.fromkeys(codes) if c not in self._active_halts
+               and (c not in js.halts_today or c in self._lifted_halts)]
+        lifted = sorted(self._active_halts - current)
+        self._active_halts = current
+        if new:
+            reasons = [r for r in g0.reasons if any(f"({c})" in r or r.startswith(f"{c}:") for c in new)]
+            text = "신규 진입 중단 (G0): " + "; ".join(reasons or new)
+            eq = run.equity if _finite(run.equity) else None
+            self._notify(self._event("error", run, reason=text[:500], equity=eq,
+                                     extra={"stage": "g0", "code": "halt", "halt_codes": new}))
+            self._lifted_halts -= set(new)
+        if lifted:
+            self._lifted_halts |= set(lifted)
+            self._notify(self._event("startup", run, reason=f"신규 진입 중단 해제: {', '.join(lifted)}",
+                                     extra={"event": "halt_lifted", "halt_codes": lifted}))
+
     # ================================================================ 본체
     def run_once(self) -> CycleSummary:
         run = _Run(self._now(), float(self._mono()))
@@ -427,11 +724,19 @@ class Cycle:
         cycle = self.state.cycle
         self._stage(run, "sync_broker", self._sync_paper_broker)
         self._stage(run, "rollover", lambda: self._rollover(run))
+        # 저널 상태 ↔ 장부 대사(재시작·충돌 뒤 레드라인 복구, 청산 후 남은 항목 정리)
+        self._stage(run, "journal_reconcile", lambda: self._reconcile_journal(run))
 
         # 3. 스캔·마크·equity·peak·낙폭 사다리
-        run.scan = self._stage(run, "scan", lambda: self.scanner.scan(
-            self.state, run.now_ms, headline_polarity=self._last_market_tone))
+        scan_kw: dict[str, Any] = {"headline_polarity": self._current_tone(run)}
+        planned = self._planned_notional()
+        if planned is not None:
+            scan_kw["planned_notional"] = planned
+        run.scan = self._stage(run, "scan", lambda: self.scanner.scan(self.state, run.now_ms, **scan_kw))
+        self._stage(run, "news_tone", lambda: self._apply_news_availability(run))
         self._stage(run, "marks", lambda: self._update_marks(run))
+        self._stage(run, "equity_series", lambda: self._record_day_point(run))
+        self._stage(run, "exchange_reconcile", lambda: self._reconcile_exchange(run))
         self._stage(run, "daily_review", lambda: self._maybe_daily_review(run))
 
         # 4. 코드 청산
@@ -440,6 +745,7 @@ class Cycle:
         # 5. G0
         g0 = self._stage(run, "g0", lambda: self._g0(run))
         run.g0 = g0
+        self._stage(run, "halt_notify", lambda: self._notify_halts(run, g0))
         review_only = self._positions_only_block(g0) and run.scan is not None
         if review_only:
             # 포지션 수 한도만 걸림 → 신규 진입만 막고 보유 포지션 검토(레드라인·risk_manager·총괄 SELL)는 계속
@@ -474,6 +780,7 @@ class Cycle:
             self.state.daily.llm_cost_usd = float(self.ledger.spent_today())
         except Exception:  # noqa: BLE001
             pass
+        self._stage(run, "llm_counters", lambda: self._count_llm(run))
         self._stage(run, "decision_log", lambda: self._write_decisions(run))
         summary = self._summary(run, cycle)
         self._stage(run, "cycle_report", lambda: self._write_report(run, cycle, summary))
@@ -498,12 +805,17 @@ class Cycle:
         stop_p = self.control_dir / STOP_FILENAME
         clear_p = self.control_dir / CLEAR_FILENAME
         events: list[tuple[int, int, str, dict]] = []
-        stop = read_control_file(stop_p)
-        if stop is not None:
-            events.append((stop["ts"], 0, "stop", stop))
-        clr = read_control_file(clear_p)
-        if clr is not None:
-            events.append((clr["ts"], 1, "clear", clr))
+        paths = {"stop": stop_p, "clear": clear_p}
+        for order, kind in ((0, "stop"), (1, "clear")):
+            info = read_control_file(paths[kind])
+            if info is None:
+                self._consumed_control.pop(kind, None)
+                continue
+            if self._consumed_control.get(kind) == info["ts"]:
+                # 이미 처리했지만 삭제에 실패한 파일 — 다시 적용하지 않고 삭제만 재시도한다
+                self._unlink_control(paths[kind], kind, info["ts"])
+                continue
+            events.append((info["ts"], order, kind, info))
         events.sort()
         pending: list[TradeEvent] = []
         for _, _, kind, info in events:
@@ -517,8 +829,10 @@ class Cycle:
                 was = self.state.kill_switch
                 self.portfolio.clear_kill()
                 if prev.startswith("drawdown"):
-                    # 사람이 낙폭 정지를 해제 → 최고자본을 현재 자본으로 재설정(아니면 다음 사이클에 다시 발동)
+                    # 사람이 낙폭 정지를 해제 → 최고자본을 현재 자본으로 재설정(아니면 다음 사이클에 다시 발동).
+                    # 해제와 같은 저장에 담는다(마크 갱신 전에 죽어도 CLEAR 가 유지되게); 마크 갱신에서 한 번 더 맞춘다.
                     run.reset_peak = True
+                    self._reset_peak_from_last_marks()
                 if was:
                     pending.append(self._event(
                         "startup", run, reason=f"킬스위치 해제 — 신규 진입 재개 (이전 사유: {prev or '-'}; "
@@ -526,12 +840,33 @@ class Cycle:
                         extra={"event": "kill_cleared"}))
         if not events:
             return
-        # 상태 저장 → control 파일 삭제 → 알림 (저장 실패 시 파일은 남아 재시작 후 다시 처리된다)
+        # 상태 저장 → 알림 → control 파일 삭제 (저장 실패 시 파일은 남아 재시작 후 다시 처리된다;
+        # 삭제 실패가 알림을 막지 않게 알림을 먼저 보낸다)
         self._save()
-        for _, _, kind, _info in events:
-            (stop_p if kind == "stop" else clear_p).unlink(missing_ok=True)
         for ev in pending:
             self._notify(ev)
+        for _, _, kind, info in events:
+            self._unlink_control(paths[kind], kind, info["ts"])
+
+    def _unlink_control(self, path: Path, kind: str, ts: int) -> None:
+        try:
+            path.unlink(missing_ok=True)
+            self._consumed_control.pop(kind, None)
+        except OSError as exc:
+            self._consumed_control[kind] = int(ts)
+            log.error("control 파일 삭제 실패 %s type=%s — 다음 사이클에 다시 적용하지 않음", path.name,
+                      type(exc).__name__)
+
+    def _reset_peak_from_last_marks(self) -> None:
+        marks = {s: float(p.last_mark) for s, p in self.state.positions.items() if _pos(p.last_mark)}
+        try:
+            eq = self._equity(marks)
+        except Exception as exc:  # noqa: BLE001 - live free_quote 실패 등: 마크 갱신 단계에서 다시 시도
+            log.warning("CLEAR 최고자본 재설정용 자본 계산 실패 type=%s", type(exc).__name__)
+            return
+        if _pos(eq):
+            log.warning("킬스위치 해제로 최고자본 재설정: %.2f → %.2f", self.state.peak_equity, eq)
+            self.state.peak_equity = float(eq)
 
     # ================================================================ 2. 롤오버·일일 리뷰
     def _rollover(self, run: _Run) -> None:
@@ -569,15 +904,22 @@ class Cycle:
         fin = self._finished_day if (self._finished_day is not None and self._finished_day.date == yesterday) else None
         start_eq = float(fin.start_equity) if fin is not None and _pos(fin.start_equity) else None
         eq_now = run.equity if _finite(run.equity) else None
-        curve = [x for x in (start_eq, eq_now) if x is not None]
-        metrics = J.code_metrics(trades, curve, None, setups=js.entry_context)
+        curve, btc_curve = self._review_curves(run, start_eq, eq_now)
+        metrics = J.code_metrics(trades, curve, btc_curve, setups=js.entry_context)
         day_pnl = sum(t.pnl_quote for t in day_trades)
+        counts = self._series["llm"].get(yesterday) or {}
+        calls = counts.get("calls")
+        abstain = counts.get("abstain")
         table = J.build_metrics_table(
             metrics, js, closed_today=len(day_trades),
             day_pnl_pct=(day_pnl / start_eq * 100.0) if start_eq else None,
+            cum_pnl_pct=self._cum_pnl_pct(curve, eq_now),
             equity=eq_now,
-            llm={"calls": None, "cost_usd": float(fin.llm_cost_usd) if fin is not None else None,
-                 "budget_usd": float(self.settings.llm_daily_budget_usd), "abstain_count": None})
+            llm={"calls": int(calls) if _finite(calls) else None,
+                 "cost_usd": float(fin.llm_cost_usd) if fin is not None else None,
+                 "budget_usd": float(self.settings.llm_daily_budget_usd),
+                 "abstain_count": int(abstain) if _finite(abstain) else None})
+        self._fix_review_table(table, metrics, eq_now)
         review = None
         if self._llm_available(run) and not self._deadline_passed(run, "daily_review"):
             review = J.daily_review(self.runner, js, trades, table)
@@ -592,6 +934,40 @@ class Cycle:
         J.start_new_day(js, yesterday)
         run.review = yesterday
         self._save_journal(run)
+
+    def _review_curves(self, run: _Run, start_eq: float | None,
+                       eq_now: float | None) -> tuple[list[float], list[float | None] | None]:
+        """일일 리뷰용 일별 자본 곡선(+같은 길이 BTC 곡선). 기록이 2점 미만이면 [전일 시작, 지금] 으로 대신한다."""
+        today = run.now.strftime("%Y-%m-%d")
+        pts = [p for p in self._series["points"] if p["date"] <= today]
+        curve = [float(p["equity"]) for p in pts]
+        btc: list[float | None] = [_pos(p.get("btc")) for p in pts]
+        if eq_now is not None and (not pts or pts[-1]["date"] != today):
+            curve.append(float(eq_now))
+            btc.append(_pos(run.scan.marks.get(BTC_SYMBOL)) if run.scan is not None else None)
+        if len(curve) < 2:
+            return [x for x in (start_eq, eq_now) if x is not None], None
+        return curve, (btc if sum(1 for b in btc if b is not None) >= 2 else None)
+
+    def _cum_pnl_pct(self, curve: list[float], eq_now: float | None) -> float | None:
+        """누적 손익률: paper 는 시작 잔고, testnet/live 는 처음 기록한 자본 대비."""
+        if eq_now is None:
+            return None
+        base = float(self.settings.paper_start_balance) if self.settings.mode == "paper" else (
+            curve[0] if curve else None)
+        return (float(eq_now) / base - 1.0) * 100.0 if base is not None and base > 0 else None
+
+    def _fix_review_table(self, table: dict, metrics: Mapping[str, Any], eq_now: float | None) -> None:
+        """최대 낙폭은 최고자본 기준과 일별 곡선 중 큰 값, calmar 는 표본이 적으면 null."""
+        ret = table.get("returns")
+        if isinstance(ret, dict) and eq_now is not None and _pos(self.state.peak_equity):
+            dd_now = max(0.0, (1.0 - float(eq_now) / float(self.state.peak_equity)) * 100.0)
+            cur = ret.get("max_drawdown_pct")
+            ret["max_drawdown_pct"] = max(float(cur), dd_now) if _finite(cur) else dd_now
+        stats = table.get("trade_stats")
+        n_days = metrics.get("n_days")
+        if isinstance(stats, dict) and "calmar" in stats and not (_finite(n_days) and n_days >= MIN_DAYS_FOR_ANNUALISED):
+            stats["calmar"] = None      # 며칠치 수익률을 연율화하면 의미 없는 값(예: −338)이 나온다
 
     # ================================================================ 3. 마크·자본
     def _fallback_marks(self) -> dict[str, float]:
@@ -650,31 +1026,121 @@ class Cycle:
             self._stage(run, f"exit:{sym}", lambda s=sym, r=reason: self._sell(run, s, 1.0, r))
 
     def _sell(self, run: _Run, symbol: str, fraction: float, reason: ExitReason) -> ClosedTrade | None:
-        """매도 → close_position → save → notify → (전량이면) 저널 사후분석."""
+        """매도 → close_position → save → notify → (전량이면) 저널 사후분석(+사후분석 알림).
+
+        - 부분 매도(trim) 몫이나 그 잔량이 최소 주문 금액 미만이면 전량 매도로 바꾼다.
+        - 전량 청산인데 정밀도 내림 후 수량이 0(팔 수 없는 잔량)이면 시세로 상각해 장부에서 지운다.
+        - testnet/live: 주문 뒤 브로커가 예외를 내도 거래소 잔고 변화로 체결을 확인하면 그 체결로 기록한다.
+        """
         pos = self.state.positions.get(symbol)
         if pos is None:
             return None
-        cycle = int(self.state.cycle)
-        amount = float(pos.base_amount) * max(0.0, min(1.0, float(fraction)))
-        if self.settings.mode != "paper":
-            try:
-                amount = min(amount, float(self.broker.free_base(symbol)))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s 가용 수량 조회 실패 type=%s — 장부 수량 사용", symbol, type(exc).__name__)
+        fraction = max(0.0, min(1.0, float(fraction)))
+        book = float(pos.base_amount)
+        mark = self._mark_for(run, pos)
+        note: str | None = None
+        if fraction < 1.0 and mark is not None:
+            min_o = self._min_order(symbol)
+            if book * fraction * mark < min_o or book * (1.0 - fraction) * mark < min_o:
+                note = f"부분 매도 {fraction:.0%} 또는 잔량이 최소 주문 {min_o:.2f} USDT 미만 → 전량 매도"
+                log.info("%s %s", symbol, note)
+                fraction = 1.0
+        amount = book * fraction
+        pre_base: float | None = None
+        pre_quote: float | None = None
+        if self._exchange_mode:
+            pre_base = self._safe_free_base(symbol)
+            if pre_base is not None:
+                amount = min(amount, pre_base)
+            else:
+                log.warning("%s 가용 수량 조회 실패 — 장부 수량 사용", symbol)
+            pre_quote = self._safe_free_quote()
         try:
-            amount = float(self.broker.amount_to_precision(symbol, amount))
+            rounded = float(self.broker.amount_to_precision(symbol, amount)) if amount > 0 else 0.0
+        except OrderValidationError:
+            rounded = 0.0
+        except Exception as exc:  # noqa: BLE001 - 거래소 오류는 거부 알림
+            self._reject_sell(run, symbol, amount, reason, exc)
+            return None
+        if not (math.isfinite(rounded) and rounded > 0):
+            if fraction >= 1.0 and self._rounded(symbol, book) <= 0:
+                # 팔 수 없는 잔량(정밀도 미만) — 매 사이클 거부를 반복하며 슬롯을 점유하지 않게 장부에서 상각
+                px = mark if mark is not None else float(pos.entry_price)
+                fill = Fill(order_id=f"dust-writeoff-{run.now_ms}", symbol=symbol, side="sell", base_amount=book,
+                            price=px, quote_amount=book * px, ts=run.now_ms, raw={"dust_writeoff": True})
+                text = f"{symbol} 잔량 {book:.8g} 은 거래소 정밀도 미만이라 매도 불가 — 시세 {px:.6g} 로 상각"
+                log.warning(text)
+                return self._book_sell(run, symbol, fill, reason, requested_reason=reason,
+                                       note=text, extra={"dust_written_off": book})
+            self._reject_sell(run, symbol, amount, reason, OrderValidationError(f"{symbol} sell: 정밀도 적용 후 수량이 0"))
+            return None
+        amount = rounded
+        try:
             risk.validate_order_request(OrderRequest(symbol=symbol, side="sell", base_amount=amount),
                                         tuple(self.settings.symbols), list(self.state.positions))
             fill = self.broker.market_sell(symbol, amount)
         except Exception as exc:  # noqa: BLE001 - 거래소/검증 오류는 거부 알림
-            text = f"{reason}: {type(exc).__name__}: {self._scrub(exc)[:MAX_ERROR_TEXT]}"
-            run.errors.append(f"sell:{symbol}: {text}")
-            log.error("매도 실패 %s %s", symbol, text)
-            self._notify(self._event("order_rejected", run, symbol=symbol, side="sell", base_amount=amount,
-                                     reason=text))
+            recovered = self._recover_sell(run, symbol, pre_base, pre_quote, amount, mark, exc)
+            if recovered is None:
+                self._reject_sell(run, symbol, amount, reason, exc)
+                return None
+            fill = recovered
+        return self._book_sell(run, symbol, fill, reason, requested_reason=reason, note=note)
+
+    def _reject_sell(self, run: _Run, symbol: str, amount: float, reason: str, exc: BaseException) -> None:
+        text = f"{reason}: {type(exc).__name__}: {self._scrub(exc)[:MAX_ERROR_TEXT]}"
+        run.errors.append(f"sell:{symbol}: {text}")
+        log.error("매도 실패 %s %s", symbol, text)
+        self._notify(self._event("order_rejected", run, symbol=symbol, side="sell", base_amount=amount, reason=text))
+
+    def _recover_sell(self, run: _Run, symbol: str, pre_base: float | None, pre_quote: float | None,
+                      amount: float, mark: float | None, exc: BaseException) -> Fill | None:
+        """매도 주문 뒤 예외: 거래소 base 가 줄었으면 체결된 것으로 보고 잔고 변화로 체결을 복원한다."""
+        if not self._exchange_mode or pre_base is None:
             return None
+        post = self._safe_free_base(symbol)
+        if post is None:
+            return None
+        sold = pre_base - post
+        if not (sold > 0 and sold >= max(amount, 0.0) * RECOVERY_MIN_SHARE):
+            return None
+        price: float | None = None
+        post_q = self._safe_free_quote()
+        if pre_quote is not None and post_q is not None and post_q > pre_quote:
+            p = (post_q - pre_quote) / sold
+            if mark is None or 0.5 * mark <= p <= 2.0 * mark:
+                price = p
+        if price is None:
+            pos = self.state.positions.get(symbol)
+            price = mark if mark is not None else (float(pos.entry_price) if pos is not None else 0.0)
+        if not _pos(price):
+            return None
+        text = (f"sell:{symbol}: 주문 응답 오류({type(exc).__name__}: {self._scrub(exc)[:MAX_ERROR_TEXT]}) — "
+                f"거래소 잔고 변화로 체결 복원 {sold:.8g} @ {price:.6g} (수동 확인 권장)")
+        run.errors.append(text)
+        log.error(text)
+        self._notify(self._event("error", run, symbol=symbol, reason=text, extra={"stage": f"sell:{symbol}"}))
+        return Fill(order_id=f"recovered-sell-{run.now_ms}", symbol=symbol, side="sell", base_amount=sold,
+                    price=float(price), quote_amount=sold * float(price), ts=run.now_ms,
+                    raw={"recovered": True, "error": type(exc).__name__})
+
+    def _book_sell(self, run: _Run, symbol: str, fill: Fill, reason: ExitReason, *, requested_reason: str,
+                   note: str | None = None, extra: dict | None = None) -> ClosedTrade:
+        """매도 체결을 장부에 반영 → 저장 → 알림 → 저널. 저장이 실패해도 체결 알림은 보내고 전파한다."""
+        pos = self.state.positions[symbol]
+        cycle = int(self.state.cycle)
+        held = float(pos.base_amount)
+        extra = dict(extra or {})
+        sold = float(fill.base_amount)
+        if sold < held * (1.0 - PARTIAL_FILL_TOLERANCE):
+            residual = held - sold
+            px = fill.price if _pos(fill.price) else self._mark_for(run, pos)
+            if not self._sellable(symbol, residual, px):
+                # 남는 잔량을 따로 팔 수 없다(정밀도·최소 금액 미만) → 전량 청산으로 기록(잔량 상각)
+                log.warning("%s 매도 후 잔량 %.8g 은 팔 수 없는 크기 — 전량 청산으로 기록", symbol, residual)
+                fill = fill.model_copy(update={"base_amount": held})
+                extra["dust_written_off"] = residual
         trade = self.portfolio.close_position(symbol, fill, reason, cycle)
-        self._save()
         partial = symbol in self.state.positions
         marks = dict(run.marks)
         if not partial:
@@ -683,19 +1149,36 @@ class Cycle:
             eq = self._equity(marks)
         except Exception:  # noqa: BLE001
             eq = None
-        run.exits.append({"symbol": symbol, "reason": trade.reason, "requested_reason": reason,
+        ev = self._event(
+            "partial_exit" if partial else "exit", run, symbol=symbol, side="sell", base_amount=trade.base_amount,
+            price=trade.exit_price, quote_amount=trade.quote_received,
+            reason=trade.reason if not partial else requested_reason,
+            pnl_quote=trade.pnl_quote, pnl_pct=trade.pnl_pct, equity=eq,
+            extra={"order_id": fill.order_id, "requested_reason": requested_reason, "cycle": cycle,
+                   **({"note": note} if note else {}), **extra})
+        run.exits.append({"symbol": symbol, "reason": trade.reason, "requested_reason": requested_reason,
                           "pnl_quote": trade.pnl_quote, "pnl_pct": trade.pnl_pct, "partial": partial,
                           "price": trade.exit_price, "base_amount": trade.base_amount})
-        run.actions[symbol] = {"action": "SELL", "executed": True, "reason": f"{reason}" + (" (부분)" if partial else "")}
-        self._notify(self._event(
-            "partial_exit" if partial else "exit", run, symbol=symbol, side="sell", base_amount=trade.base_amount,
-            price=trade.exit_price, quote_amount=trade.quote_received, reason=trade.reason if not partial else reason,
-            pnl_quote=trade.pnl_quote, pnl_pct=trade.pnl_pct, equity=eq,
-            extra={"order_id": fill.order_id, "requested_reason": reason, "cycle": cycle}))
-        self._post_trade(run, trade, partial)
+        run.actions[symbol] = {"action": "SELL", "executed": True,
+                               "reason": f"{requested_reason}" + (" (부분)" if partial else "")}
+        try:
+            self._save()
+        except StateSaveError:
+            # notify 가 extra.state_saved == False 를 경고 줄로 렌더한다(SPEC §11)
+            self._notify(ev.model_copy(update={"extra": {**ev.extra, "state_saved": False}}))
+            raise
+        self._notify(ev)
+        review_text = self._post_trade(run, trade, partial)
+        if review_text and not partial:
+            # notify 가 extra.post_trade_review + follow_up 을 '📝 사후분석' 전용 메시지로 렌더한다
+            self._notify(self._event(
+                "exit", run, symbol=symbol, side="sell", base_amount=trade.base_amount, price=trade.exit_price,
+                pnl_quote=trade.pnl_quote, pnl_pct=trade.pnl_pct, reason=trade.reason,
+                extra={"post_trade_review": review_text, "follow_up": True, "order_id": fill.order_id}))
         return trade
 
-    def _post_trade(self, run: _Run, trade: ClosedTrade, partial: bool) -> None:
+    def _post_trade(self, run: _Run, trade: ClosedTrade, partial: bool) -> str | None:
+        """저널 사후분석·기록·심볼 정리. 전량 청산이면 텔레그램용 사후분석 문구(LLM 또는 코드 요약)를 돌려준다."""
         js = self.journal_state
         review = None
         if not partial:
@@ -720,6 +1203,11 @@ class Cycle:
         if not partial:
             J.clear_symbol(js, trade.symbol)
         self._save_journal(run)
+        if partial:
+            return None
+        if review is not None and getattr(review, "telegram_text", None):
+            return str(review.telegram_text)
+        return (rec or {}).get("code_summary") if isinstance(rec, dict) else None
 
     # ================================================================ 5. G0
     def _g0(self, run: _Run) -> G.GateDecision:
@@ -759,14 +1247,31 @@ class Cycle:
     def _pipeline(self, run: _Run, *, no_candidates: bool = False) -> PipelineResult:
         assert run.scan is not None
         scan = run.scan.model_copy(update={"candidates": []}) if no_candidates else run.scan
+        # 백엔드(AnthropicBackend)에 사이클 기한을 알려 호출·재시도가 기한을 넘지 않게 한다. 매수·주문 몫은 남겨 둔다.
+        set_deadline = getattr(self.backend, "set_deadline", None)
+        if not callable(set_deadline):
+            set_deadline = None
+        if set_deadline is not None:
+            try:
+                set_deadline(max(0.0, self.deadline_s - self._elapsed(run) - LLM_DEADLINE_RESERVE_S))
+            except Exception as exc:  # noqa: BLE001 - 기한 전달 실패는 단계 경계 검사로 충분
+                log.warning("백엔드 기한 설정 실패 type=%s", type(exc).__name__)
+                set_deadline = None
         try:
             return run_pipeline(scan, self.state, run.equity, self.runner, self.journal_state, run.now_ms,
-                                news_store=self.news_store)
+                                news_store=self.news_store,
+                                should_stop=lambda stage: self._deadline_passed(run, f"pipeline:{stage}"))
         except BudgetExceeded:
             # 파이프라인이 잡지 못한 경로(방어): 예산 초과로 처리
             run.budget_exceeded = True
             self._pause_for_budget(run, "LLM 예산 초과 (파이프라인)")
             raise
+        finally:
+            if set_deadline is not None:
+                try:
+                    set_deadline(None)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _after_pipeline(self, run: _Run) -> None:
         res = run.result
@@ -786,7 +1291,14 @@ class Cycle:
             self._notify(self._event("llm_paused", run, reason=f"인증 오류 기권 {len(auth)}건 — LLM {AUTH_PAUSE_MINUTES}분 일시정지",
                                      extra={"until_ts": until}))
         if res.news is not None:
-            self._last_market_tone = float(res.news.market_tone) if _finite(res.news.market_tone) else None
+            if _finite(res.news.market_tone):
+                self._last_market_tone = float(res.news.market_tone)
+                self._last_market_tone_ts = run.now_ms
+            else:
+                self._clear_tone()
+        elif any(a.startswith("news_sentiment:") for a in res.abstained):
+            # 뉴스 채널 기권(피드 없음 등) → 묵은 톤을 다음 사이클 종합심리에 넣지 않는다
+            self._clear_tone()
         # 게이트 카운터
         for k, v in sorted((res.gate_counts or {}).items()):
             if v:
@@ -816,6 +1328,8 @@ class Cycle:
             return
         ctxs = {c.symbol: c for c in res.candidates}
         pcs = {p.symbol: p for p in res.positions}
+        downgraded = {str(x.get("symbol")): str(x.get("reason") or "코드 강등")
+                      for x in (getattr(res, "head_downgrades", None) or [])}
         # SELL 을 먼저 처리한다(실현 손익이 뒤이은 BUY 의 전역 게이트 재검사에 반영되도록)
         ordered = sorted(res.head.decisions, key=lambda x: 0 if x.action == "SELL" else 1)
         for d in ordered:
@@ -825,7 +1339,7 @@ class Cycle:
                     run.actions[sym] = {"action": "HOLD", "executed": False, "reason": "SELL 대상 미보유"}
                     continue
                 pc = pcs.get(sym)
-                fraction = TRIM_FRACTION if (pc is not None and pc.risk is not None and pc.risk.action == "trim") else 1.0
+                fraction = TRIM_FRACTION if self._trim_only(run, sym, pc) else 1.0
                 log.info("총괄 SELL %s (비율 %.0f%%): %s", sym, fraction * 100, d.rationale[:120])
                 self._stage(run, f"head_sell:{sym}", lambda s=sym, f=fraction: self._sell(run, s, f, "head_sell"))
             elif d.action == "BUY":
@@ -833,9 +1347,37 @@ class Cycle:
                     run.actions[sym] = {"action": "HOLD", "executed": False, "reason": DEADLINE_REASON}
                     continue
                 self._stage(run, f"buy:{sym}", lambda dd=d: self._buy(run, dd, ctxs.get(dd.symbol)))
+            elif sym in downgraded and sym not in run.actions:
+                # pipeline._sanitize_head 가 총괄 BUY 를 HOLD 로 강등(노출·슬롯·미승인) → G4 강등과 같은 알림(SPEC v2 §7)
+                self._stage(run, f"downgrade:{sym}", lambda s=sym: self._downgrade(run, s, downgraded[s]))
             else:
                 log.info("총괄 HOLD %s: %s", sym, d.rationale[:120])
                 run.actions.setdefault(sym, {"action": "HOLD", "executed": False, "reason": d.rationale[:200]})
+
+    @staticmethod
+    def _exit_triggers(run: _Run, symbol: str, pc: Any) -> list[str]:
+        """코드가 찾은(또는 청산을 요구하는) 청산 사유 — 하나라도 있으면 trim 이 아니라 전량 매도."""
+        out: list[str] = []
+        if pc is not None:
+            if pc.red_line_hits:
+                out.append("red_line")
+            if pc.technical is not None and pc.technical.exit_flag:
+                out.append("technical_exit_flag")
+            if pc.risk is not None and pc.risk.action == "exit":
+                out.append("risk_exit")
+        if run.scan is not None and symbol in (run.scan.regime.name_alarm_symbols or []):
+            out.append("name_alarm")
+        return out
+
+    def _trim_only(self, run: _Run, symbol: str, pc: Any) -> bool:
+        """risk_manager 가 trim 이고 코드 쪽 청산 사유가 없을 때만 50% 매도(LLM 라벨은 청산을 풀지 못한다)."""
+        if pc is None or pc.risk is None or pc.risk.action != "trim":
+            return False
+        triggers = self._exit_triggers(run, symbol, pc)
+        if triggers:
+            log.info("%s risk trim 이지만 청산 사유(%s) → 전량 매도", symbol, ", ".join(triggers))
+            return False
+        return True
 
     def _downgrade(self, run: _Run, symbol: str, reason: str, *, quote: float | None = None) -> None:
         J.record_gate(self.journal_state, "g4_downgrade")
@@ -889,17 +1431,28 @@ class Cycle:
         if self._deadline_passed(run, f"order:{sym}"):
             run.actions[sym] = {"action": "HOLD", "executed": False, "reason": DEADLINE_REASON}
             return
+        pre_base: float | None = None
+        if self._exchange_mode:
+            pre_base = self._safe_free_base(sym)
+            if pre_base is not None and self._sellable(sym, pre_base, mark):
+                # 장부 밖 보유(이전 체결 기록 실패·수동 매수 등)가 있으면 노출 한도를 넘지 않게 사지 않는다
+                self._downgrade(run, sym, f"untracked_exchange_balance: 거래소에 장부 밖 {sym} {pre_base:.8g} 보유 — "
+                                          "수동 확인 필요", quote=plan.quote_amount)
+                return
         try:
             risk.validate_order_request(OrderRequest(symbol=sym, side="buy", quote_amount=plan.quote_amount),
                                         tuple(self.settings.symbols), list(self.state.positions))
             fill = self.broker.market_buy(sym, plan.quote_amount)
         except Exception as exc:  # noqa: BLE001
             text = f"{type(exc).__name__}: {self._scrub(exc)[:MAX_ERROR_TEXT]}"
-            run.errors.append(f"buy:{sym}: {text}")
-            run.actions[sym] = {"action": "HOLD", "executed": False, "reason": f"order_rejected: {text}"}
-            self._notify(self._event("order_rejected", run, symbol=sym, side="buy", quote_amount=plan.quote_amount,
-                                     price=mark, reason=text))
-            return
+            recovered = self._recover_buy(run, sym, pre_base, free_quote, plan.quote_amount, mark, exc)
+            if recovered is None:
+                run.errors.append(f"buy:{sym}: {text}")
+                run.actions[sym] = {"action": "HOLD", "executed": False, "reason": f"order_rejected: {text}"}
+                self._notify(self._event("order_rejected", run, symbol=sym, side="buy",
+                                         quote_amount=plan.quote_amount, price=mark, reason=text))
+                return
+            fill = recovered
         # 손절/익절을 실제 체결가 기준 같은 거리로 다시 놓는다(슬리피지로 손절거리가 넓어지지 않게)
         ref = mark if mark is not None else float(fill.price)
         sl_pct = max(0.0, 1.0 - plan.stop_loss_price / ref)
@@ -908,22 +1461,7 @@ class Cycle:
         sl, tp = risk.clamp_stops(entry, entry * (1.0 - sl_pct), entry * (1.0 + tp_pct))
         thesis_json = json.dumps(d.thesis.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
         pos = self.portfolio.open_position(fill, sl, tp, thesis_json, float(d.confidence), int(self.state.cycle))
-        # 저널: 구조화 논지 + 진입 판단 스냅샷
-        js = self.journal_state
-        try:
-            ev_score = P.event_signal(P.symbol_news_events(sym, self.news_store.active_events(run.now_ms), run.now_ms),
-                                      run.now_ms).get("score")
-        except Exception:  # noqa: BLE001
-            ev_score = None
-        ret_1h = None
-        if fp is not None and len(fp.last_closes_1h) >= 2 and _pos(fp.last_closes_1h[-2]):
-            ret_1h = (fp.last_closes_1h[-1] / fp.last_closes_1h[-2] - 1.0) * 100.0
-        verdicts = J.make_entry_verdicts(technical=ctx.technical, flow=ctx.flow, bull=ctx.bull, bear=ctx.bear,
-                                         risk=ctx.risk, head=d, debias=res.head.debias if res.head else None,
-                                         risk_note=res.risk_note, event_signal_score=ev_score)
-        J.record_entry_verdicts(js, sym, verdicts, thesis=d.thesis, opened_ts=pos.opened_ts, entry_return_1h_pct=ret_1h)
-        self._save()
-        self._save_journal(run)
+        # 체결 → 상태 저장 → 알림. 저널 스냅샷(보조 상태)은 그 뒤에 따로 감싼다.
         bear_point = ctx.bear.strongest_point if ctx.bear is not None else None
         parts = [d.rationale]
         if d.thesis.assumptions:
@@ -938,13 +1476,74 @@ class Cycle:
                             "base_amount": fill.base_amount, "stop_loss_price": sl, "take_profit_price": tp,
                             "confidence": d.confidence, "size_pct": plan.size_pct})
         run.actions[sym] = {"action": "BUY", "executed": True, "reason": d.rationale[:200]}
-        self._notify(self._event(
+        ev = self._event(
             "entry", run, symbol=sym, side="buy", base_amount=fill.base_amount, price=fill.price,
             quote_amount=fill.quote_amount, stop_loss_price=sl, take_profit_price=tp, confidence=float(d.confidence),
             thesis=" | ".join(p for p in parts if p), equity=eq,
             extra={"bear_strongest_point": bear_point, "losing_side_strongest_point": d.losing_side_strongest_point,
                    "decisive_factor": d.decisive_factor, "size_pct": plan.size_pct, "order_id": fill.order_id,
-                   "red_lines": [r.model_dump(mode="json") for r in d.thesis.red_lines]}))
+                   "red_lines": [r.model_dump(mode="json") for r in d.thesis.red_lines],
+                   **({"recovered": True} if fill.raw.get("recovered") else {})})
+        try:
+            self._save()
+        except StateSaveError:
+            self._notify(ev.model_copy(update={"extra": {**ev.extra, "state_saved": False}}))
+            raise
+        self._notify(ev)
+        try:
+            self._journal_entry(run, d, ctx, pos, fp)
+        except Exception as exc:  # noqa: BLE001 - 저널은 보조 상태: 체결·저장·알림을 막지 않는다
+            run.errors.append(f"journal_entry:{sym}: {type(exc).__name__}: {self._scrub(exc)[:MAX_ERROR_TEXT]}")
+            log.error("진입 저널 스냅샷 실패 %s type=%s", sym, type(exc).__name__)
+        self._save_journal(run)
+
+    def _journal_entry(self, run: _Run, d: HeadDecision, ctx: CandidateContext, pos: Position, fp: Any) -> None:
+        """저널: 구조화 논지 + 진입 판단 스냅샷."""
+        res = run.result
+        assert res is not None
+        sym = d.symbol
+        js = self.journal_state
+        try:
+            ev_score = P.event_signal(P.symbol_news_events(sym, self.news_store.active_events(run.now_ms), run.now_ms),
+                                      run.now_ms).get("score")
+        except Exception:  # noqa: BLE001
+            ev_score = None
+        ret_1h = None
+        if fp is not None and len(fp.last_closes_1h) >= 2 and _pos(fp.last_closes_1h[-2]):
+            ret_1h = (fp.last_closes_1h[-1] / fp.last_closes_1h[-2] - 1.0) * 100.0
+        verdicts = J.make_entry_verdicts(technical=ctx.technical, flow=ctx.flow, bull=ctx.bull, bear=ctx.bear,
+                                         risk=ctx.risk, head=d, debias=res.head.debias if res.head else None,
+                                         risk_note=res.risk_note, event_signal_score=ev_score)
+        J.record_entry_verdicts(js, sym, verdicts, thesis=d.thesis, opened_ts=pos.opened_ts, entry_return_1h_pct=ret_1h)
+
+    def _recover_buy(self, run: _Run, symbol: str, pre_base: float | None, pre_quote: float | None,
+                     quote_amount: float, mark: float | None, exc: BaseException) -> Fill | None:
+        """매수 주문 뒤 예외: 거래소 base 가 늘었으면 체결된 것으로 보고 잔고 변화로 체결을 복원한다.
+
+        (복원하지 않으면 손절·익절·시간손절 없는 고아 보유가 생기고 같은 종목을 다시 살 수 있다.)
+        """
+        if not self._exchange_mode or pre_base is None:
+            return None
+        post = self._safe_free_base(symbol)
+        if post is None:
+            return None
+        got = post - pre_base
+        ref = mark
+        if not (got > 0 and ref is not None and got * ref >= quote_amount * RECOVERY_MIN_SHARE):
+            return None
+        price: float = float(ref)
+        post_q = self._safe_free_quote()
+        if pre_quote is not None and post_q is not None and pre_quote > post_q:
+            p = (pre_quote - post_q) / got
+            if 0.5 * ref <= p <= 2.0 * ref:
+                price = p
+        text = (f"buy:{symbol}: 주문 응답 오류({type(exc).__name__}: {self._scrub(exc)[:MAX_ERROR_TEXT]}) — "
+                f"거래소 잔고 변화로 체결 복원 {got:.8g} @ {price:.6g}, 손절·익절을 걸고 추적 (수동 확인 권장)")
+        run.errors.append(text)
+        log.error(text)
+        self._notify(self._event("error", run, symbol=symbol, reason=text, extra={"stage": f"buy:{symbol}"}))
+        return Fill(order_id=f"recovered-buy-{run.now_ms}", symbol=symbol, side="buy", base_amount=got, price=price,
+                    quote_amount=got * price, ts=run.now_ms, raw={"recovered": True, "error": type(exc).__name__})
 
     # ================================================================ 8. 로그·보고서
     def _write_decisions(self, run: _Run) -> None:

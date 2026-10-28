@@ -62,10 +62,13 @@ def test_estimate_zero(ledger: CostLedger):
     assert ledger.estimate("claude-opus-5-5", 0, 0, 0) == 0.0
 
 
-def test_estimate_unknown_model_uses_opus(ledger: CostLedger, caplog):
+def test_estimate_unknown_model_is_conservative(ledger: CostLedger, caplog):
+    # SPEC §8.2 보수 추정: 미지 모델은 알려진 어떤 모델보다도 싸게 잡히지 않는다(상한 $10/$1/$50).
     with caplog.at_level(logging.WARNING, logger="tradingbot.llm.cost"):
         got = ledger.estimate("claude-mystery-9", 1000, 1000, 1000)
-    assert got == pytest.approx(ledger.estimate("claude-opus-5-5", 1000, 1000, 1000))
+    for known in PRICES_USD_PER_MTOK:
+        assert got >= ledger.estimate(known, 1000, 1000, 1000)
+    assert got == pytest.approx((10.0 + 1.0 + 50.0) * 1000 / 1e6)
     assert any("미지 모델" in r.getMessage() for r in caplog.records)
 
 

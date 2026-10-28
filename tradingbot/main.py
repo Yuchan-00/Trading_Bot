@@ -4,6 +4,8 @@
 - ``run [--once] [--cycle-minutes N] [--offline-fixture]``  사이클 루프(``cycle_minutes`` 경계 + 5초).
   ``--once`` 는 1회 후 종료. ``--offline-fixture`` 는 ccxt 시세 대신 결정적 합성 시세
   (``tradingbot.testing.FakeMarketData``)를 쓰고 뉴스 조회를 끈다 — 키·네트워크 없이 체험(paper 전용).
+  합성 상태가 실제 paper 저널을 오염시키지 않도록 데이터는 ``<DATA_DIR>/offline_fixture/`` 에 따로 쓰고,
+  백엔드는 mock 으로 강제하며 텔레그램 전송은 끈다(유료 API 호출·네트워크 0).
   ``AGENT_BACKEND=mock`` 이면 ``MOCK_SCENARIO``(conservative|approve) 로 Mock 응답 시나리오를 고른다.
 - ``dashboard``                         로컬 대시보드(FastAPI + uvicorn, 읽기 전용).
 - ``backtest [--days 90] [--symbols ...]`` 규칙 전용 기준선 백테스트(LLM 없음).
@@ -13,6 +15,7 @@
 
 안전장치
 - ``MODE=live`` 이면 ``run`` 시작 시 콘솔에 ``LIVE`` 를 직접 입력해야 진행한다(환경변수로 우회 불가).
+  표준입력이 대화형 터미널(TTY)이 아니면(``echo LIVE | ... run`` 등 파이프/리다이렉트) 묻지 않고 거부한다.
 - ``bot.lock``(PID) 으로 단일 인스턴스. 기록된 PID 가 살아 있지 않으면 낡은 잠금으로 보고 가져온다.
 - SIGINT/SIGTERM → 진행 중 사이클을 마친 뒤 notify(shutdown) + ``notifier.flush()`` + 잠금 해제.
 - 하트비트 notify 4시간마다.
@@ -38,7 +41,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from tradingbot import cycle as C
-from tradingbot.config import ConfigError, Settings, load_settings
+from tradingbot.config import ConfigError, Settings, _read_env, load_settings
 from tradingbot.models import BotState, TradeEvent
 
 log = logging.getLogger("tradingbot.main")
@@ -46,12 +49,13 @@ log = logging.getLogger("tradingbot.main")
 __all__ = [
     "main", "build_parser", "BotLock", "LockHeldError", "Components", "build_components", "confirm_live",
     "run_loop", "next_run_ts", "install_signal_handlers", "status_text", "write_stop", "write_clear",
-    "HEARTBEAT_S", "RUN_OFFSET_S", "LIVE_CONFIRM_WORD",
+    "HEARTBEAT_S", "RUN_OFFSET_S", "LIVE_CONFIRM_WORD", "OFFLINE_FIXTURE_DIRNAME", "offline_fixture_settings",
 ]
 
 HEARTBEAT_S = 4 * 3600.0
 RUN_OFFSET_S = 5.0
 LIVE_CONFIRM_WORD = "LIVE"
+OFFLINE_FIXTURE_DIRNAME = "offline_fixture"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
@@ -259,6 +263,28 @@ def confirm_live(input_fn: Callable[[str], str], out: TextIO) -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return isinstance(answer, str) and answer.strip() == LIVE_CONFIRM_WORD
+
+
+def _stdin_is_tty() -> bool:
+    """현재 ``sys.stdin`` 이 대화형 터미널인지(파이프·리다이렉트·닫힘 → False)."""
+    try:
+        stdin = sys.stdin
+        return bool(stdin is not None and stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def offline_fixture_settings(settings: Settings) -> Settings:
+    """``--offline-fixture`` 용 격리 설정: ``<data_dir>/offline_fixture`` + mock 백엔드 + 텔레그램 끔.
+
+    합성 시세로 연 포지션·사이클 카운터·OI/펀딩 이력이 실제 paper ``state.json``/``cache`` 에 섞이지 않게 하고,
+    "키·네트워크 없음" 약속대로 유료 LLM 호출과 텔레그램 전송을 막는다. 이미 격리된 설정이면 그대로 둔다.
+    """
+    data_dir = Path(settings.data_dir)
+    if data_dir.name != OFFLINE_FIXTURE_DIRNAME:
+        data_dir = data_dir / OFFLINE_FIXTURE_DIRNAME
+    return dataclasses.replace(settings, data_dir=data_dir, agent_backend="mock",
+                               telegram_bot_token=None, telegram_chat_id=None)
 
 
 def next_run_ts(now_s: float, cycle_minutes: int, offset_s: float = RUN_OFFSET_S) -> float:
@@ -503,7 +529,7 @@ def _positive_int(v: int | None, name: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None,
-         input_fn: Callable[[str], str] = input, out: TextIO | None = None, err: TextIO | None = None,
+         input_fn: Callable[[str], str] | None = None, out: TextIO | None = None, err: TextIO | None = None,
          components_factory: Callable[..., Components] | None = None,
          stop_event: threading.Event | None = None, pid: int | None = None) -> int:
     out = out or sys.stdout
@@ -522,38 +548,69 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         if args.command == "backtest":
             _positive_int(args.days, "--days")
     except ConfigError as exc:
+        if args.command in ("stop", "clear-stop"):
+            # 제어 파일 쓰기는 DATA_DIR 만 있으면 된다 — 백엔드/키 설정이 깨져 있어도 킬스위치는 켜고 끌 수 있어야 한다
+            data_dir = _control_data_dir(env)
+            err.write(f"설정 경고(무시하고 진행): {exc}\n")
+            return _cmd_control(args, data_dir, out)
         err.write(f"설정 오류: {exc}\n")
         return EXIT_USAGE
 
+    if args.command in ("stop", "clear-stop"):
+        return _cmd_control(args, Path(settings.data_dir), out)
     if args.command == "status":
         out.write(status_text(settings))
-        return EXIT_OK
-    if args.command == "stop":
-        path = write_stop(Path(settings.data_dir), args.reason)
-        out.write(f"STOP 요청 기록: {path} — 다음 사이클에 킬스위치가 켜집니다\n")
-        return EXIT_OK
-    if args.command == "clear-stop":
-        path = write_clear(Path(settings.data_dir))
-        out.write(f"CLEAR 요청 기록: {path} — 다음 사이클에 킬스위치가 해제됩니다\n")
         return EXIT_OK
     if args.command == "dashboard":
         return _cmd_dashboard(settings, out)
     if args.command == "backtest":
         return _cmd_backtest(settings, args, out, err)
-    src_env = os.environ if env is None else env
+    # load_settings 와 같은 출처(os.environ 위에 .env)에서 읽는다 — .env 의 MOCK_SCENARIO 도 반영.
+    src_env: Mapping[str, str] = _read_env(None) if env is None else env
     mock_scenario = (src_env.get("MOCK_SCENARIO") or "").strip() or None
-    return _cmd_run(settings, args, input_fn=input_fn, out=out, err=err, components_factory=components_factory,
-                    stop_event=stop_event, pid=pid, mock_scenario=mock_scenario)
+    # input_fn 미주입(실제 CLI) → 기본 input() + live 확인은 TTY 에서만(파이프로 'LIVE' 주입 차단).
+    require_tty = input_fn is None
+    return _cmd_run(settings, args, input_fn=input_fn or input, out=out, err=err,
+                    components_factory=components_factory, stop_event=stop_event, pid=pid,
+                    mock_scenario=mock_scenario, require_tty=require_tty)
+
+
+def _control_data_dir(env: Mapping[str, str] | None) -> Path:
+    """설정 검증 없이 DATA_DIR 만 푼다(load_settings 와 같은 출처: os.environ 위에 .env, 기본 '.')."""
+    src: Mapping[str, str] = _read_env(None) if env is None else env
+    return Path((src.get("DATA_DIR") or "").strip() or ".").expanduser()
+
+
+def _cmd_control(args: argparse.Namespace, data_dir: Path, out: TextIO) -> int:
+    """``stop`` / ``clear-stop``: control 파일만 쓴다."""
+    if args.command == "stop":
+        path = write_stop(data_dir, args.reason)
+        out.write(f"STOP 요청 기록: {path} — 다음 사이클에 킬스위치가 켜집니다\n")
+        return EXIT_OK
+    path = write_clear(data_dir)
+    out.write(f"CLEAR 요청 기록: {path} — 다음 사이클에 킬스위치가 해제됩니다\n")
+    return EXIT_OK
 
 
 def _cmd_run(settings: Settings, args: argparse.Namespace, *, input_fn: Callable[[str], str], out: TextIO,
              err: TextIO, components_factory: Callable[..., Components] | None,
-             stop_event: threading.Event | None, pid: int | None, mock_scenario: str | None = None) -> int:
+             stop_event: threading.Event | None, pid: int | None, mock_scenario: str | None = None,
+             require_tty: bool = False) -> int:
     offline = bool(getattr(args, "offline_fixture", False))
     if offline and settings.mode != "paper":
         err.write("--offline-fixture 는 MODE=paper 에서만 쓸 수 있습니다\n")
         return EXIT_USAGE
+    if offline:
+        settings = offline_fixture_settings(settings)
+        out.write(f"오프라인 픽스처: 합성 시세 · mock 백엔드 · 텔레그램 끔 — 데이터는 {settings.data_dir} "
+                  "(실제 paper 상태와 분리)\n")
+        log.warning("오프라인 픽스처: 격리 데이터 디렉터리 %s 사용(실제 paper 상태 미변경)", settings.data_dir)
     if settings.mode == "live":
+        if require_tty and not _stdin_is_tty():
+            err.write("MODE=live 는 대화형 콘솔(TTY)에서 직접 LIVE 를 입력해야 합니다 — "
+                      "파이프/리다이렉트된 표준입력은 거부합니다. 실행하지 않습니다\n")
+            log.warning("live 확인: 표준입력이 TTY 가 아님 — 실행 거부")
+            return EXIT_REFUSED
         if not confirm_live(input_fn, out):
             err.write("\nLIVE 확인 실패 — 실행하지 않습니다\n")
             log.warning("live 확인 입력 불일치 — 실행 거부")

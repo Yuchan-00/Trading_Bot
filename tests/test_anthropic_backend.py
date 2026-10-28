@@ -148,7 +148,9 @@ def test_default_client_is_constructed_with_key_and_retries(ledger, monkeypatch)
     monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
     backend = AnthropicBackend(make_settings(), ledger)
     assert captured["api_key"] == KEY
-    assert captured["max_retries"] == 2
+    # SDK 자동 재시도는 끈다: 재시도는 백엔드가 역할 timeout 예산 안에서만 한다(CLAUDE-API-1)
+    assert captured["max_retries"] == 0
+    assert backend.max_retries == 2
     assert captured["timeout"] == 60
     assert KEY not in repr(backend)
     assert isinstance(backend.client, FakeAnthropic)
@@ -584,3 +586,87 @@ def test_parse_kwargs_are_accepted_by_real_sdk_signature(ledger):
     backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.1)), ledger)
     run(backend)
     assert set(client.messages.calls[0]) <= params
+
+
+# ---------------------------------------------------------------- 시간 예산 안의 재시도·사이클 기한 (CLAUDE-API-1)
+from tradingbot.llm import anthropic_backend as _AB  # noqa: E402
+
+
+def _retrying_backend(responder, ledger, monkeypatch, sleeps=None):
+    backend, client = make_backend(responder, ledger)
+    backend.max_retries = 2  # 직접 만든 client 와 같은 백엔드 재시도 정책
+    monkeypatch.setattr(_AB.time, "sleep", lambda s: (sleeps.append(s) if sleeps is not None else None))
+    return backend, client
+
+
+def test_injected_client_is_not_retried_by_backend(ledger):
+    backend, client = make_backend(lambda kw: status_error(anthropic.InternalServerError, 500), ledger)
+    assert backend.max_retries == 0
+    assert run(backend).error == "server"
+    assert len(client.messages.calls) == 1
+
+
+def test_fast_retryable_errors_are_retried_within_budget(ledger, monkeypatch):
+    sleeps: list[float] = []
+    backend, client = _retrying_backend(lambda kw: status_error(anthropic.InternalServerError, 500), ledger,
+                                        monkeypatch, sleeps)
+    r = run(backend, timeout_s=30.0)
+    assert r.error == "server"
+    assert len(client.messages.calls) == 3
+    assert len(sleeps) == 2
+    # 첫 시도는 역할 timeout 그대로, 재시도는 남은 시간(<= timeout)
+    assert client.messages.calls[0]["timeout"] == 30.0
+    assert all(0 < c["timeout"] <= 30.0 for c in client.messages.calls[1:])
+
+
+def test_retry_then_success(ledger, monkeypatch):
+    seq = iter([status_error(anthropic.RateLimitError, 429), fake_response(Decision(action="HOLD", confidence=0.1))])
+    backend, client = _retrying_backend(lambda kw: next(seq), ledger, monkeypatch)
+    r = run(backend)
+    assert r.ok and len(client.messages.calls) == 2
+
+
+def test_timeout_is_not_retried(ledger, monkeypatch):
+    backend, client = _retrying_backend(lambda kw: anthropic.APITimeoutError(request=REQ), ledger, monkeypatch)
+    assert run(backend, timeout_s=100.0).error == "timeout"
+    assert len(client.messages.calls) == 1
+
+
+def test_non_retryable_status_is_not_retried(ledger, monkeypatch):
+    backend, client = _retrying_backend(lambda kw: status_error(anthropic.BadRequestError, 400), ledger, monkeypatch)
+    assert run(backend).error.startswith("api:")
+    assert len(client.messages.calls) == 1
+
+
+def test_retry_skipped_when_budget_too_small(ledger, monkeypatch):
+    # 남은 시간(timeout 3s)이 재시도 최소 시간보다 작으면 다시 보내지 않는다
+    backend, client = _retrying_backend(lambda kw: status_error(anthropic.InternalServerError, 503), ledger,
+                                        monkeypatch)
+    assert run(backend, timeout_s=3.0).error == "server"
+    assert len(client.messages.calls) == 1
+
+
+def test_deadline_passed_skips_call(ledger):
+    backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.1)), ledger)
+    backend.set_deadline(0.0)
+    r = run(backend)
+    assert r.ok is False and r.output is None and r.error == "deadline"
+    assert client.messages.calls == []
+    assert not ledger.path.exists()
+    backend.set_deadline(None)
+    assert run(backend).ok
+
+
+def test_deadline_caps_request_timeout(ledger):
+    backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.1)), ledger)
+    backend.set_deadline(20.0)
+    assert run(backend, timeout_s=100.0).ok
+    assert 0 < client.messages.calls[0]["timeout"] <= 20.0
+
+
+def test_budget_projection_prices_system_as_cache_write(tmp_path):
+    # head(opus) 1h: system 4000자 -> 1000토큰 x1.3 = 1300 x 2(캐시 쓰기) = 2600 input 토큰 상당
+    led = CostLedger(tmp_path / "l.jsonl", 10.0, 200.0)
+    got = _AB.project_call_cost(led, "claude-opus-5-5", 4000, 0, 0, cache_ttl="1h")
+    assert got == pytest.approx(2600 * 4.0 / 1e6)
+    assert got > led.estimate("claude-opus-5-5", 1000, 0, 0) * CACHE_WRITE_MULTIPLIER["1h"]

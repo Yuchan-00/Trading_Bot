@@ -51,7 +51,7 @@
 
 - `client.messages.parse(... output_format=<pydantic>)` 구조화 출력. `tool_choice` 강제 없음, `thinking` 미지정(5.5 계열 기본 adaptive), `output_config.effort`로 깊이 제어(분석 low, 리서치 medium, 총괄 high).
 - 시스템 프롬프트(역할 프롬프트 + 스킬 본문)는 **바이트 고정** + `cache_control {ephemeral, ttl 1h}`. 변동 데이터는 전부 user 메시지(JSON, `sort_keys`). 15분 주기라 1시간 TTL이 5분보다 싸다.
-- 타임아웃: Haiku 25~30s, Sonnet 45~60s, Opus 90s. SDK 재시도 2회. 실패·거부·max_tokens → 기권.
+- 타임아웃: Haiku 25~30s, Sonnet 45~60s, Opus 90s. 재시도는 백엔드가 직접 최대 2회, 역할 타임아웃(과 사이클 기한) 안에서만 한다(SDK `max_retries=0`, 타임아웃 뒤 재시도 없음). 호출 전 예산 검사는 system 프롬프트를 캐시 쓰기 단가 × 토크나이저 여유 1.3 으로 잡는다. 실패·거부·max_tokens → 기권.
 - 비용 원장(`cost_ledger.jsonl`): 호출마다 토큰·비용 기록, 호출 전 예산 검사. 인증 실패 → LLM 60분 일시정지.
 - 비밀값은 SDK 클라이언트에만 전달. 프롬프트·로그·텔레그램·예외 메시지에 키가 들어가지 않는다(마스킹 테스트).
 - 서버측 refusal fallback은 쓰지 않는다(거부는 HOLD로 충분하고 모델 티어를 고정하는 편이 비용·재현성에 낫다). 필요하면 설정으로 추가 가능.

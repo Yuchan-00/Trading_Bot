@@ -89,7 +89,8 @@ def _run(tmp_path: Path, scenario: str | None = None) -> tuple[int, str, str, Pa
         env["MOCK_SCENARIO"] = scenario
     out, err = io.StringIO(), io.StringIO()
     code = M.main(["run", "--once", "--offline-fixture"], env=env, out=out, err=err)
-    return code, out.getvalue(), err.getvalue(), data
+    # 픽스처는 실제 paper 상태를 오염시키지 않도록 <DATA_DIR>/offline_fixture 에 쓴다(main.offline_fixture_settings)
+    return code, out.getvalue(), err.getvalue(), data / M.OFFLINE_FIXTURE_DIRNAME
 
 
 def _decisions(data: Path) -> list[dict]:

@@ -75,7 +75,8 @@ class FakeMarketData:
 
     def __init__(self, *, clock_ms: Callable[[], int] | None = None, quote_volume_24h: float = 500_000_000.0,
                  spread_pct: float = 0.0002, depth_usdt: float = 2_000_000.0,
-                 funding_rate: float = 0.0001, open_interest_usdt: float = 1e9, long_short_ratio: float = 1.1) -> None:
+                 funding_rate: float = 0.0001, open_interest_usdt: float = 1e9, long_short_ratio: float = 1.1,
+                 perp_premium_pct: float | None = 0.01) -> None:
         self._clock = clock_ms or (lambda: int(time.time() * 1000))
         self.quote_volume_24h = float(quote_volume_24h)
         self.spread_pct = float(spread_pct)
@@ -83,6 +84,7 @@ class FakeMarketData:
         self.funding_rate = funding_rate
         self.open_interest_usdt = open_interest_usdt
         self.long_short_ratio = long_short_ratio
+        self.perp_premium_pct = perp_premium_pct   # None → 마크가격 미제공(프리미엄 null)
         self.calls: list[tuple] = []
 
     def __repr__(self) -> str:
@@ -146,7 +148,7 @@ class FakeMarketData:
         prev = self.price_at(symbol, now - 86_400_000)
         half = self.spread_pct / 2.0
         return Ticker(symbol=symbol, last=last, bid=last * (1 - half), ask=last * (1 + half),
-                      quote_volume_24h=self.quote_volume_24h, change_24h_pct=(last / prev - 1.0) * 100.0, ts=now)
+                      quote_volume_24h=self.quote_volume_24h, change_24h_pct=(last / prev - 1.0), ts=now)
 
     def fetch_orderbook_summary(self, symbol: str, depth: int = 50) -> OrderBookSummary:
         self.calls.append(("orderbook", symbol))
@@ -163,6 +165,12 @@ class FakeMarketData:
         return FuturesContext(symbol=symbol, funding_rate=self.funding_rate,
                               open_interest_usdt=self.open_interest_usdt,
                               long_short_ratio=self.long_short_ratio, ts=int(self._clock()))
+
+    def fetch_perp_mark(self, symbol: str) -> float | None:
+        """무기한 선물 마크가격(선택 확장, ``MarketData`` 프로토콜 밖). 현물가 × (1 + premium%)."""
+        if self.perp_premium_pct is None:
+            return None
+        return self.price_at(symbol, int(self._clock())) * (1.0 + float(self.perp_premium_pct) / 100.0)
 
     def server_time_ms(self) -> int:
         return int(self._clock())

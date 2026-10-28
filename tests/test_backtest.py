@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import time
 from pathlib import Path
 
 import pytest
@@ -689,7 +690,9 @@ class TestRunCardAndFetch:
         monkeypatch.setattr(bt, "rule_signal", lambda a, b, c: ("HOLD", 0.0, "x"))
         cfg.days = 1
         calls: list[tuple[str, str, int]] = []
-        base = flat_series(200)
+        # 캐시는 마지막 봉이 최신일 때만 재사용되므로(OPS-5) 지금 끝나는 시계열을 쓴다.
+        end_ts = (int(time.time() * 1000) // TF) * TF
+        base = flat_series(200, start_ts=end_ts - 199 * TF)
 
         class FakeMarket:
             def fetch_ohlcv(self, symbol, timeframe, limit):

@@ -888,3 +888,33 @@ def test_local_validate_fallback_without_risk(monkeypatch):
         mod._validate(OrderRequest(symbol=BTC, side="sell", base_amount=1.0), (), ())
     with pytest.raises(ValueError):
         mod._validate(OrderRequest(symbol=BTC, side="buy", quote_amount=10.0, base_amount=1.0), (BTC,), ())
+
+
+def test_fetch_perp_mark_reuses_funding_mark_then_falls_back(ex, sleeps):
+    """CONTRACT-2: perp mark for FlowPack.perp_premium_pct — funding response markPrice, else fetch_mark_price."""
+    calls: list[str] = []
+
+    class F(FakeFutures):
+        def fetch_funding_rate(self, symbol, params=None):
+            return {"symbol": symbol, "fundingRate": 0.0001, "markPrice": "101.5"}
+
+        def fetch_mark_price(self, symbol, params=None):
+            calls.append(symbol)
+            return {"symbol": symbol, "markPrice": "99.0"}
+
+    now = [1_000_000]
+    m = CcxtMarketData(exchange=ex, sleep=sleeps.append, futures_factory=F, clock_ms=lambda: now[0])
+    m.fetch_futures_context(BTC)
+    assert m.fetch_perp_mark(BTC) == pytest.approx(101.5) and calls == []
+    now[0] += 120_000                                   # stale cache → dedicated mark-price lookup
+    assert m.fetch_perp_mark(BTC) == pytest.approx(99.0) and calls == ["BTC/USDT:USDT"]
+
+
+def test_fetch_perp_mark_never_raises(ex, sleeps):
+    def boom():
+        raise RuntimeError("no futures")
+
+    m = CcxtMarketData(exchange=ex, sleep=sleeps.append, futures_factory=boom, clock_ms=lambda: 777)
+    assert m.fetch_perp_mark(BTC) is None
+    assert CcxtMarketData(exchange=ex, sleep=sleeps.append, futures_factory=FakeFutures,
+                          clock_ms=lambda: 777).fetch_perp_mark(BTC) is None   # no markPrice anywhere

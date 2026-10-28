@@ -37,7 +37,7 @@ import logging
 import math
 import os
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,7 @@ _STAGE_BEAR = "bear_decline"
 _STAGE_RISK = "risk_veto"
 _STAGE_G3 = "g3"
 _STAGE_BUDGET = "budget"
+_STAGE_DEADLINE = "cycle_deadline"   # 사이클 기한 초과로 남은 LLM 단계를 건너뜀(HOLD)
 _MAX_SIZE_PCT = HardLimits.MAX_POSITION_PCT * 100.0                    # 10.0 (%)
 _MAX_EXPOSURE_PCT = HardLimits.MAX_POSITIONS * _MAX_SIZE_PCT           # 30.0 (%) — gates 와 같은 정의
 
@@ -107,7 +108,7 @@ class CandidateContext(_Model):
     bear: BearOutput | None = None
     risk: RiskCandidateVerdict | None = None
     gates: list[GateDecision] = Field(default_factory=list)
-    dropped_at: str | None = None        # "g1" | "bear_decline" | "risk_veto" | "g3" | "budget" | None(생존)
+    dropped_at: str | None = None        # "g1" | "bear_decline" | "risk_veto" | "g3" | "budget" | "cycle_deadline" | None(생존)
 
 
 class PositionContext(_Model):
@@ -138,6 +139,8 @@ class PipelineResult(_Model):
     risk_note: str | None = None                         # RiskOutput.risk_note (entry_verdicts 용)
     risk_confidence: float | None = None                 # RiskOutput.confidence
     gate_counts: dict[str, int] = Field(default_factory=dict)   # journal.record_gate 용 카운터
+    # _sanitize_head 가 총괄 BUY 를 HOLD 로 강등한 기록 [{symbol, reason}] → cycle 이 gate_downgrade 알림(SPEC v2 §7)
+    head_downgrades: list[dict[str, str]] = Field(default_factory=list)
 
     def approved(self) -> list[CandidateContext]:
         """G3 까지 살아남은(승인/조건부) 후보."""
@@ -449,6 +452,7 @@ class _Acc:
         self.cost = 0.0
         self.abstained: list[str] = []
         self.budget = False
+        self.deadline: str | None = None   # 기한 초과로 멈춘 단계 이름(None = 기한 내)
 
     def take(self, results: Sequence[AgentResult]) -> None:
         for r in results:
@@ -474,9 +478,29 @@ def _output(result: AgentResult | None, model: type[BaseModel]) -> Any:
 
 # ======================================================================= 파이프라인
 def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, journal_state: JournalState,
-                 now_ms: int, *, news_store: NewsStore) -> PipelineResult:
-    """SPEC §20.5. ``runner`` 는 ``AgentRunner``(``run_many`` 필요)."""
+                 now_ms: int, *, news_store: NewsStore,
+                 should_stop: Callable[[str], bool] | None = None) -> PipelineResult:
+    """SPEC §20.5. ``runner`` 는 ``AgentRunner``(``run_many`` 필요).
+
+    ``should_stop(stage)`` (선택, cycle 이 사이클 기한 검사로 넘긴다)이 단계 경계(bull/bear·risk_manager·head 앞)에서
+    True 를 돌려주면 남은 LLM 단계를 부르지 않고 HOLD 로 끝낸다(``head_skipped_reason="cycle_deadline"``, 살아 있던
+    후보는 ``dropped_at="cycle_deadline"``, 보유 플래그 해제). 예산 초과와 달리 LLM 일시정지는 걸지 않는다.
+    """
     acc = _Acc()
+
+    def _stop(stage: str) -> bool:
+        if should_stop is None:
+            return False
+        try:
+            hit = bool(should_stop(stage))
+        except Exception as exc:  # noqa: BLE001 - 기한 콜백 실패는 기한 내로 본다(조이기만 하는 장치)
+            log.warning("기한 콜백 실패 stage=%s type=%s", stage, type(exc).__name__)
+            return False
+        if hit:
+            log.warning("사이클 기한 초과 — 단계 %s 부터 LLM 호출 생략, 남은 단계는 HOLD", stage)
+            acc.deadline = stage
+            acc.abstain(_STAGE_DEADLINE)
+        return hit
     gate_log: list[GateDecision] = []
     counts: dict[str, int] = {k: 0 for k in ("candidates_seen", "g1_dropped", "g2_bear_decline",
                                              "g3_risk_veto", "g3_other", "head_calls")}
@@ -517,6 +541,7 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
     risk_out: RiskOutput | None = None
     head_out: HeadOutput | None = None
     head_skipped: str | None = None
+    head_downgrades: list[dict[str, str]] = []
     vetoed: list[dict] = []
 
     def _finish(reason_if_budget: str = "budget_exceeded") -> PipelineResult:
@@ -528,6 +553,13 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
             for p in pos_ctx.values():
                 p.flagged_for_head = False
             head_skipped = reason_if_budget
+        elif acc.deadline is not None:
+            for c in ctxs.values():
+                if c.dropped_at is None:
+                    c.dropped_at = _STAGE_DEADLINE
+            for p in pos_ctx.values():
+                p.flagged_for_head = False
+            head_skipped = _STAGE_DEADLINE
         try:
             news_store.prune(now_ms)
             news_store.save()
@@ -536,11 +568,11 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
         return PipelineResult(
             candidates=[ctxs[s] for s in cand_syms], positions=[pos_ctx[s] for s in held], news=news_out,
             flow=flow_out, risk_global=risk_out.global_ if risk_out is not None else None,
-            head=None if acc.budget else head_out, abstained=list(acc.abstained), llm_calls=acc.calls,
+            head=None if (acc.budget or acc.deadline is not None) else head_out, abstained=list(acc.abstained), llm_calls=acc.calls,
             llm_cost_usd=round(acc.cost, 6), gate_log=gate_log, head_skipped_reason=head_skipped,
             budget_exceeded=acc.budget, news_risk_symbols=sorted(news_risk), risk_note=None if risk_out is None
             else risk_out.risk_note, risk_confidence=None if risk_out is None else risk_out.confidence,
-            gate_counts=dict(counts),
+            gate_counts=dict(counts), head_downgrades=[] if acc.budget else list(head_downgrades),
         )
 
     news_risk: set[str] = news_store.risk_symbols(now_ms)
@@ -653,13 +685,21 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
             vetoed.append({"symbol": s, "stage": _STAGE_G1, "reason": _first_failed_reason(g)})
 
     # ================================================================ 4. bull + bear (한 번의 run_many)
+    if survivors and _stop("debate"):
+        return _finish()
     if survivors:
+        # §20.3a.4: news_context 는 뉴스 채널이 기권했을 때만 null. 새 헤드라인이 없어 news_sentiment 를 부르지 않은
+        # 평상 사이클은 기권이 아니다 → 총괄 news 블록(_head_news_ctx)과 같은 상태: market_tone null + 저장소 위험 심볼.
+        debate_news: Any = news_out
+        if news_out is None and not any(a.startswith("news_sentiment:") for a in acc.abstained):
+            debate_news = {"market_tone": None, "risk_event_symbols": sorted(news_risk),
+                           "feed_health_note": "새 헤드라인 없음(news_sentiment 미호출, 기권 아님)"}
         calls = []
         for s in survivors:
             c = ctxs[s]
             fp = scan.feature_packs.get(s)
             rp = scan.risk_packs.get(s)
-            common = dict(feature_pack=fp, news=news_out, liquidity=scan.liquidity.get(s), now_ms=int(now_ms))
+            common = dict(feature_pack=fp, news=debate_news, liquidity=scan.liquidity.get(s), now_ms=int(now_ms))
             calls.append(("bull", P.build_bull(s, c.technical, c.flow, news_events, sentiment, c.candidate, regime,
                                                None, **common)))
             calls.append(("bear", P.build_bear(s, c.technical, c.flow, news_events, sentiment, c.candidate, regime,
@@ -723,6 +763,8 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
     planned_notional = max(0.0, float(equity) * HardLimits.MAX_POSITION_PCT) if _finite(equity) else 0.0
 
     # ================================================================ 6. risk_manager
+    if (survivors2 or held_llm) and _stop("risk_manager"):
+        return _finish()
     if survivors2 or held_llm:
         cands_payload = [{"symbol": s, "candidate": ctxs[s].candidate, "technical": ctxs[s].technical,
                           "flow": ctxs[s].flow, "bull": ctxs[s].bull, "bear": ctxs[s].bear,
@@ -843,6 +885,9 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
         log.info("총괄 호출 생략: %s", head_skipped)
         return _finish()
 
+    if _stop("head"):
+        return _finish()
+
     news_abstained = any(a.startswith("news_sentiment:") for a in acc.abstained)
 
     def _head_news_ctx(sym: str) -> dict:
@@ -891,17 +936,22 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
         caps = {s: (float(ctxs[s].risk.max_size_pct) if ctxs[s].risk is not None and _finite(ctxs[s].risk.max_size_pct)
                     else _MAX_SIZE_PCT) for s in approved}
         head_out = _sanitize_head(head_out, set(approved), set(flagged), slots=slots,
-                                  exposure_headroom_pct=exposure_headroom, size_caps=caps)
+                                  exposure_headroom_pct=exposure_headroom, size_caps=caps,
+                                  downgrades=head_downgrades)
     return _finish()
 
 
 def _sanitize_head(head: HeadOutput, approved: set[str], flagged: set[str], *, slots: int | None = None,
                    exposure_headroom_pct: float | None = None,
-                   size_caps: Mapping[str, float] | None = None) -> HeadOutput:
+                   size_caps: Mapping[str, float] | None = None,
+                   downgrades: list[dict[str, str]] | None = None) -> HeadOutput:
     """총괄 결정 정리(조이기만): 대상 밖 심볼 결정은 버리고, 승인 안 된 BUY·플래그 안 된 SELL 은 HOLD 로.
 
     ``slots``/``exposure_headroom_pct`` 가 주어지면 BUY 를 결정 순서대로 남은 포지션 슬롯 수와 남은 노출 한도
     (BUY 비중 = min(head size_pct, risk max_size_pct, 10) 의 누적합)로 제한하고 넘치는 BUY 는 HOLD 로 강등한다.
+
+    ``downgrades`` 리스트가 주어지면 HOLD 로 강등된 총괄 BUY 마다 ``{"symbol", "reason"}`` 을 덧붙인다
+    (cycle 이 notify(order_rejected, "gate_downgrade: ...") 로 알린다 — SPEC v2 §7).
     """
     out: list[HeadDecision] = []
     seen: set[str] = set()
@@ -915,6 +965,7 @@ def _sanitize_head(head: HeadOutput, approved: set[str], flagged: set[str], *, s
             log.warning("총괄이 대상 밖 심볼 결정 symbol=%s action=%s — 무시", d.symbol, d.action)
             continue
         seen.add(d.symbol)
+        was_buy = d.action == "BUY"
         if d.action == "BUY" and d.symbol not in approved:
             log.warning("승인되지 않은 BUY → HOLD symbol=%s", d.symbol)
             d = HeadDecision.hold(d.symbol, "코드 강등: 승인되지 않은 후보의 BUY")
@@ -932,5 +983,7 @@ def _sanitize_head(head: HeadOutput, approved: set[str], flagged: set[str], *, s
             else:
                 buys += 1
                 used += size
+        if was_buy and d.action != "BUY" and downgrades is not None:
+            downgrades.append({"symbol": d.symbol, "reason": d.rationale})
         out.append(d)
     return head.model_copy(update={"decisions": out})

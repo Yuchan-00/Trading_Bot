@@ -926,3 +926,24 @@ def test_scan_payload_compactable():
         compact(res.liquidity[c.symbol])
         compact(res.feature_packs[c.symbol])
     json.dumps(compact(res.regime), sort_keys=True, ensure_ascii=False)
+
+
+def test_scan_perp_mark_hook_feeds_premium():
+    """CONTRACT-2: market.fetch_perp_mark (optional, outside the frozen MarketData protocol) → perp_premium_pct."""
+    market = FakeMarketData(default_specs())
+    sc = S.Scanner(make_settings(), market, thresholds=S.Thresholds())
+    assert all(fp.perp_premium_pct is None for fp in sc.scan(make_state(), NOW).flow_packs.values())
+    market.fetch_perp_mark = lambda symbol: market.fetch_ticker(symbol).last * 1.002   # type: ignore[attr-defined]
+    res = sc.scan(make_state(), NOW)
+    assert res.flow_packs and all(fp.perp_premium_pct == pytest.approx(0.2) for fp in res.flow_packs.values())
+
+
+def test_scan_perp_mark_hook_failure_is_null():
+    market = FakeMarketData(default_specs())
+
+    def boom(symbol):
+        raise RuntimeError("mark down")
+
+    market.fetch_perp_mark = boom   # type: ignore[attr-defined]
+    res = S.Scanner(make_settings(), market, thresholds=S.Thresholds()).scan(make_state(), NOW)
+    assert res.candidates and all(fp.perp_premium_pct is None for fp in res.flow_packs.values())

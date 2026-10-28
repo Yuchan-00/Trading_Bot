@@ -145,10 +145,12 @@
     }
     $("h-mode").innerHTML = badge(s.mode, s.mode === "live" ? "on" : (s.mode === "testnet" ? "warn" : ""));
     $("h-cycle").textContent = s.cycle;
-    $("h-equity").textContent = num(s.equity);
+    // testnet/live 에서 자본을 모르면(사이클 보고서 없음) equity/drawdown_pct 는 null -> "-" 로 표시
+    $("h-equity").textContent = s.equity == null ? "- (자본 미확인)" : num(s.equity);
     $("h-daily").innerHTML = '<span class="' + signCls(s.daily_pnl) + '">' + num(s.daily_pnl) + " (" + pct(s.daily_pnl_pct) + ")</span>";
-    var ddCls = { none: "ok", caution: "warn", block: "on", stop_all: "on" }[s.drawdown_level] || "";
-    $("h-dd").innerHTML = pct(-s.drawdown_pct) + " " + badge(s.drawdown_level, ddCls);
+    var ddCls = { none: "ok", caution: "warn", block: "on", stop_all: "on", unknown: "" }[s.drawdown_level] || "";
+    var ddTxt = s.drawdown_pct == null ? "-" : pct(-s.drawdown_pct);
+    $("h-dd").innerHTML = ddTxt + " " + badge(s.drawdown_level, ddCls);
     $("h-pos").textContent = s.positions_count + " / " + s.max_positions;
     $("h-llm").innerHTML = s.llm_paused ? badge("일시정지: " + (s.llm_pause_reason || ""), "warn") : badge("정상", "ok");
     var killTxt = s.kill_switch ? "ON " + (s.kill_reason || "") : (st.stop_pending ? "STOP 대기" : "OFF");

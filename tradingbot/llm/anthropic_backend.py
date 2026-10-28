@@ -1,6 +1,13 @@
 """Claude API 백엔드 (SPEC §8.3).
 
-``client.messages.parse()``로 구조화 출력(``output_format=<pydantic model>``)을 받는다.
+구조화 출력은 ``client.messages.create(output_config={"format": {json_schema}})``로 받고 본문 JSON을
+``output_model.model_validate_json``으로 직접 검증한다.
+
+SPEC §8.3 (2)는 ``client.messages.parse()``를 예시로 들지만, 실제 SDK(anthropic 2.x)의 ``parse()``는
+``stop_reason=max_tokens``(잘린 JSON)·``refusal``(거부 문구)처럼 본문이 스키마에 맞지 않으면 HTTP 응답을
+받은 *뒤* ``pydantic.ValidationError``를 던져 ``usage``/``stop_reason``에 접근할 길이 없다. 그러면 SPEC §8.3
+(3)의 ``max_tokens``/``refusal:<category>`` 매핑과 (5)의 "usage는 항상 기록"을 지킬 수 없으므로, 원본
+``Message``를 돌려주는 ``create()``를 쓴다(리뷰 LLM-1/LLM-2).
 
 - 호출 전 ``ledger.check(예상 비용)`` → ``BudgetExceeded``는 그대로 전파(호출자가 LLM 일시정지).
 - system 블록은 ``cache_control={"type":"ephemeral","ttl":cache_ttl}``로 캐시한다. 역할별 system은
@@ -19,6 +26,11 @@ from typing import Any, Literal
 import anthropic
 from pydantic import BaseModel, ValidationError
 
+try:  # SDK 의 parse() 가 쓰는 스키마 변환기(구조화 출력 제약에 맞게 additionalProperties 등 정리)
+    from anthropic.lib._parse._transform import transform_schema as _transform_schema
+except Exception:  # noqa: BLE001 - 비공개 모듈이므로 없으면 원본 스키마 사용
+    _transform_schema = None  # type: ignore[assignment]
+
 from tradingbot.config import ConfigError, Settings, mask_secret
 from tradingbot.llm.backend import AgentResult, Effort, Tier
 from tradingbot.llm.cost import BudgetExceeded, CostLedger
@@ -34,8 +46,19 @@ def _dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _output_format(output_model: type[BaseModel]) -> dict[str, Any]:
+    """``output_config.format`` 값: SDK ``parse()`` 와 같은 json_schema 변환."""
+    schema = output_model.model_json_schema()
+    if _transform_schema is not None:
+        try:
+            schema = _transform_schema(schema)
+        except Exception:  # noqa: BLE001 - 변환 실패 시 원본 스키마
+            pass
+    return {"type": "json_schema", "schema": schema}
+
+
 class AnthropicBackend:
-    """``AgentBackend`` 구현. 테스트는 ``client``에 가짜 객체(``.messages.parse``)를 주입한다."""
+    """``AgentBackend`` 구현. 테스트는 ``client``에 가짜 객체(``.messages.create``)를 주입한다."""
 
     def __init__(
         self,
@@ -99,21 +122,30 @@ class AnthropicBackend:
         return AgentResult(role=role, ok=False, output=None, error=error, model=model, latency_s=latency, **usage)
 
     @staticmethod
-    def _coerce_output(parsed: Any, output_model: type[BaseModel]) -> BaseModel | None:
-        if parsed is None:
+    def _response_text(resp: Any) -> str:
+        """응답 content 의 text 블록을 이어 붙인다(구조화 출력은 text 블록 하나에 JSON 으로 온다)."""
+        parts: list[str] = []
+        for block in getattr(resp, "content", None) or []:
+            btype = getattr(block, "type", None)
+            if btype is None and isinstance(block, dict):
+                btype = block.get("type")
+            if btype != "text":
+                continue
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+
+    @staticmethod
+    def _coerce_output(text: str, output_model: type[BaseModel]) -> BaseModel | None:
+        if not text or not text.strip():
             return None
-        if isinstance(parsed, output_model):
-            return parsed
         try:
-            if isinstance(parsed, BaseModel):
-                return output_model.model_validate(parsed.model_dump())
-            if isinstance(parsed, (dict, list)):
-                return output_model.model_validate(parsed)
-            if isinstance(parsed, (str, bytes)):
-                return output_model.model_validate_json(parsed)
+            return output_model.model_validate_json(text)
         except (ValidationError, ValueError, TypeError):
             return None
-        return None
 
     # ------------------------------------------------------------------ API
     def complete(
@@ -141,13 +173,13 @@ class AnthropicBackend:
 
         logger.debug(
             "요청 role=%s tier=%s model=%s effort=%s max_tokens=%d payload=%s",
-            role, tier, model, effort, max_tokens, self._scrub(user_text[:_LOG_SNIPPET]),
+            role, tier, model, effort, max_tokens, self._scrub(user_text)[:_LOG_SNIPPET],  # 가린 뒤 자른다
         )
 
-        # 2) 호출
+        # 2) 호출 — create() 는 본문이 스키마에 안 맞아도 원본 Message 를 돌려주므로 usage/stop_reason 을 항상 본다
         started = time.monotonic()
         try:
-            resp = self.client.messages.parse(
+            resp = self.client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
                 system=[
@@ -158,8 +190,7 @@ class AnthropicBackend:
                     }
                 ],
                 messages=[{"role": "user", "content": user_text}],
-                output_format=output_model,
-                output_config={"effort": effort},
+                output_config={"effort": effort, "format": _output_format(output_model)},
                 timeout=timeout_s,
             )
         except BudgetExceeded:
@@ -225,11 +256,11 @@ class AnthropicBackend:
 
         # 5) 구조화 출력 검증
         try:
-            parsed = getattr(resp, "parsed_output", None)
-        except Exception as e:  # noqa: BLE001 - SDK 내부 검증 실패도 parse_error
+            text = self._response_text(resp)
+        except Exception as e:  # noqa: BLE001 - 응답 본문 접근 실패도 parse_error
             logger.warning("LLM 출력 파싱 실패 role=%s model=%s: %s", role, model, self._scrub(e)[:_LOG_SNIPPET])
-            parsed = None
-        output = self._coerce_output(parsed, output_model)
+            text = ""
+        output = self._coerce_output(text, output_model)
         if output is None:
             logger.warning("LLM 출력 검증 실패 role=%s model=%s output_model=%s", role, model, output_model.__name__)
             return self._fail(role, model, "parse_error", latency, **usage_kw)

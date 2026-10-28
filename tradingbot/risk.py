@@ -33,6 +33,10 @@ MIN_FEASIBLE_STOP_PCT: float = 0.002
 #: 낙폭 사다리 경계 비교용 허용 오차(부동소수 잡음으로 경계값이 미끄러지지 않게, 보수적으로 당긴다).
 _EPS: float = 1e-12
 
+#: 손절/익절 거리를 상한과 비교할 때의 허용 오차. ``entry*(1-0.02)`` 를 되돌려 계산하면
+#: 0.020000000000000018 처럼 1 ulp 가 흘러나오므로, 그 잡음만 흡수하고 실제 초과는 잡는다.
+_PCT_TOL: float = 1e-9
+
 #: 확신도 티어 (하한 포함, 상한 미포함) -> 상한(MAX_POSITION_PCT) 대비 비율.
 CONFIDENCE_TIERS: tuple[tuple[float, float, float], ...] = (
     (HardLimits.MIN_CONFIDENCE, 0.75, 0.40),
@@ -190,8 +194,11 @@ def global_gates(state: BotState, equity: float, now_ts: int, llm_budget_ok: boo
         reasons.append("LLM 예산 소진 (llm_budget): 신규 진입 판단 불가")
 
     # 7) LLM 일시정지 (예산/인증 오류 등으로 호출이 멈춘 동안은 새 판단이 없다)
+    #    now_ts 가 NaN/inf/비숫자면 일시정지 여부를 판단할 수 없다 -> 다른 무효 입력과 같이 **막는다**(fail-closed).
     paused_until = state.llm_paused_until_ts
-    if paused_until is not None and _finite(now_ts) and int(now_ts) < int(paused_until):
+    if not _finite(now_ts):
+        reasons.append(f"현재 시각이 유효하지 않음 (invalid_now_ts): {now_ts!r}: LLM 일시정지 판단 불가")
+    elif paused_until is not None and int(now_ts) < int(paused_until):
         reasons.append(
             f"LLM 일시정지 중 (llm_paused) until={int(paused_until)}: {state.llm_pause_reason or '사유 없음'}"
         )
@@ -217,25 +224,33 @@ def symbol_gates(state: BotState, symbol: str, whitelist: Iterable[str] | None =
     - 쿨다운(``cooldown_until_cycle``)·복수매매 창(``loss_cooldown_until_cycle``) 안이면 막는다.
       ``state.cycle <= until`` 인 동안 막는다(경계 포함, 보수적).
     - ``whitelist``가 주어지면 그 밖의 종목은 막는다. None이면 화이트리스트 검사는 생략한다.
+    - 종목 기호는 정규형(``strip().upper()``, 예 "BTC/USDT")이어야 한다. 정규형이 아니면
+      ``non_canonical_symbol`` 로 막고, 보유/쿨다운/복수매매 창 조회는 정규형 **과** 원문 둘 다로 한다
+      (대소문자·공백 변형으로 같은 종목에 중복 진입하거나 쿨다운을 우회할 수 없게).
     """
     reasons: list[str] = []
     if not isinstance(symbol, str) or not symbol.strip():
         reasons.append(f"종목 기호가 비어 있음 (invalid_symbol): {symbol!r}")
         return RiskVerdict(allowed=False, reasons=reasons, size_multiplier=0.0)
 
+    canonical = symbol.strip().upper()
+    keys = (symbol, canonical) if canonical != symbol else (symbol,)
+    if canonical != symbol:
+        reasons.append(f"{symbol!r}: 종목 기호가 정규형이 아님 (non_canonical_symbol) -> {canonical!r}")
+
     if whitelist is not None:
         wl = tuple(whitelist)
         if symbol not in wl:
             reasons.append(f"{symbol}: 화이트리스트 밖 (not_whitelisted)")
 
-    if symbol in state.positions:
+    if any(k in state.positions for k in keys):
         reasons.append(f"{symbol}: 이미 보유 중 (already_held)")
 
-    until = state.cooldown_until_cycle.get(symbol)
+    until = _max_until(state.cooldown_until_cycle, keys)
     if until is not None and state.cycle <= until:
         reasons.append(f"{symbol}: 청산 후 쿨다운 (cooldown) until_cycle={until} 현재={state.cycle}")
 
-    loss_until = state.loss_cooldown_until_cycle.get(symbol)
+    loss_until = _max_until(state.loss_cooldown_until_cycle, keys)
     if loss_until is not None and state.cycle <= loss_until:
         reasons.append(
             f"{symbol}: 손실 청산 후 재진입 금지 창 (revenge_window) until_cycle={loss_until} 현재={state.cycle}"
@@ -243,6 +258,25 @@ def symbol_gates(state: BotState, symbol: str, whitelist: Iterable[str] | None =
 
     allowed = not reasons
     return RiskVerdict(allowed=allowed, reasons=reasons, size_multiplier=1.0 if allowed else 0.0)
+
+
+def _max_until(table: dict[str, int], keys: tuple[str, ...]) -> int | None:
+    """여러 키 중 가장 늦은 until 사이클(보수적). 하나도 없으면 None."""
+    found = [table[k] for k in keys if k in table]
+    return max(found) if found else None
+
+
+def _nudge_within(entry: float, price: float, max_pct: float, *, below: bool) -> float:
+    """``price`` 를 진입가 쪽으로 ulp 단위로 당겨 거리 비율이 ``max_pct`` 를 넘지 않게 한다(조이기만).
+
+    ``entry*(1-max_pct)`` 를 되돌려 계산한 비율은 1 ulp 가 흘러 ``max_pct`` 를 살짝 넘을 수 있다.
+    """
+    dist = _pct_below if below else _pct_above
+    for _ in range(8):
+        if dist(entry, price) <= max_pct:
+            break
+        price = math.nextafter(price, entry)
+    return price
 
 
 # ---------------------------------------------------------------- 손절/익절
@@ -301,9 +335,9 @@ def clamp_stops(entry_price: float, stop_loss_price: float, take_profit_price: f
 
     sl = entry * (1.0 - sl_pct)
     tp = entry * (1.0 + tp_pct)
-    # 부동소수 잡음으로 상한을 넘지 않게 마지막으로 한 번 더 조인다.
-    sl = max(sl, entry * (1.0 - max_sl))
-    tp = min(tp, entry * (1.0 + max_tp))
+    # 부동소수 잡음으로 상한을 넘지 않게 마지막으로 한 번 더 조인다(되돌려 계산한 비율도 상한 이하가 되게).
+    sl = _nudge_within(entry, max(sl, entry * (1.0 - max_sl)), max_sl, below=True)
+    tp = _nudge_within(entry, min(tp, entry * (1.0 + max_tp)), max_tp, below=False)
     return sl, tp
 
 
@@ -328,10 +362,17 @@ def enforce_net_rr(
     조여서도 불가능(필요 손절거리 ≤ 0.002)하거나 손절/익절이 무효면 입력을 그대로 돌려주고
     note에 "rr_impossible"을 담는다 -> 호출자는 HOLD. entry_price 무효는 ValueError.
     반환 (stop_loss_price, take_profit_price, note).
+
+    하드 리밋(§3 불변식)은 여기서도 지킨다: 입력 손절거리가 MAX_STOP_LOSS_PCT 를 넘으면 먼저 상한으로
+    조이고(note "stop_clamped"), 익절거리가 MAX_TAKE_PROFIT_PCT 를 넘으면 상한으로 내린 뒤(note
+    "tp_clamped") 그 값으로 손익비를 계산한다 — 도달 불가능한 익절로 손익비가 부풀려지지 않게.
+    상한 안의 익절은 절대 바꾸지 않는다.
     """
     entry = _require_entry(entry_price)
     cost = ROUND_TRIP_COST_PCT
     min_rr = HardLimits.MIN_NET_RR
+    max_sl = HardLimits.MAX_STOP_LOSS_PCT
+    max_tp = HardLimits.MAX_TAKE_PROFIT_PCT
 
     if not (_positive(stop_loss_price) and float(stop_loss_price) < entry):
         return stop_loss_price, take_profit_price, f"rr_impossible: 손절가 무효 {stop_loss_price!r}"
@@ -342,17 +383,30 @@ def enforce_net_rr(
     tp = float(take_profit_price)
     sl_pct = _pct_below(entry, sl)
     tp_pct = _pct_above(entry, tp)
+    prefix = ""
+    if sl_pct > max_sl + _PCT_TOL:
+        prefix += f"stop_clamped: 손절거리 {sl_pct:.4%} -> 상한 {max_sl:.2%}; "
+        sl_pct = max_sl
+        sl = _nudge_within(entry, entry * (1.0 - max_sl), max_sl, below=True)
+    if tp_pct > max_tp + _PCT_TOL:
+        prefix += f"tp_clamped: 익절거리 {tp_pct:.4%} -> 상한 {max_tp:.2%}; "
+        tp_pct = max_tp
+        tp = _nudge_within(entry, entry * (1.0 + max_tp), max_tp, below=False)
+    if prefix:
+        log.debug("enforce_net_rr 하드 리밋 조임: %s", prefix)
+
     rr = (tp_pct - cost) / (sl_pct + cost)
     if rr >= min_rr:
-        return sl, tp, f"net_rr={rr:.2f} ≥ {min_rr}"
+        return sl, tp, f"{prefix}net_rr={rr:.2f} ≥ {min_rr}"
 
     # 손절만 조인다: (tp_pct - cost) / (needed + cost) = min_rr  ->  needed = (tp_pct - cost)/min_rr - cost
     needed = (tp_pct - cost) / min_rr - cost
     if needed <= MIN_FEASIBLE_STOP_PCT:
+        # 불가능 -> 호출자가 HOLD 하므로 입력을 그대로 돌려준다(주문에 쓰이지 않는다).
         return (
-            sl,
-            tp,
-            f"rr_impossible: 순손익비 {rr:.2f} < {min_rr}, 필요 손절거리 {needed:.4%} ≤ "
+            float(stop_loss_price),
+            float(take_profit_price),
+            f"{prefix}rr_impossible: 순손익비 {rr:.2f} < {min_rr}, 필요 손절거리 {needed:.4%} ≤ "
             f"{MIN_FEASIBLE_STOP_PCT:.2%} (익절거리 {tp_pct:.2%})",
         )
     # 부동소수 잡음에 대비해 아주 조금 더 조인다(조이기만 한다).
@@ -360,7 +414,7 @@ def enforce_net_rr(
     new_sl = entry * (1.0 - new_sl_pct)
     new_rr = (tp_pct - cost) / (new_sl_pct + cost)
     note = (
-        f"stop_tightened: 손절거리 {sl_pct:.4%} -> {new_sl_pct:.4%}, "
+        f"{prefix}stop_tightened: 손절거리 {sl_pct:.4%} -> {new_sl_pct:.4%}, "
         f"순손익비 {rr:.2f} -> {new_rr:.2f} (익절 유지 {tp_pct:.2%})"
     )
     log.debug(note)
@@ -407,7 +461,8 @@ def size_position(
     entry = float(entry_price)
     sl_pct = _pct_below(entry, float(stop_loss_price))
     # 손절거리가 상한을 넘으면(호출자가 clamp를 빼먹은 경우) 위험 계산에는 그대로(더 작은 수량) 쓰고 경고만 남긴다.
-    if sl_pct > HardLimits.MAX_STOP_LOSS_PCT:
+    # clamp_stops 출력(정확히 2%)의 부동소수 잡음은 허위 경고가 되지 않게 _PCT_TOL 만큼 봐준다.
+    if sl_pct > HardLimits.MAX_STOP_LOSS_PCT + _PCT_TOL:
         notes.append(f"손절거리 {sl_pct:.2%} > 상한 {HardLimits.MAX_STOP_LOSS_PCT:.0%} (stop_over_limit): 위험 계산에 그대로 반영")
 
     # 1) 위험 기반
@@ -492,7 +547,12 @@ def check_exits(position: Position, mark_price: float, current_cycle: int) -> Ex
     mark ≤ 손절 -> "stop_loss"; mark ≥ 익절 -> "take_profit";
     current_cycle - opened_cycle ≥ TIME_STOP_CYCLES -> "time_stop"; 아니면 None.
     마크가 NaN/inf/0 이하면 가격 조건은 판단하지 않고(시간손절만 본다) 경고를 남긴다.
+    current_cycle 이 NaN/inf/비숫자면 시간손절을 판단할 수 없으므로(호출자 버그) ValueError — 조용히
+    포지션을 무기한 유지하지 않는다(fail-closed).
     """
+    if not _finite(current_cycle):
+        raise ValueError(f"{position.symbol}: 현재 사이클이 유효하지 않음(유한한 정수여야 함): {current_cycle!r}")
+
     if _positive(mark_price):
         mark = float(mark_price)
         if _finite(position.stop_loss_price) and mark <= float(position.stop_loss_price):
@@ -502,7 +562,7 @@ def check_exits(position: Position, mark_price: float, current_cycle: int) -> Ex
     else:
         log.warning("%s: 마크 가격이 유효하지 않음(%r) -> 가격 기반 청산 판단 건너뜀", position.symbol, mark_price)
 
-    if _finite(current_cycle) and int(current_cycle) - int(position.opened_cycle) >= HardLimits.TIME_STOP_CYCLES:
+    if int(current_cycle) - int(position.opened_cycle) >= HardLimits.TIME_STOP_CYCLES:
         return "time_stop"
     return None
 

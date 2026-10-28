@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import calendar
 import html
+import io
 import json
 import logging
 import os
@@ -60,13 +61,17 @@ SYMBOL_ALIASES: dict[str, tuple[str, ...]] = {
     "OP": ("optimism",),
 }
 
-TIER1_DOMAINS = ("coindesk", "cointelegraph", "theblock", "bloomberg", "reuters")
+# 등록 가능 도메인(registrable domain) 기준. 정확히 같거나 그 서브도메인일 때만 인정한다
+# (부분 문자열 매칭 금지: evilcoindesk.com / coindesk.evil.com 은 tier 3).
+TIER1_DOMAINS = ("coindesk.com", "cointelegraph.com", "theblock.co", "bloomberg.com", "reuters.com")
 TIER2_DOMAINS = (
-    "decrypt", "bitcoinmagazine", "cryptoslate", "cryptonews", "beincrypto", "dlnews", "blockworks",
-    "thedefiant", "messari", "wsj", "ft.com", "cnbc", "forbes", "binance", "coinbase", "kraken",
-    "cryptobriefing", "newsbtc", "ambcrypto", "u.today", "cryptopotato", "bitcoinist",
-    "coinmarketcap", "coingecko", "protos", "unchained", "watcher.guru", "cryptoquant", "glassnode",
-    "defillama", "bitcoin.com", "news.bitcoin", "theverge", "wired", "techcrunch", "nytimes", "wsj",
+    "decrypt.co", "bitcoinmagazine.com", "cryptoslate.com", "cryptonews.com", "beincrypto.com",
+    "dlnews.com", "blockworks.co", "thedefiant.io", "messari.io", "wsj.com", "ft.com", "cnbc.com",
+    "forbes.com", "binance.com", "coinbase.com", "kraken.com", "cryptobriefing.com", "newsbtc.com",
+    "ambcrypto.com", "u.today", "cryptopotato.com", "bitcoinist.com", "coinmarketcap.com",
+    "coingecko.com", "protos.com", "unchainedcrypto.com", "watcher.guru", "cryptoquant.com",
+    "glassnode.com", "defillama.com", "bitcoin.com", "theverge.com", "wired.com", "techcrunch.com",
+    "nytimes.com",
 )
 
 MAX_PER_SYMBOL = 15
@@ -140,19 +145,54 @@ def source_tier(domain: str) -> int:
     d = (domain or "").lower()
     if not d:
         return 3
-    if any(k in d for k in TIER1_DOMAINS):
+    if d.startswith("www."):
+        d = d[4:]
+    if _domain_in(d, TIER1_DOMAINS):
         return 1
-    if any(k in d for k in TIER2_DOMAINS):
+    if _domain_in(d, TIER2_DOMAINS):
         return 2
     return 3
 
 
+def _domain_in(host: str, known: Iterable[str]) -> bool:
+    """host 가 known 중 하나와 같거나 그 서브도메인이면 True."""
+    return any(host == k or host.endswith("." + k) for k in known)
+
+
 # ---------------------------------------------------------------- 파싱
-def _clean_text(s: Any) -> str:
+def _clean_text(s: Any, *, is_html: bool = True) -> str:
+    """텍스트 정리. ``is_html`` 일 때만 태그를 벗기고 엔티티를 푼다(feedparser는 text/plain 값의
+    엔티티를 이미 풀어 주므로 평문의 '<' '>' 는 그대로 둔다)."""
     if not isinstance(s, str):
         return ""
-    s = html.unescape(_TAG_RE.sub(" ", s))
+    if is_html:
+        s = html.unescape(_TAG_RE.sub(" ", s))
     return _WS_RE.sub(" ", s).strip()
+
+
+def _entry_text(entry: Any, key: str) -> str:
+    """entry[key] 를 그 ``*_detail.type`` 에 맞게 정리한다."""
+    value = entry.get(key, "")
+    detail = entry.get(key + "_detail")
+    kind = detail.get("type", "") if isinstance(detail, dict) else ""
+    is_html = not (isinstance(kind, str) and kind.lower().startswith("text/plain"))
+    return _clean_text(value, is_html=is_html)
+
+
+def _parse_bytes(raw: str | bytes) -> Any:
+    """feedparser 에 **데이터로만** 넘긴다. 문자열을 그대로 주면 URL/파일 경로로 오인해 직접 받아오므로
+    항상 BytesIO 로 감싼다."""
+    data = raw.encode("utf-8", errors="replace") if isinstance(raw, str) else bytes(raw)
+    return feedparser.parse(io.BytesIO(data))
+
+
+def _looks_like_feed(raw: str | bytes) -> bool:
+    """RSS/Atom 으로 인식되고 항목이 하나라도 있으면 True(점검 페이지 HTML 등은 False)."""
+    try:
+        parsed = _parse_bytes(raw)
+    except Exception:
+        return False
+    return bool(getattr(parsed, "entries", None)) and bool(getattr(parsed, "version", ""))
 
 
 def _entry_ts(entry: Any) -> int | None:
@@ -179,7 +219,7 @@ def parse_feed(raw: str | bytes, feed_url: str, bases: Iterable[str], *, now_ms:
         log.warning("피드 원문이 XML이 아님 %s", domain_feed)
         return []
     try:
-        parsed = feedparser.parse(raw)
+        parsed = _parse_bytes(raw)
     except Exception as e:  # feedparser는 거의 던지지 않지만, 절대 전파하지 않는다
         log.warning("피드 파싱 실패 %s: %s", domain_feed, type(e).__name__)
         return []
@@ -198,14 +238,14 @@ def parse_feed(raw: str | bytes, feed_url: str, bases: Iterable[str], *, now_ms:
     items: list[NewsItem] = []
     for entry in entries:
         try:
-            title = _clean_text(entry.get("title", ""))
+            title = _entry_text(entry, "title")
             if not title:
                 continue
             link = entry.get("link") or ""
             if not isinstance(link, str):
                 link = ""
             link = link.strip()
-            summary = _clean_text(entry.get("summary", "") or entry.get("description", ""))
+            summary = _entry_text(entry, "summary") or _entry_text(entry, "description")
             ts = _entry_ts(entry)
             if cutoff_ms is not None and ts is not None and ts < cutoff_ms:
                 continue
@@ -292,6 +332,12 @@ def _get_raw(url: str, fetcher: Callable[[str], str], cache: dict[str, Any], now
         return None, False
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
+    if not _looks_like_feed(raw):
+        # 200 이지만 피드가 아닌 응답(점검/WAF 페이지 등): 정상 캐시를 덮어쓰지 않고 오래된 캐시로 대체
+        if isinstance(entry, dict) and isinstance(entry.get("raw"), str):
+            log.warning("피드 아닌 응답 -> 오래된 캐시로 대체 %s", source_domain(url))
+            return entry["raw"], False
+        return raw, False
     cache[url] = {"fetched_ts": int(now_s), "raw": raw}
     return raw, True
 
@@ -358,7 +404,8 @@ def fetch_news(
     out: list[NewsItem] = []
     for item in collected:
         if item.symbols:
-            if all(counts.get(s, 0) >= MAX_PER_SYMBOL for s in item.symbols):
+            # 심볼당 최대 15개는 **하드 상한**: 태그된 심볼 중 하나라도 꽉 찼으면 넣지 않는다
+            if any(counts.get(s, 0) >= MAX_PER_SYMBOL for s in item.symbols):
                 continue
             for s in item.symbols:
                 counts[s] = counts.get(s, 0) + 1

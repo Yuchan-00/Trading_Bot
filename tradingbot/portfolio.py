@@ -74,8 +74,42 @@ def _finite_nonneg(x: object) -> bool:
 
 
 def _dump_state(state: BotState) -> str:
-    """결정적 JSON(sort_keys, ensure_ascii=False). 같은 상태면 같은 바이트."""
-    return json.dumps(state.model_dump(mode="json"), sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    """결정적 JSON(sort_keys, ensure_ascii=False). 같은 상태면 같은 바이트.
+
+    ``allow_nan=False``: NaN/Infinity 토큰은 RFC 8259 JSON이 아니므로 절대 쓰지 않는다(ValueError).
+    """
+    return (
+        json.dumps(state.model_dump(mode="json"), sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False)
+        + "\n"
+    )
+
+
+def _cash_fee(fill: Fill, price: float) -> float:
+    """체결의 **현금(quote) 수수료**만 돌려준다.
+
+    SPEC §4 Fill 규약: 수수료가 base로 나가면 ``base_amount``는 이미 순수량(filled - fee_base)이고
+    ``fee_quote``는 그 base 수수료를 체결가로 환산한 값을 포함한다. 순수량이 줄어든 것이 곧 수수료이므로
+    손익/잔고 계산에서는 환산분을 빼고 실제로 quote에서 나간 몫만 비용으로 잡는다(이중 차감 방지).
+    """
+    fee = float(fill.fee_quote)
+    fee_base = fill.fee_base if _finite_nonneg(fill.fee_base) else 0.0
+    if fee_base > 0 and _finite_positive(price):
+        fee -= fee_base * price
+    return max(fee, 0.0)
+
+
+def _fsync_dir(path: Path) -> None:
+    """``os.replace`` 뒤 디렉터리 엔트리를 내구성 있게 만든다(best effort; 미지원 FS는 무시)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- Portfolio
@@ -91,6 +125,9 @@ class Portfolio:
         #: 재시도 대기 함수. 테스트가 ``pf.sleep = lambda s: None`` 처럼 바꿔 끼운다.
         self.sleep: Callable[[float], None] = time.sleep
         self.state = self._fresh_state()
+        #: 새 상태의 DailyStats 날짜는 벽시계로 임시 기록된다. 첫 ``ensure_day``가 호출자 시계의 날짜를
+        #: 채택할 때까지 False (SPEC §15: 시계는 주입 가능하므로 벽시계와 다를 수 있다).
+        self._day_adopted: bool = False
 
     # ------------------------------------------------------------ 생성/로드
     def _fresh_state(self) -> BotState:
@@ -150,6 +187,7 @@ class Portfolio:
             return pf
 
         pf.state = state
+        pf._day_adopted = True  # 파일의 날짜는 실제로 운영된 날이다
         log.info(
             "상태 로드 (mode=%s, cycle=%d, positions=%d, closed=%d)",
             state.mode, state.cycle, len(state.positions), len(state.closed_trades),
@@ -190,6 +228,7 @@ class Portfolio:
                     except OSError:  # 일부 파일시스템은 fsync 미지원
                         pass
                 os.replace(tmp, p)
+                _fsync_dir(p.parent)
                 if attempt > 1:
                     log.warning("상태 저장 성공 (재시도 %d회 후): %s", attempt - 1, p)
                 return
@@ -253,19 +292,33 @@ class Portfolio:
 
         연속 손실 카운트는 날이 바뀌면 0으로 돌아간다(당일 안에서만 누적).
         같은 날이면 None. 단, start_equity가 아직 0(testnet/live 첫 사이클)이면 지금 자본으로 채운다.
+
+        - 새 상태(파일 없이 시작)의 첫 호출은 롤오버가 아니다: 호출자 시계의 날짜를 채택하고 None.
+        - 날짜가 **거꾸로** 가면(시계 보정 등) 롤오버하지 않는다: 경고만 남기고 당일 손실 한도·연속 손실
+          같은 안전장치 카운터를 그대로 유지한다(None).
         """
         today = _date_str(now)
         daily = self.state.daily
+        if not self._day_adopted:
+            self._day_adopted = True
+            pristine = daily.trades == 0 and daily.realized_pnl == 0.0 and daily.llm_cost_usd == 0.0
+            if today != daily.date and pristine:
+                log.info("새 상태의 일일 통계 날짜를 호출자 시계로 채택: %s -> %s", daily.date, today)
+                daily.date = today
         if today == daily.date:
             if daily.start_equity <= 0 and _finite_positive(equity):
                 daily.start_equity = float(equity)
                 log.info("당일 시작 자본 설정: %.2f", equity)
             return None
+        if today < daily.date:
+            log.warning(
+                "날짜가 거꾸로 감(%s -> %s): 시계 확인 필요. 일일 통계를 유지하고 롤오버하지 않음",
+                daily.date, today,
+            )
+            return None
         finished = daily.model_copy(deep=True)
         start = float(equity) if _finite_nonneg(equity) else 0.0
         self.state.daily = DailyStats(date=today, start_equity=start)
-        if today < daily.date:
-            log.warning("날짜가 거꾸로 감(%s -> %s): 시계 확인 필요. 새 일일 통계 시작", daily.date, today)
         log.info(
             "일일 롤오버 %s -> %s (전일 손익 %.2f, 거래 %d, 시작자본 %.2f)",
             finished.date, today, finished.realized_pnl, finished.trades, start,
@@ -293,15 +346,23 @@ class Portfolio:
             raise ValueError("체결 금액/수수료가 유효하지 않음")
         if not _finite_positive(stop_loss_price) or not _finite_positive(take_profit_price):
             raise ValueError("손절/익절 가격이 유효하지 않음")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
+            raise ValueError(f"confidence가 유효하지 않음: {confidence!r}")
 
         entry_price = fill.price if _finite_positive(fill.price) else fill.quote_amount / fill.base_amount
+        if not _finite_positive(entry_price):
+            raise ValueError(
+                f"매수 체결의 진입가가 양수가 아님: price={fill.price!r} quote_amount={fill.quote_amount!r}"
+            )
         if not (stop_loss_price < entry_price < take_profit_price):
             log.warning(
                 "%s 손절/익절이 진입가와 어긋남: sl=%s entry=%s tp=%s",
                 fill.symbol, stop_loss_price, entry_price, take_profit_price,
             )
 
-        cost = fill.quote_amount + fill.fee_quote
+        # base로 나간 수수료는 순수량에 이미 반영됐다. 현금 수수료만 비용으로 기록한다.
+        fee_cash = _cash_fee(fill, entry_price)
+        cost = fill.quote_amount + fee_cash
         if self._mode == "paper" and cost > self.state.paper_quote_balance + 1e-9:
             raise ValueError(
                 f"paper 잔고 부족: 필요 {cost:.2f} > 보유 {self.state.paper_quote_balance:.2f}"
@@ -312,7 +373,7 @@ class Portfolio:
             base_amount=fill.base_amount,
             entry_price=entry_price,
             quote_spent=fill.quote_amount,
-            fee_quote=fill.fee_quote,
+            fee_quote=fee_cash,
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
             opened_cycle=cycle,
@@ -327,7 +388,7 @@ class Portfolio:
         self.state.positions[fill.symbol] = pos
         log.info(
             "진입 기록 [%s] %s %.8g @ %.8g (%.2f USDT, 수수료 %.4f) sl=%.8g tp=%.8g cycle=%d",
-            self._mode, fill.symbol, pos.base_amount, entry_price, fill.quote_amount, fill.fee_quote,
+            self._mode, fill.symbol, pos.base_amount, entry_price, fill.quote_amount, fee_cash,
             stop_loss_price, take_profit_price, cycle,
         )
         return pos
@@ -356,7 +417,9 @@ class Portfolio:
         held = pos.base_amount
         sold = fill.base_amount
         quote_received = fill.quote_amount
-        fee_exit = fill.fee_quote
+        # 매도 수수료도 현금 몫만(base로 나간 몫은 순수량/금액에 이미 반영).
+        fill_price = fill.price if _finite_positive(fill.price) else (quote_received / sold if sold > 0 else 0.0)
+        fee_exit = _cash_fee(fill, fill_price)
         if sold > held:
             scale = held / sold
             log.warning(

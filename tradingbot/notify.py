@@ -262,6 +262,7 @@ class Notifier:
         self._sleep: Callable[[float], None] = sleep if sleep is not None else time.sleep
         self._queue: queue.Queue[tuple[TradeEvent, str]] = queue.Queue()
         self._worker: threading.Thread | None = None
+        self._inflight: tuple[TradeEvent, str] | None = None
         self._lock = threading.Lock()
         self.sent_count = 0
         self.failed_count = 0
@@ -280,14 +281,21 @@ class Notifier:
         if self.transport is None:
             log.info("[알림 비활성] %s", text.replace("\n", " | "))
             return
-        if self.async_send:
-            self._ensure_worker()
-            self._queue.put((event, text))
-            return
-        self._deliver(event, text)
+        try:
+            if self.async_send and self._ensure_worker():
+                self._queue.put((event, text))
+                return
+            # 동기 모드이거나 워커를 띄울 수 없으면(자원 고갈·인터프리터 종료 중) 동기 전송으로 강등
+            self._deliver(event, text)
+        except Exception:  # noqa: BLE001 - 어떤 경우에도 사이클로 전파하지 않는다
+            log.exception("알림 처리 중 내부 오류 (kind=%s)", getattr(event, "kind", "?"))
 
     def flush(self, timeout_s: float = 5.0) -> None:
-        """큐가 빌 때까지(최대 ``timeout_s``) 기다린다. 동기 모드면 즉시 반환."""
+        """큐가 빌 때까지(최대 ``timeout_s``) 기다린다. 동기 모드면 즉시 반환.
+
+        시간 초과 시 큐에 남은(그리고 전송 중인) 이벤트는 유실되지 않도록 failed_log에 기록한다
+        (SPEC §11: 최종 실패 → failed_log). 프로세스 종료 시 데몬 워커가 함께 사라지기 때문이다.
+        """
         if not self.async_send:
             return
         q = self._queue
@@ -296,9 +304,34 @@ class Notifier:
             while q.unfinished_tasks:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    log.warning("알림 flush 시간 초과: 미전송 %d건", q.unfinished_tasks)
-                    return
+                    log.warning("알림 flush 시간 초과: 미전송 %d건 — failed_log로 기록", q.unfinished_tasks)
+                    break
                 q.all_tasks_done.wait(remaining)
+            else:
+                return
+        self._drain_to_failed_log()
+
+    def _drain_to_failed_log(self) -> None:
+        """큐에 남은 이벤트를 모두 꺼내 failed_log에 기록한다. 전송 중인 이벤트도 함께 기록한다."""
+        drained = 0
+        while True:
+            try:
+                event, text = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self.failed_count += 1
+                self._record_failure(event, text, "flush 시간 초과: 전송 전 종료", 0)
+                drained += 1
+            finally:
+                self._queue.task_done()
+        inflight = self._inflight
+        if inflight is not None:
+            event, text = inflight
+            self._record_failure(event, text, "flush 시간 초과: 전송 중 종료", 0)
+            drained += 1
+        if drained:
+            log.error("알림 flush 시간 초과로 %d건을 failed_log에 기록", drained)
 
     @property
     def pending(self) -> int:
@@ -312,22 +345,32 @@ class Notifier:
         )
 
     # 내부: 워커 ----------------------------------------------------------------
-    def _ensure_worker(self) -> None:
+    def _ensure_worker(self) -> bool:
+        """워커 스레드가 살아 있도록 한다. 스레드를 만들 수 없으면 False(호출자는 동기 전송으로 강등)."""
         with self._lock:
             if self._worker is not None and self._worker.is_alive():
-                return
-            self._worker = threading.Thread(target=self._run, name="tradingbot-notify", daemon=True)
-            self._worker.start()
+                return True
+            try:
+                worker = threading.Thread(target=self._run, name="tradingbot-notify", daemon=True)
+                worker.start()
+            except Exception as e:  # noqa: BLE001 - 자원 고갈·인터프리터 종료 중
+                self._worker = None
+                log.warning("알림 워커 스레드를 시작할 수 없음 (%s: %s) — 동기 전송으로 강등", type(e).__name__, e)
+                return False
+            self._worker = worker
+            return True
 
     def _run(self) -> None:
         while True:
             item = self._queue.get()
+            self._inflight = item
             try:
                 event, text = item
                 self._deliver(event, text)
             except Exception:  # noqa: BLE001 - 워커는 절대 죽지 않는다
                 log.exception("알림 워커 내부 오류")
             finally:
+                self._inflight = None
                 self._queue.task_done()
 
     # 내부: 전송·재시도 -----------------------------------------------------------
@@ -349,7 +392,7 @@ class Notifier:
             try:
                 transport.send(text)
             except Exception as e:  # noqa: BLE001
-                last_error = f"{type(e).__name__}: {e}"
+                last_error = f"{type(e).__name__}: {self._scrub_error(transport, str(e))}"
                 if i < attempts - 1:
                     delay = self._delay_for(i)
                     log.warning(
@@ -369,23 +412,51 @@ class Notifier:
         self._record_failure(event, text, last_error, attempts)
         return False
 
+    @staticmethod
+    def _scrub_error(transport: object, message: str) -> str:
+        """전송기가 비밀값 가리기(_scrub)를 제공하면 적용한다. 그 외 전송기는 메시지 그대로."""
+        scrub = getattr(transport, "_scrub", None)
+        if callable(scrub):
+            try:
+                return str(scrub(message))
+            except Exception:  # noqa: BLE001
+                return message
+        return message
+
+    @staticmethod
+    def _event_payload(event: TradeEvent) -> object:
+        """failed_log용 이벤트 표현. JSON 직렬화 불가 값(extra 등)은 repr로 대체한다."""
+        try:
+            payload = event.model_dump(mode="json")
+            json.dumps(payload, sort_keys=True, ensure_ascii=False)
+            return payload
+        except Exception:  # noqa: BLE001 - PydanticSerializationError 등
+            pass
+        try:
+            raw = event.model_dump(mode="python")
+            return json.loads(json.dumps(raw, sort_keys=True, ensure_ascii=False, default=repr))
+        except Exception:  # noqa: BLE001
+            return repr(event)
+
     def _record_failure(self, event: TradeEvent, text: str, error: str, attempts: int) -> None:
+        """최종 실패를 failed_log(jsonl)에 남긴다. 어떤 경우에도 예외를 던지지 않는다."""
         if self.failed_log is None:
             return
-        record = {
-            "ts": int(time.time() * 1000),
-            "kind": event.kind,
-            "event": event.model_dump(mode="json"),
-            "text": text,
-            "error": error,
-            "attempts": attempts,
-        }
         try:
+            record = {
+                "ts": int(time.time() * 1000),
+                "kind": str(getattr(event, "kind", "?")),
+                "event": self._event_payload(event),
+                "text": str(text),
+                "error": str(error),
+                "attempts": int(attempts),
+            }
+            line = json.dumps(record, sort_keys=True, ensure_ascii=False, default=repr) + "\n"
             self.failed_log.parent.mkdir(parents=True, exist_ok=True)
             with self.failed_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
-        except OSError as e:
-            log.error("failed_log 기록 실패 (%s): %s", self.failed_log, e)
+                f.write(line)
+        except Exception as e:  # noqa: BLE001 - 기록 실패가 사이클을 죽이면 안 된다
+            log.error("failed_log 기록 실패 (%s): %s: %s", self.failed_log, type(e).__name__, e)
 
     # 포맷 -----------------------------------------------------------------------
     @staticmethod
@@ -425,7 +496,9 @@ def _format_exit(e: TradeEvent, *, partial: bool = False) -> str:
     if partial:
         emoji, title = EMOJI["partial_exit"], "부분 청산"
     else:
-        emoji = EMOJI["exit_loss"] if (pnl is not None and pnl < 0) else EMOJI["exit_gain"]
+        # 손익 부호: pnl_quote 우선, 없으면 pnl_pct로 판단 (SPEC §11: 🔴 손실 / 🔵 이익)
+        sign_src = pnl if pnl is not None else e.pnl_pct
+        emoji = EMOJI["exit_loss"] if (sign_src is not None and sign_src < 0) else EMOJI["exit_gain"]
         title = "청산"
     head = _header(emoji, title, e)
     if e.reason:

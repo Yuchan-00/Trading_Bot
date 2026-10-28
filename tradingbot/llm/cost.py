@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
@@ -109,13 +110,14 @@ class CostLedger:
                     except (ValueError, KeyError, TypeError):
                         bad += 1
                         continue
-                    if cost != cost:  # NaN 방어
+                    if not math.isfinite(cost) or cost < 0.0:  # NaN/inf/음수(손상·조작) 방어
                         bad += 1
                         continue
                     self._by_date[date] = self._by_date.get(date, 0.0) + cost
         except OSError as e:
+            # 원장은 일/월 예산의 유일한 영속 저장소: 못 읽으면 예산 상태를 모르므로 시작을 거부한다(SPEC §0).
             logger.error("비용 원장 읽기 실패 %s: %s", self.path, e)
-            return
+            raise
         if bad:
             logger.warning("비용 원장에 손상된 줄 %d개 무시 (%s)", bad, self.path)
         logger.info(
@@ -180,14 +182,16 @@ class CostLedger:
         }
         line = json.dumps(rec, sort_keys=True, ensure_ascii=False)
         with self._lock:
-            # 메모리 합계를 먼저 갱신: 파일 쓰기가 실패해도 이 프로세스의 예산 검사는 정확하다.
+            # 메모리 합계를 먼저 갱신: 파일 쓰기가 실패해도 이 프로세스의 예산 검사는 보수적으로 유지된다.
             self._by_date[date] = self._by_date.get(date, 0.0) + cost
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8") as fh:
                     fh.write(line + "\n")
             except OSError as e:
+                # 상태 저장 실패는 멈춘다(SPEC §0): 삼키면 재시작 후 합계가 0 으로 복원돼 월 예산을 조용히 넘긴다.
                 logger.error("비용 원장 쓰기 실패 %s: %s", self.path, e)
+                raise
         logger.debug(
             "비용 기록 role=%s model=%s in=%d cached=%d cw=%d out=%d cost=%.6f",
             role, model, input_tokens, cached_tokens, cache_write_tokens, output_tokens, cost,

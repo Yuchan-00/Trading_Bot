@@ -38,7 +38,7 @@ SKILL_FILENAME = "SKILL.md"
 FRONTMATTER_DELIM = "---"
 ROLE_WILDCARD = "*"  # roles: ["*"] 이면 모든 역할에 포함
 _KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:(?:\s+(.*))?$")
-_LIST_ITEM_RE = re.compile(r"^\s+-(?:\s+(.*))?$")
+_LIST_ITEM_RE = re.compile(r"^\s*-(?:\s+(.*))?$")  # YAML 블록 목록: 들여쓰기는 선택
 _NULL_TOKENS = {"null", "~", "none"}
 _BLOCK_MARKERS = {"", ">", ">-", ">+", "|", "|-", "|+"}  # YAML 블록 스칼라 표시(최소 지원)
 
@@ -141,15 +141,21 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str | list[str] | None], str
         if line.strip() == "":
             continue
         item = _LIST_ITEM_RE.match(line)
-        if item and current_list_key is not None:
+        if item and current_list_key is not None and isinstance(meta[current_list_key], list):
             value = _unquote(item.group(1) or "")
             if value != "":
                 meta[current_list_key].append(value)  # type: ignore[union-attr]
             continue
         if line[0].isspace():
-            # 들여쓴 이어쓰기 줄: 바로 앞 스칼라에 접어 넣는다 (YAML ">-" / "|" 블록의 최소 지원)
+            # 들여쓴 이어쓰기 줄: 바로 앞 스칼라에 접어 넣는다
+            # (YAML ">-" / "|" 블록과 "key:\n  text\n  more" plain multi-line scalar의 최소 지원)
             prev = meta.get(last_key) if last_key is not None else None
-            if last_key is None or not isinstance(prev, str):
+            if last_key is None:
+                raise SkillError(f"{lineno}행: frontmatter 문법 오류: {raw.strip()!r}")
+            if prev == [] and current_list_key == last_key:
+                prev = ""  # "key:" 뒤에 "- 항목" 없이 들여쓴 문장이 오면 여러 줄 스칼라로 취급
+                current_list_key = None
+            if not isinstance(prev, str):
                 raise SkillError(f"{lineno}행: frontmatter 문법 오류: {raw.strip()!r}")
             cont = _unquote(line)
             meta[last_key] = cont if prev in _BLOCK_MARKERS else f"{prev} {cont}".strip()
@@ -292,20 +298,25 @@ class SkillRegistry:
         if not selected:
             return ""
         sections = [s.render_section() for s in selected]
-        costs = [len(sec) // 4 for sec in sections]
+        sep = "\n\n"
+
+        def cost(n: int) -> int:
+            # 실제 결과 문자열("\n\n" 구분자 포함) 기준 근사 토큰 → len(out)//4 <= max_tokens 보장
+            return len(sep.join(sections[:n])) // 4
+
         kept = len(selected)
-        while kept > 0 and sum(costs[:kept]) > max_tokens:
+        while kept > 0 and cost(kept) > max_tokens:
             kept -= 1
         dropped = [s.name for s in selected[kept:]]
         if dropped:
             log.warning(
                 "역할 %r 스킬 토큰 예산 초과(%d > %d): 제외 %s",
                 role,
-                sum(costs),
+                cost(len(sections)),
                 max_tokens,
                 ", ".join(dropped),
             )
-        return "\n\n".join(sections[:kept])
+        return sep.join(sections[:kept])
 
     def __repr__(self) -> str:
         return f"SkillRegistry(root={str(self.root)!r}, skills={self.names})"

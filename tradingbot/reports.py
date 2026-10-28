@@ -57,7 +57,11 @@ def _json_default(obj: Any) -> Any:
         return obj.decode("utf-8", errors="replace")
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
-    return str(obj)
+    # 알 수 없는 객체: 클래스가 __str__을 직접 정의했으면 그 문자열을 쓰고, 아니면 repr(SDK 클라이언트 등은
+    # repr에 API 키가 들어갈 수 있음 — SPEC §0)을 그대로 쓰지 않고 타입 이름만 남긴다.
+    if type(obj).__str__ is not object.__str__:
+        return str(obj)
+    return f"<{type(obj).__name__}>"
 
 
 def dumps(obj: Any, *, indent: int | None = None) -> str:
@@ -243,12 +247,14 @@ def render_cycle_markdown(cycle: int, payload: Mapping[str, Any]) -> str:
     if isinstance(positions, (Mapping, list, tuple)):
         lines.append(f"- 보유 포지션: {len(positions)}개")
     try:
-        calls_i = int(llm_calls or 0)
-    except (TypeError, ValueError):
+        calls_i = int(llm_calls or 0)  # int(inf) -> OverflowError, int(nan) -> ValueError
+    except (TypeError, ValueError, OverflowError):
         calls_i = 0
     try:
         cost_f = float(llm_cost or 0.0)
-    except (TypeError, ValueError):
+        if not math.isfinite(cost_f):
+            cost_f = 0.0
+    except (TypeError, ValueError, OverflowError):
         cost_f = 0.0
     lines.append(f"- LLM 호출: {calls_i}회 / 비용 ${cost_f:.4f}")
     lines.append("")
@@ -384,7 +390,8 @@ def daily_summary(state: BotState, equity: float, ledger_spent: float) -> TradeE
             "losses": int(d.losses),
             "win_rate": win_rate,
             "consecutive_losses": int(d.consecutive_losses),
-            "cost_usd": cost,
+            "llm_cost_usd": cost,  # notify._format_daily_summary 가 읽는 키 (DailyStats 필드명과 동일)
+            "cost_usd": cost,  # 하위 호환 별칭
             "open_positions": len(state.positions),
             "unrealized_pnl": unrealized,
             "peak_equity": float(state.peak_equity),

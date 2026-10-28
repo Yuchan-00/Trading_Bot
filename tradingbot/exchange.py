@@ -96,6 +96,19 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _as_int_ms(x: Any) -> int | None:
+    """ccxt 타임스탬프(int/float/숫자 문자열)를 int ms로. NaN·비숫자·bool이면 None."""
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    return int(v)
+
+
 def split_symbol(symbol: str) -> tuple[str, str]:
     """'BTC/USDT' -> ('BTC', 'USDT'). 형식이 아니면 OrderValidationError."""
     if not isinstance(symbol, str) or "/" not in symbol:
@@ -229,10 +242,11 @@ def _parse_candles(rows: Any, *, drop_last: bool) -> list[Candle]:
             log.warning("OHLCV 행 형식 오류, 건너뜀: %r", row)
             continue
         vals = [_as_float(o), _as_float(h), _as_float(l), _as_float(c), _as_float(v, 0.0)]
-        if ts is None or any(x is None for x in vals):
-            log.warning("OHLCV 행에 None/NaN, 건너뜀: %r", row)
+        ts_i = _as_int_ms(ts)
+        if ts_i is None or any(x is None for x in vals):
+            log.warning("OHLCV 행에 None/NaN/비숫자, 건너뜀: %r", row)
             continue
-        by_ts[int(ts)] = Candle(ts=int(ts), open=vals[0], high=vals[1], low=vals[2], close=vals[3], volume=vals[4])
+        by_ts[ts_i] = Candle(ts=ts_i, open=vals[0], high=vals[1], low=vals[2], close=vals[3], volume=vals[4])
     out = [by_ts[k] for k in sorted(by_ts)]
     if drop_last and out:
         out.pop()
@@ -250,7 +264,7 @@ def _parse_ticker(symbol: str, raw: dict, now_ms: int) -> Ticker:
         else:
             raise ExchangeError(f"{symbol}: 티커에 가격이 없음")
     pct = _as_float(raw.get("percentage"))
-    ts = raw.get("timestamp")
+    ts = _as_int_ms(raw.get("timestamp"))
     return Ticker(
         symbol=symbol,
         last=last,
@@ -258,7 +272,7 @@ def _parse_ticker(symbol: str, raw: dict, now_ms: int) -> Ticker:
         ask=ask,
         quote_volume_24h=_as_float(raw.get("quoteVolume")),
         change_24h_pct=(pct / 100.0) if pct is not None else None,  # ccxt는 % 단위 -> 소수
-        ts=int(ts) if ts is not None else now_ms,
+        ts=ts if ts is not None else now_ms,
     )
 
 
@@ -287,7 +301,7 @@ def _parse_orderbook(symbol: str, raw: dict, now_ms: int) -> OrderBookSummary:
     if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
         raise ExchangeError(f"{symbol}: 최우선 호가가 유효하지 않음")
     mid = (best_bid + best_ask) / 2.0
-    ts = raw.get("timestamp")
+    ts = _as_int_ms(raw.get("timestamp"))
     return OrderBookSummary(
         symbol=symbol,
         best_bid=best_bid,
@@ -295,7 +309,7 @@ def _parse_orderbook(symbol: str, raw: dict, now_ms: int) -> OrderBookSummary:
         spread_pct=(best_ask - best_bid) / mid,
         bid_depth_usdt_1pct=_depth_usdt(bids, best_bid * (1 - DEPTH_BAND_PCT), "bid"),
         ask_depth_usdt_1pct=_depth_usdt(asks, best_ask * (1 + DEPTH_BAND_PCT), "ask"),
-        ts=int(ts) if ts is not None else now_ms,
+        ts=ts if ts is not None else now_ms,
     )
 
 
@@ -359,7 +373,7 @@ def _parse_fill(order: dict, symbol: str, side: str, *, now_ms: int | None = Non
 
     net_base = max(filled - fee_base, 0.0)
     fee_quote = fee_quote_direct + fee_base * avg
-    ts = order.get("timestamp")
+    ts = _as_int_ms(order.get("timestamp"))
     raw = {
         "id": order.get("id"),
         "status": order.get("status"),
@@ -377,7 +391,7 @@ def _parse_fill(order: dict, symbol: str, side: str, *, now_ms: int | None = Non
         quote_amount=cost,
         fee_quote=fee_quote,
         fee_base=fee_base,
-        ts=int(ts) if ts is not None else (now_ms if now_ms is not None else _now_ms()),
+        ts=ts if ts is not None else (now_ms if now_ms is not None else _now_ms()),
         raw=raw,
     )
 
@@ -514,6 +528,23 @@ class _CcxtBase:
             self._futures = factory()
         return self._futures
 
+    def _fetch_mark_price(self, client: Any, fsym: str, symbol: str) -> float | None:
+        """OI 금액 환산용 마크가격 보조 조회(fetch_mark_price). 실패/미지원이면 None."""
+        fn = getattr(client, "fetch_mark_price", None)
+        if not callable(fn):
+            return None
+        try:
+            mp = fn(fsym)
+            if isinstance(mp, dict):
+                px = _as_float(mp.get("markPrice"))
+                if px is None:
+                    mp_info = mp.get("info") if isinstance(mp.get("info"), dict) else {}
+                    px = _as_float(mp_info.get("markPrice"))
+                return px
+        except Exception as e:
+            log.info("%s 마크가격 조회 실패: %s", symbol, _scrub_exception(e, self._settings))
+        return None
+
     def fetch_futures_context(self, symbol: str) -> FuturesContext | None:
         """binanceusdm 공개 데이터(펀딩비·미결제약정·롱숏비). 어떤 실패에도 예외 없이 None."""
         try:
@@ -521,9 +552,15 @@ class _CcxtBase:
             base, quote = split_symbol(symbol)
             fsym = f"{base}/{quote}:{quote}"
             funding = oi = lsr = None
+            mark_px: float | None = None  # 펀딩비 응답의 markPrice(OI 금액 환산용)
             try:
                 fr = client.fetch_funding_rate(fsym)
-                funding = _as_float(fr.get("fundingRate")) if isinstance(fr, dict) else None
+                if isinstance(fr, dict):
+                    funding = _as_float(fr.get("fundingRate"))
+                    mark_px = _as_float(fr.get("markPrice"))
+                    if mark_px is None:
+                        fr_info = fr.get("info") if isinstance(fr.get("info"), dict) else {}
+                        mark_px = _as_float(fr_info.get("markPrice"))
             except Exception as e:
                 log.info("%s 펀딩비 조회 실패: %s", symbol, _scrub_exception(e, self._settings))
             try:
@@ -531,10 +568,16 @@ class _CcxtBase:
                 if isinstance(o, dict):
                     oi = _as_float(o.get("openInterestValue"))
                     if oi is None:
+                        # 실제 binanceusdm 응답({symbol, openInterest, time})에는 금액이 없다.
+                        # 수량 × markPrice(펀딩비 응답 > OI info > fetch_mark_price)로 환산한다.
                         amt = _as_float(o.get("openInterestAmount"))
+                        if amt is None:
+                            amt = _as_float(o.get("baseVolume"))
                         info = o.get("info") if isinstance(o.get("info"), dict) else {}
-                        px = _as_float(info.get("markPrice")) if info else None
-                        if amt is not None and px is not None:
+                        px = mark_px if mark_px is not None else _as_float(info.get("markPrice"))
+                        if amt is not None and px is None:
+                            px = self._fetch_mark_price(client, fsym, symbol)
+                        if amt is not None and px is not None and px > 0:
                             oi = amt * px
             except Exception as e:
                 log.info("%s 미결제약정 조회 실패: %s", symbol, _scrub_exception(e, self._settings))
@@ -681,14 +724,21 @@ class CcxtBroker(_CcxtBase):
         return "tb" + uuid.uuid4().hex[:30]
 
     def _lookup_by_client_id(self, symbol: str, cid: str) -> dict | None:
-        """네트워크 오류 후 주문이 접수됐는지 clientOrderId로 확인. 없으면 None."""
-        try:
-            o = self._ex.fetch_order(None, symbol, {"origClientOrderId": cid})
+        """네트워크 오류 후 주문이 접수됐는지 clientOrderId로 확인. 없으면 None.
+
+        조회 자체도 SPEC §4대로 ``_retry``(일시 오류 3회)를 탄다. 일시 오류 한 번으로 주문 접수 여부를
+        모른 채 포기하면 체결된 BUY가 추적 없이 남을 수 있기 때문이다.
+        """
+        not_found = _order_not_found_types()
+
+        def _lookup() -> dict | None:
+            try:
+                o = self._ex.fetch_order(None, symbol, {"origClientOrderId": cid})
+            except not_found:  # type: ignore[misc]
+                return None
             return o if isinstance(o, dict) else None
-        except _order_not_found_types():  # type: ignore[misc]
-            return None
-        except Exception as e:
-            raise self._wrap(e, "fetch_order(clientOrderId)") from e
+
+        return self._retry("fetch_order(clientOrderId)", _lookup)
 
     def _submit(self, symbol: str, side: str, amount: float | None, params: dict) -> dict:
         """create_order를 중복 주문 없이 최대 3회 시도한다."""
@@ -784,10 +834,16 @@ class CcxtBroker(_CcxtBase):
             raise InsufficientFunds(f"{symbol} sell: 필요 {amount} > 가용 {free_base}")
         min_cost = self._exchange_min_cost(symbol)
         if min_cost is not None:
-            ticker = self.fetch_ticker(symbol)
-            ref = ticker.bid if ticker.bid else ticker.last
-            if amount * ref < min_cost:
-                raise OrderValidationError(f"{symbol} sell: 예상 금액 {amount * ref:.2f} USDT < 거래소 최소 {min_cost:.2f} USDT")
+            # 최소 주문 금액 사전 검사. 티커 조회 실패는 청산을 막지 않는다(fail-open):
+            # 거래소가 MIN_NOTIONAL을 자체 검증하므로 주문을 보내고 거절은 거래소에 맡긴다.
+            try:
+                ticker = self.fetch_ticker(symbol)
+            except ExchangeError as e:
+                log.warning("%s sell: 최소 금액 사전 검사용 티커 조회 실패, 검사 생략하고 진행: %s", symbol, e)
+            else:
+                ref = ticker.bid if ticker.bid else ticker.last
+                if amount * ref < min_cost:
+                    raise OrderValidationError(f"{symbol} sell: 예상 금액 {amount * ref:.2f} USDT < 거래소 최소 {min_cost:.2f} USDT")
         order = self._submit(symbol, "sell", amount, {})
         order = self._settle(order, symbol)
         fill = _parse_fill(order, symbol, "sell", now_ms=self._clock_ms())

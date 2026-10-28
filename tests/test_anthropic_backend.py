@@ -1,4 +1,7 @@
-"""AnthropicBackend 테스트: 가짜 client 로 parse 호출 인자·정지 사유·예외 매핑·예산·비밀 비노출."""
+"""AnthropicBackend 테스트: 가짜 client 로 create 호출 인자·정지 사유·예외 매핑·예산·비밀 비노출.
+
+가짜 client 는 실제 SDK 처럼 원본 Message(text 블록 + usage + stop_reason)를 돌려준다.
+"""
 from __future__ import annotations
 
 import json
@@ -57,12 +60,19 @@ def fake_response(
         cache_read_input_tokens=cache_read,
         cache_creation_input_tokens=cache_write,
     )
+    if parsed is None:
+        content = []
+    elif isinstance(parsed, BaseModel):
+        content = [SimpleNamespace(type="text", text=parsed.model_dump_json())]
+    elif isinstance(parsed, str):
+        content = [SimpleNamespace(type="text", text=parsed)]
+    else:
+        content = [SimpleNamespace(type="text", text=json.dumps(parsed, ensure_ascii=False, sort_keys=True))]
     resp = SimpleNamespace(
-        parsed_output=parsed,
         stop_reason=stop_reason,
         stop_details=stop_details,
         usage=usage,
-        content=[],
+        content=content,
     )
     resp._request_id = request_id
     return resp
@@ -73,7 +83,7 @@ class FakeMessages:
         self.responder = responder
         self.calls: list[dict] = []
 
-    def parse(self, **kwargs):
+    def create(self, **kwargs):
         self.calls.append(kwargs)
         out = self.responder(kwargs) if callable(self.responder) else self.responder
         if isinstance(out, BaseException):
@@ -155,22 +165,25 @@ def test_repr_masks_key(ledger):
     assert mask_secret(KEY) in repr(backend)
 
 
-# ---------------------------------------------------------------- parse 호출 인자
-def test_parse_kwargs(ledger):
+# ---------------------------------------------------------------- create 호출 인자
+def test_create_kwargs(ledger):
     backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.2)), ledger)
     r = run(backend, tier="research", max_tokens=777, effort="high", timeout_s=12.5)
     assert r.ok
     assert len(client.messages.calls) == 1
     kw = client.messages.calls[0]
-    assert set(kw) == {"model", "max_tokens", "system", "messages", "output_format", "output_config", "timeout"}
+    assert set(kw) == {"model", "max_tokens", "system", "messages", "output_config", "timeout"}
     assert kw["model"] == "claude-sonnet-5-5"
     assert kw["max_tokens"] == 777
     assert kw["system"] == [
         {"type": "text", "text": "SYSTEM PROMPT", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
     ]
     assert kw["messages"] == [{"role": "user", "content": json.dumps(PAYLOAD, ensure_ascii=False, sort_keys=True)}]
-    assert kw["output_format"] is Decision
-    assert kw["output_config"] == {"effort": "high"}
+    assert kw["output_config"]["effort"] == "high"
+    fmt = kw["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert set(fmt["schema"]["properties"]) == {"action", "confidence", "thesis"}
+    assert "output_format" not in kw
     assert kw["timeout"] == 12.5
     assert "thinking" not in kw
     assert "tool_choice" not in kw
@@ -223,7 +236,7 @@ def test_cache_ttl_5m(ledger):
 def test_effort_passed_in_output_config(ledger, effort):
     backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.2)), ledger)
     run(backend, effort=effort)
-    assert client.messages.calls[0]["output_config"] == {"effort": effort}
+    assert client.messages.calls[0]["output_config"]["effort"] == effort
 
 
 def test_system_text_byte_identical(ledger):
@@ -242,7 +255,7 @@ def test_success_result_fields(ledger):
     )
     r = run(backend, role="head_trader", tier="head")
     assert r.ok is True and r.error is None
-    assert r.output is out
+    assert r.output == out and isinstance(r.output, Decision)
     assert r.role == "head_trader"
     assert r.model == "claude-opus-5-5"
     assert r.input_tokens == 1000 and r.cached_tokens == 4000 and r.output_tokens == 200
@@ -363,7 +376,7 @@ def test_parsed_output_invalid_dict_is_parse_error(ledger):
     assert run(backend).error == "parse_error"
 
 
-def test_parsed_output_property_raising_is_parse_error(ledger):
+def test_content_property_raising_is_parse_error(ledger):
     class Boom:
         stop_reason = "end_turn"
         stop_details = None
@@ -371,14 +384,31 @@ def test_parsed_output_property_raising_is_parse_error(ledger):
         _request_id = "r"
 
         @property
-        def parsed_output(self):
+        def content(self):
             raise ValueError("bad json")
 
     backend, _ = make_backend(Boom(), ledger)
     assert run(backend).error == "parse_error"
 
 
-def test_validation_error_from_parse_is_parse_error(ledger):
+def test_truncated_json_text_is_max_tokens_with_usage(ledger):
+    """실제 SDK 가 max_tokens 로 자른 JSON 을 돌려줘도 stop_reason 이 우선하고 usage 는 기록된다."""
+    backend, _ = make_backend(fake_response('{"action": "BU', stop_reason="max_tokens", output_tokens=800), ledger)
+    r = run(backend)
+    assert r.ok is False and r.error == "max_tokens"
+    assert r.output_tokens == 800 and r.cost_usd > 0
+    assert ledger.spent_today() > 0
+
+
+def test_non_json_text_is_parse_error_with_usage(ledger):
+    backend, _ = make_backend(fake_response("I cannot answer.", stop_reason="end_turn"), ledger)
+    r = run(backend)
+    assert r.ok is False and r.error == "parse_error"
+    assert r.cost_usd > 0
+
+
+def test_validation_error_raised_by_client_is_parse_error(ledger):
+    """client 자체가 ValidationError 를 던지면(응답 객체 없음) parse_error, 기록할 usage 도 없다."""
     def responder(kw):
         try:
             Decision.model_validate({"action": "SELL"})
@@ -545,12 +575,12 @@ def test_ledger_cache_ttl_mismatch_warns(ledger, caplog):
 
 # ---------------------------------------------------------------- 실제 SDK 시그니처 호환성
 def test_parse_kwargs_are_accepted_by_real_sdk_signature(ledger):
-    """가짜 client 에 넘긴 kwargs 가 설치된 SDK 의 messages.parse 시그니처에 실제로 존재하는지."""
+    """가짜 client 에 넘긴 kwargs 가 설치된 SDK 의 messages.create 시그니처에 실제로 존재하는지."""
     import inspect
 
     from anthropic.resources.messages import Messages
 
-    params = set(inspect.signature(Messages.parse).parameters)
+    params = set(inspect.signature(Messages.create).parameters)
     backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.1)), ledger)
     run(backend)
     assert set(client.messages.calls[0]) <= params

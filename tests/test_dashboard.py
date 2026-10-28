@@ -308,8 +308,9 @@ def test_state_endpoint(full_client: TestClient):
     assert s["drawdown_level"] == "none"
     assert s["daily_realized_pnl"] == -12.5
     assert s["daily_unrealized_pnl"] == pytest.approx(0.005 * 1000.0)
-    assert s["daily_pnl"] == pytest.approx(-12.5 + 5.0)
-    assert s["daily_pnl_pct"] == pytest.approx(-7.5 / 10_000.0)
+    # 당일 손익 = 자본 - 당일 시작자본 (10,005 - 10,000). 실현+전체 미실현을 더하면 전날 미실현이 이중 계산된다.
+    assert s["daily_pnl"] == pytest.approx(10_005.0 - 10_000.0)
+    assert s["daily_pnl_pct"] == pytest.approx(5.0 / 10_000.0)
     assert s["positions_count"] == 1 and s["max_positions"] == HardLimits.MAX_POSITIONS
     assert s["kill_switch"] is False and s["llm_paused"] is False
     assert s["consecutive_losses"] == 2 and s["daily_trades"] == 3
@@ -676,3 +677,22 @@ def test_settings_secrets_not_exposed(data_dir: Path):
     c = TestClient(create_app(settings, data_dir))
     for path in ("/", "/api/health", "/api/state", "/api/costs"):
         assert "SECRET-TELEGRAM-TOKEN" not in c.get(path).text
+
+
+def test_live_mode_summary_uses_latest_cycle_report_equity(tmp_path: Path):
+    """testnet/live: 현금은 거래소에 있으므로 자본은 최신 사이클 보고서에서, 없으면 None/unknown."""
+    data_dir = tmp_path / "live"
+    data_dir.mkdir()
+    st = make_state(mode="live", paper_quote_balance=0.0, peak_equity=10_100.0)
+    write_state(data_dir, st)
+    c = TestClient(create_app(make_settings(data_dir), data_dir))
+    s = c.get("/api/state").json()["summary"]
+    assert s["equity"] is None and s["cash"] is None and s["drawdown_pct"] is None
+    assert s["drawdown_level"] == "unknown"
+    assert s["daily_pnl"] == -12.5  # 자본을 모르면 실현손익만
+    write_cycle(data_dir, "20261028", 42, {"ts": 1_700_001_800_000, "cycle": 42, "equity": 9_900.0, "mode": "live"})
+    s = c.get("/api/state").json()["summary"]
+    assert s["equity"] == 9_900.0 and s["cash"] is None
+    assert s["drawdown_pct"] == pytest.approx(200.0 / 10_100.0)
+    assert s["drawdown_level"] == "none"
+    assert s["daily_pnl"] == pytest.approx(-100.0)

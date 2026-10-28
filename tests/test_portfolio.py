@@ -598,19 +598,35 @@ class TestEnsureDay:
         assert testnet.state.daily.start_equity == 5_000.0  # 한 번 정해지면 고정
 
     def test_rollover_with_bad_equity_uses_zero(self, paper: Portfolio):
-        tomorrow = datetime.fromisoformat(paper.state.daily.date).replace(tzinfo=UTC) + timedelta(days=1)
-        assert paper.ensure_day(tomorrow, float("nan")) is not None
+        day = datetime.fromisoformat(paper.state.daily.date).replace(tzinfo=UTC)
+        assert paper.ensure_day(day, 10_000.0) is None  # 새 상태: 첫 호출이 날짜를 채택
+        assert paper.ensure_day(day + timedelta(days=1), float("nan")) is not None
         assert paper.state.daily.start_equity == 0.0
 
-    def test_backwards_date_still_rolls_with_warning(self, paper: Portfolio, caplog):
-        yesterday = datetime.fromisoformat(paper.state.daily.date).replace(tzinfo=UTC) - timedelta(days=1)
+    def test_fresh_state_adopts_first_caller_date(self, paper: Portfolio):
+        # 주입 시계(SPEC §15)가 벽시계와 달라도 첫 호출은 '가짜 전날' 통계를 만들지 않는다
+        injected = datetime(2024, 1, 1, 0, 10, tzinfo=UTC)
+        assert paper.ensure_day(injected, 10_000.0) is None
+        assert paper.state.daily.date == "2024-01-01"
+        assert paper.ensure_day(injected + timedelta(days=1), 10_000.0) is not None
+
+    def test_backwards_date_warns_and_keeps_daily_stats(self, paper: Portfolio, caplog):
+        day = datetime.fromisoformat(paper.state.daily.date).replace(tzinfo=UTC)
+        assert paper.ensure_day(day, 10_000.0) is None
+        paper.open_position(buy_fill(), 49_000.0, 52_000.0, "t", 0.9, cycle=1)
+        paper.close_position("BTC/USDT", sell_fill(price=49_000.0), "stop_loss", cycle=2)
+        before = paper.state.daily.model_copy(deep=True)
+        assert before.consecutive_losses == 1
         with caplog.at_level(logging.WARNING, logger="tradingbot.portfolio"):
-            assert paper.ensure_day(yesterday, 10.0) is not None
-        assert paper.state.daily.date == yesterday.date().isoformat()
+            assert paper.ensure_day(day - timedelta(days=1), 10.0) is None
+        # 날짜 역행은 롤오버가 아니다: 당일 손실 한도·연속 손실 카운터가 유지된다
+        assert paper.state.daily == before
         assert any("거꾸로" in r.getMessage() for r in caplog.records)
 
     def test_rollover_persists_through_save_load(self, paper: Portfolio):
-        tomorrow = datetime.fromisoformat(paper.state.daily.date).replace(tzinfo=UTC) + timedelta(days=1)
+        day = datetime.fromisoformat(paper.state.daily.date).replace(tzinfo=UTC)
+        assert paper.ensure_day(day, 10_000.0) is None
+        tomorrow = day + timedelta(days=1)
         paper.ensure_day(tomorrow, 123.0)
         paper.save()
         loaded = Portfolio.load(make_settings("paper"), paper.path)

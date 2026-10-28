@@ -162,16 +162,38 @@ def test_record_creates_parent_dir(tmp_path: Path, clock: Clock):
     assert path.exists()
 
 
-def test_record_write_failure_logs_and_keeps_memory_totals(tmp_path: Path, clock: Clock, caplog):
-    # path 가 디렉터리이면 append 가 실패한다 -> 로그 + 메모리 합계 유지
-    path = tmp_path / "asdir"
-    path.mkdir()
-    led = CostLedger(path, 10, 100, now=clock)
+def test_record_write_failure_raises_and_keeps_memory_totals(tmp_path: Path, clock: Clock, caplog):
+    # 부모가 일반 파일이면 append 가 실패한다 -> ERROR 로그 + OSError 전파(상태 저장 실패는 멈춘다, SPEC §0)
+    # 메모리 합계는 보수적으로 유지된다.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    led = CostLedger(blocker / "ledger.jsonl", 10, 100, now=clock)
     with caplog.at_level(logging.ERROR, logger="tradingbot.llm.cost"):
-        cost = led.record(role="r", model="claude-opus-5-5", input_tokens=1_000_000, cached_tokens=0, output_tokens=0)
-    assert cost == pytest.approx(4.0)
+        with pytest.raises(OSError):
+            led.record(role="r", model="claude-opus-5-5", input_tokens=1_000_000, cached_tokens=0, output_tokens=0)
     assert led.spent_today() == pytest.approx(4.0)
     assert any("쓰기 실패" in r.getMessage() for r in caplog.records)
+
+
+def test_restore_read_failure_raises(tmp_path: Path, clock: Clock):
+    # path 가 디렉터리이면 읽기가 실패한다 -> 예산 상태를 모르므로 시작 거부
+    path = tmp_path / "asdir"
+    path.mkdir()
+    with pytest.raises(OSError):
+        CostLedger(path, 10, 100, now=clock)
+
+
+def test_restore_ignores_negative_and_inf_cost_lines(tmp_path: Path, clock: Clock):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(
+        '{"date": "2026-10-28", "cost_usd": 0.5}\n{"date": "2026-10-28", "cost_usd": -1e6}\n'
+        '{"date": "2026-10-28", "cost_usd": "Infinity"}\n{"date": "2026-10-28", "cost_usd": "-Infinity"}\n',
+        encoding="utf-8",
+    )
+    led = CostLedger(path, 10, 200, now=clock)
+    assert led.spent_today() == pytest.approx(0.5)
+    with pytest.raises(BudgetExceeded):
+        led.check(10.0)
 
 
 # ---------------------------------------------------------------- 복원

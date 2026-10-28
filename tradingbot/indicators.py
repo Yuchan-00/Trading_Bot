@@ -12,6 +12,13 @@
 - Bollinger(20, 2): 모집단 표준편차(ddof=0). ``width_pct = (upper - lower) / middle``.
 - VWAP: UTC 일 단위 세션. 각 봉의 값은 그 봉이 속한 UTC 날짜의 누적 VWAP.
   마지막 원소가 "현재 세션" VWAP 이다.
+- 비유한 입력(NaN/inf): 해당 위치는 ``None`` 이고, 그 지표의 워밍업은 바로 다음 유한 값부터
+  **다시 시작**한다(연속된 유한 구간 단위로 독립 계산). 따라서 어떤 도우미도 NaN 을 "변화 없음"으로
+  흡수하거나 롤링 합을 영구 오염시키지 않으며, 같은 창에 대해 sma 와 bollinger middle 이 항상
+  일치한다. ``compute()`` 는 비유한 값을 절대 내보내지 않고(모두 None), 핵심 지표가 None 이면
+  ``warmup_ok=False`` 다. 마지막 봉의 종가가 비유한이면 ValueError.
+- 전제: ``compute()`` 의 캔들은 ``ts`` 오름차순·중복 없음(SPEC §4 exchange 보장). 여기서는 검사하지
+  않으므로 합성 캔들을 만드는 호출자(backtest 등)가 정렬을 책임진다.
 """
 from __future__ import annotations
 
@@ -64,16 +71,41 @@ def _floats(values: Sequence[float]) -> list[float]:
     return [float(v) for v in values]
 
 
-def _ema_from(values: list[float], n: int, start: int) -> list[float | None]:
-    """``values[start:]`` 에 대해 SMA 시드 EMA 를 계산해 전체 길이 리스트로 돌려준다.
+def _segments(ok: Sequence[bool]) -> list[tuple[int, int]]:
+    """``ok`` 가 연속으로 True 인 구간 ``[start, end)`` 목록. 비유한 값 사이를 독립 구간으로 자른다."""
+    out: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, flag in enumerate(ok):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            out.append((start, i))
+            start = None
+    if start is not None:
+        out.append((start, len(ok)))
+    return out
 
-    ``values[:start]`` 구간은 무시(None)된다. MACD 의 signal 처럼 "앞부분이 None 인 시리즈"
-    위에 EMA 를 얹을 때 쓴다.
+
+def _candle_ok(c: Candle, *, volume: bool = False) -> bool:
+    """high/low/close(및 선택적으로 volume)가 모두 유한한 봉인지."""
+    fields = (float(c.high), float(c.low), float(c.close))
+    if volume:
+        fields += (float(c.volume),)
+    return all(math.isfinite(f) for f in fields)
+
+
+def _ema_from(values: list[float], n: int, start: int, end: int | None = None) -> list[float | None]:
+    """``values[start:end]`` 에 대해 SMA 시드 EMA 를 계산해 전체 길이 리스트로 돌려준다.
+
+    구간 밖은 None 이다. 비유한 값이 없는 구간만 넘겨야 한다. MACD 의 signal 처럼
+    "앞부분이 None 인 시리즈" 위에 EMA 를 얹을 때도 쓴다.
     """
     length = len(values)
+    if end is None:
+        end = length
     out: list[float | None] = [None] * length
     seed_idx = start + n - 1
-    if seed_idx >= length:
+    if seed_idx >= end:
         return out
     k = 2.0 / (n + 1)
     acc = 0.0
@@ -81,17 +113,26 @@ def _ema_from(values: list[float], n: int, start: int) -> list[float | None]:
         acc += v
     prev = acc / n
     out[seed_idx] = prev
-    for i in range(seed_idx + 1, length):
+    for i in range(seed_idx + 1, end):
         prev = (values[i] - prev) * k + prev
         out[i] = prev
     return out
 
 
-def _true_ranges(candles: Sequence[Candle]) -> list[float]:
-    """TR 리스트. 첫 봉은 이전 종가가 없으므로 high-low."""
+def _ema_segments(values: list[float], n: int) -> list[float | None]:
+    """유한 구간마다 독립적으로 SMA 시드 EMA. 비유한 위치는 None."""
+    out: list[float | None] = [None] * len(values)
+    for start, end in _segments([math.isfinite(v) for v in values]):
+        seg = _ema_from(values, n, start, end)
+        out[start:end] = seg[start:end]
+    return out
+
+
+def _true_ranges(candles: Sequence[Candle], start: int, end: int) -> list[float]:
+    """``candles[start:end]`` 의 TR 리스트. 구간 첫 봉은 이전 종가가 없으므로 high-low."""
     out: list[float] = []
     prev_close: float | None = None
-    for c in candles:
+    for c in candles[start:end]:
         hl = float(c.high) - float(c.low)
         if prev_close is None:
             tr = hl
@@ -100,6 +141,10 @@ def _true_ranges(candles: Sequence[Candle]) -> list[float]:
         out.append(tr)
         prev_close = float(c.close)
     return out
+
+
+def _candle_segments(candles: Sequence[Candle]) -> list[tuple[int, int]]:
+    return _segments([_candle_ok(c) for c in candles])
 
 
 def _utc_day(ts_ms: int) -> int:
@@ -113,52 +158,52 @@ def sma(values: Sequence[float], n: int) -> list[float | None]:
     _check_n(n)
     vals = _floats(values)
     out: list[float | None] = [None] * len(vals)
-    if len(vals) < n:
-        return out
-    window_sum = 0.0
-    for i, v in enumerate(vals):
-        window_sum += v
-        if i >= n:
-            window_sum -= vals[i - n]
-        if i >= n - 1:
-            out[i] = window_sum / n
+    for start, end in _segments([math.isfinite(v) for v in vals]):
+        if end - start < n:
+            continue
+        window_sum = 0.0
+        for i in range(start, end):
+            window_sum += vals[i]
+            if i - start >= n:
+                window_sum -= vals[i - n]
+            if i - start >= n - 1:
+                out[i] = window_sum / n
     return out
 
 
 def ema(values: Sequence[float], n: int) -> list[float | None]:
     """지수이동평균(SMA 시드). 앞 n-1 개는 None."""
     _check_n(n)
-    return _ema_from(_floats(values), n, 0)
+    return _ema_segments(_floats(values), n)
 
 
 def rsi(values: Sequence[float], n: int = 14) -> list[float | None]:
     """Wilder RSI. 앞 n 개는 None(변화량 n개가 필요). 상승·하락 평균이 모두 0이면 50.0."""
     _check_n(n)
     vals = _floats(values)
-    length = len(vals)
-    out: list[float | None] = [None] * length
-    if length < n + 1:
-        return out
+    out: list[float | None] = [None] * len(vals)
+    for start, end in _segments([math.isfinite(v) for v in vals]):
+        if end - start < n + 1:
+            continue
+        gain_sum = 0.0
+        loss_sum = 0.0
+        for i in range(start + 1, start + n + 1):
+            d = vals[i] - vals[i - 1]
+            if d > 0:
+                gain_sum += d
+            else:
+                loss_sum -= d
+        avg_gain = gain_sum / n
+        avg_loss = loss_sum / n
+        out[start + n] = _rsi_value(avg_gain, avg_loss)
 
-    gain_sum = 0.0
-    loss_sum = 0.0
-    for i in range(1, n + 1):
-        d = vals[i] - vals[i - 1]
-        if d > 0:
-            gain_sum += d
-        else:
-            loss_sum -= d
-    avg_gain = gain_sum / n
-    avg_loss = loss_sum / n
-    out[n] = _rsi_value(avg_gain, avg_loss)
-
-    for i in range(n + 1, length):
-        d = vals[i] - vals[i - 1]
-        gain = d if d > 0 else 0.0
-        loss = -d if d < 0 else 0.0
-        avg_gain = (avg_gain * (n - 1) + gain) / n
-        avg_loss = (avg_loss * (n - 1) + loss) / n
-        out[i] = _rsi_value(avg_gain, avg_loss)
+        for i in range(start + n + 1, end):
+            d = vals[i] - vals[i - 1]
+            gain = d if d > 0 else 0.0
+            loss = -d if d < 0 else 0.0
+            avg_gain = (avg_gain * (n - 1) + gain) / n
+            avg_loss = (avg_loss * (n - 1) + loss) / n
+            out[i] = _rsi_value(avg_gain, avg_loss)
     return out
 
 
@@ -185,11 +230,11 @@ def macd(
         raise ValueError(f"fast({fast})는 slow({slow})보다 작아야 함")
     vals = _floats(values)
     length = len(vals)
-    fast_e = _ema_from(vals, fast, 0)
-    slow_e = _ema_from(vals, slow, 0)
+    fast_e = _ema_segments(vals, fast)
+    slow_e = _ema_segments(vals, slow)
 
     macd_line: list[float | None] = [None] * length
-    for i in range(slow - 1, length):
+    for i in range(length):
         f = fast_e[i]
         s = slow_e[i]
         if f is not None and s is not None:
@@ -197,11 +242,11 @@ def macd(
 
     signal_line: list[float | None] = [None] * length
     hist: list[float | None] = [None] * length
-    if length >= slow:
-        # macd 선이 있는 구간(slow-1 부터)에 대해 EMA(signal). None 구간은 0으로 채우되 start 로 건너뛴다.
-        dense = [0.0 if m is None else m for m in macd_line]
-        sig = _ema_from(dense, signal, slow - 1)
-        for i in range(length):
+    # macd 선이 있는 각 연속 구간에 대해 EMA(signal). None 구간은 0으로 채우되 구간 범위로 한정한다.
+    dense = [0.0 if m is None else m for m in macd_line]
+    for start, end in _segments([m is not None for m in macd_line]):
+        sig = _ema_from(dense, signal, start, end)
+        for i in range(start, end):
             s = sig[i]
             m = macd_line[i]
             if s is not None and m is not None:
@@ -213,19 +258,19 @@ def macd(
 def atr(candles: Sequence[Candle], n: int = 14) -> list[float | None]:
     """Wilder ATR. 앞 n 개는 None(이전 종가가 있는 TR n개로 시드)."""
     _check_n(n)
-    length = len(candles)
-    out: list[float | None] = [None] * length
-    if length < n + 1:
-        return out
-    trs = _true_ranges(candles)
-    seed = 0.0
-    for i in range(1, n + 1):
-        seed += trs[i]
-    prev = seed / n
-    out[n] = prev
-    for i in range(n + 1, length):
-        prev = (prev * (n - 1) + trs[i]) / n
-        out[i] = prev
+    out: list[float | None] = [None] * len(candles)
+    for start, end in _candle_segments(candles):
+        if end - start < n + 1:
+            continue
+        trs = _true_ranges(candles, start, end)
+        seed = 0.0
+        for j in range(1, n + 1):
+            seed += trs[j]
+        prev = seed / n
+        out[start + n] = prev
+        for j in range(n + 1, end - start):
+            prev = (prev * (n - 1) + trs[j]) / n
+            out[start + j] = prev
     return out
 
 
@@ -245,18 +290,19 @@ def bollinger(
     middle: list[float | None] = [None] * length
     lower: list[float | None] = [None] * length
     width: list[float | None] = [None] * length
-    if length < n:
-        return upper, middle, lower, width
-    for i in range(n - 1, length):
+    # middle 은 sma() 와 같은 롤링 합 방식으로 계산해 두 도우미가 비트 단위로 일치하게 한다.
+    middle = sma(vals, n)
+    for i in range(length):
+        mean = middle[i]
+        if mean is None:
+            continue
         window = vals[i - n + 1:i + 1]
-        mean = sum(window) / n
         var = sum((v - mean) ** 2 for v in window) / n
         # 부동소수 오차로 아주 작은 음수가 될 수 있다.
         std = math.sqrt(var) if var > 0 else 0.0
         up = mean + k * std
         lo = mean - k * std
         upper[i] = up
-        middle[i] = mean
         lower[i] = lo
         width[i] = (up - lo) / mean if mean != 0 else None
     return upper, middle, lower, width
@@ -265,12 +311,29 @@ def bollinger(
 def adx(candles: Sequence[Candle], n: int = 14) -> list[float | None]:
     """Wilder ADX. 앞 2n-1 개는 None (DM/TR 평활 n 봉 + DX 평균 n 봉)."""
     _check_n(n)
-    length = len(candles)
-    out: list[float | None] = [None] * length
-    if length < 2 * n:
-        return out
+    out: list[float | None] = [None] * len(candles)
+    for start, end in _candle_segments(candles):
+        if end - start < 2 * n:
+            continue
+        _adx_segment(candles[start:end], n, out, start)
+    return out
 
-    trs = _true_ranges(candles)
+
+def _dx(tr_s: float, p_s: float, m_s: float) -> float:
+    if tr_s == 0.0:
+        return 0.0
+    pdi = 100.0 * p_s / tr_s
+    mdi = 100.0 * m_s / tr_s
+    denom = pdi + mdi
+    if denom == 0.0:
+        return 0.0
+    return 100.0 * abs(pdi - mdi) / denom
+
+
+def _adx_segment(candles: Sequence[Candle], n: int, out: list[float | None], offset: int) -> None:
+    """유한 봉으로만 이뤄진 ``candles`` 에 대해 ADX 를 계산해 ``out[offset:]`` 에 쓴다."""
+    length = len(candles)
+    trs = _true_ranges(candles, 0, length)
     plus_dm: list[float] = [0.0] * length
     minus_dm: list[float] = [0.0] * length
     for i in range(1, length):
@@ -290,16 +353,6 @@ def adx(candles: Sequence[Candle], n: int = 14) -> list[float | None]:
         sm_plus += plus_dm[i]
         sm_minus += minus_dm[i]
 
-    def _dx(tr_s: float, p_s: float, m_s: float) -> float:
-        if tr_s == 0.0:
-            return 0.0
-        pdi = 100.0 * p_s / tr_s
-        mdi = 100.0 * m_s / tr_s
-        denom = pdi + mdi
-        if denom == 0.0:
-            return 0.0
-        return 100.0 * abs(pdi - mdi) / denom
-
     dx_vals: list[float] = [_dx(sm_tr, sm_plus, sm_minus)]  # index n
     for i in range(n + 1, length):
         sm_tr = sm_tr - sm_tr / n + trs[i]
@@ -309,24 +362,27 @@ def adx(candles: Sequence[Candle], n: int = 14) -> list[float | None]:
 
     # dx_vals[j] 는 index n+j 에 해당. 첫 ADX = 첫 n 개 DX 평균 (index 2n-1).
     first = sum(dx_vals[:n]) / n
-    out[2 * n - 1] = first
+    out[offset + 2 * n - 1] = first
     prev = first
     for j in range(n, len(dx_vals)):
         prev = (prev * (n - 1) + dx_vals[j]) / n
-        out[n + j] = prev
-    return out
+        out[offset + n + j] = prev
 
 
 def vwap(candles: Sequence[Candle]) -> list[float | None]:
     """UTC 일 세션 VWAP. 각 봉의 값은 그 봉이 속한 UTC 날짜 안의 누적 ``Σ(tp*vol)/Σvol``.
 
     날짜가 바뀌면 누적을 리셋한다. 누적 거래량이 0이면 None. 마지막 원소가 현재 세션 VWAP.
+    비유한 봉(high/low/close/volume 중 NaN/inf)은 None 이고, 그 뒤 누적은 다시 시작한다.
     """
     out: list[float | None] = [None] * len(candles)
     cur_day: int | None = None
     pv = 0.0
     vol = 0.0
     for i, c in enumerate(candles):
+        if not _candle_ok(c, volume=True):
+            cur_day = None  # 다음 유한 봉부터 누적을 새로 시작
+            continue
         day = _utc_day(c.ts)
         if day != cur_day:
             cur_day = day
@@ -349,7 +405,7 @@ def _return(closes: list[float], n: int) -> float | None:
     if len(closes) <= n:
         return None
     base = closes[-1 - n]
-    if base == 0:
+    if base == 0 or not math.isfinite(base) or not math.isfinite(closes[-1]):
         return None
     return closes[-1] / base - 1.0
 
@@ -358,6 +414,10 @@ def compute(symbol: str, timeframe: str, candles: list[Candle]) -> IndicatorSet:
     """마지막 봉 기준 IndicatorSet. 워밍업 미만 지표는 None. 빈 입력은 ValueError.
 
     ``warmup_ok`` 는 ema_20, rsi_14, atr_14, bb_* 가 모두 계산됐을 때만 True.
+    비유한(NaN/inf) 캔들 값은 지표로 새지 않는다: 영향을 받는 지표는 None 이 되고(모듈 docstring
+    참조) 결과는 ``json.dumps(..., allow_nan=False)`` 로 직렬화 가능하다. 마지막 봉의 종가가
+    비유한이면 ``close`` 자체를 만들 수 없으므로 ValueError.
+    전제: 캔들은 ``ts`` 오름차순·중복 없음(SPEC §4). 여기서는 검사하지 않는다.
     """
     if not candles:
         raise ValueError(f"{symbol} {timeframe}: 캔들이 비어 있음")
@@ -365,6 +425,10 @@ def compute(symbol: str, timeframe: str, candles: list[Candle]) -> IndicatorSet:
     closes = [float(c.close) for c in candles]
     last = candles[-1]
     close = closes[-1]
+    if not math.isfinite(close):
+        raise ValueError(f"{symbol} {timeframe}: 마지막 봉 종가가 비유한({close!r})")
+    if not all(math.isfinite(v) for v in closes) or not all(_candle_ok(c, volume=True) for c in candles):
+        log.debug("%s %s: 비유한 캔들 값 포함 — 영향 지표는 None 처리", symbol, timeframe)
 
     ema_20 = _last(ema(closes, 20)) if n >= WARMUP["ema_20"] else None
     ema_50 = _last(ema(closes, 50)) if n >= WARMUP["ema_50"] else None
@@ -391,14 +455,19 @@ def compute(symbol: str, timeframe: str, candles: list[Candle]) -> IndicatorSet:
     volume_ratio_20 = None
     if n >= WARMUP["volume_ratio_20"]:
         prev_vols = [float(c.volume) for c in candles[-21:-1]]
-        mean_vol = sum(prev_vols) / 20.0
-        volume_ratio_20 = float(last.volume) / mean_vol if mean_vol > 0 else None
+        last_vol = float(last.volume)
+        if math.isfinite(last_vol) and all(math.isfinite(v) for v in prev_vols):
+            mean_vol = sum(prev_vols) / 20.0
+            volume_ratio_20 = last_vol / mean_vol if mean_vol > 0 else None
 
     high_20 = low_20 = None
     if n >= WARMUP["high_low_20"]:
         tail = candles[-20:]
-        high_20 = max(float(c.high) for c in tail)
-        low_20 = min(float(c.low) for c in tail)
+        highs = [float(c.high) for c in tail]
+        lows = [float(c.low) for c in tail]
+        if all(math.isfinite(v) for v in highs) and all(math.isfinite(v) for v in lows):
+            high_20 = max(highs)
+            low_20 = min(lows)
 
     warmup_ok = all(
         v is not None for v in (ema_20, rsi_14, atr_14, bb_upper, bb_lower, bb_width)

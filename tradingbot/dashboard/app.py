@@ -17,8 +17,10 @@ import hmac
 import json
 import logging
 import math
+import os
 import re
 import secrets
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,7 @@ from typing import Any
 from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from tradingbot import risk
 from tradingbot.config import HardLimits, Settings, mask_secret
 from tradingbot.models import BotState
 
@@ -49,7 +52,19 @@ CLEAR_FILENAME = "CLEAR"
 
 _DATE_RE = re.compile(r"^\d{8}$")
 _CYCLE_FILE_RE = re.compile(r"^cycle_(\d+)\.json$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f  ]")
 _MAX_LIMIT = 1000
+
+#: 파일 읽기에서 삼키는 예외. ``read_text(encoding="utf-8")``의 UnicodeDecodeError는 ValueError 하위다.
+_READ_ERRORS = (OSError, ValueError)
+
+#: risk.drawdown_level 어휘 -> 대시보드 어휘
+_RISK_LEVEL_TO_DASH = {"normal": "none", "caution": "caution", "block": "block", "stop_all": "stop_all"}
+
+
+def _clean_text(text: str, max_len: int) -> str:
+    """사용자 입력(reason)의 개행·제어문자를 공백으로 바꾸고 길이를 자른다 (로그 주입 방지)."""
+    return _CONTROL_CHARS_RE.sub(" ", text)[:max_len].strip()
 
 
 # ---------------------------------------------------------------- JSON 응답(결정적)
@@ -98,8 +113,9 @@ def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
     try:
         if not path.is_file():
             return []
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as e:
+        # 잘린 멀티바이트(크래시·디스크 풀)가 있어도 나머지 줄은 살린다.
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except _READ_ERRORS as e:
         log.warning("jsonl 읽기 실패 %s: %s", path, e)
         return []
     out: list[dict] = []
@@ -124,49 +140,87 @@ def _clamp_limit(limit: int) -> int:
 
 # ---------------------------------------------------------------- 상태 파생값
 def drawdown_level(drawdown_pct: float) -> str:
-    """낙폭(소수)을 사다리 단계 문자열로. ``none``/``caution``/``block``/``stop_all``."""
-    if drawdown_pct >= HardLimits.DRAWDOWN_STOP_ALL:
+    """낙폭(소수)을 사다리 단계 문자열로. ``none``/``caution``/``block``/``stop_all``.
+
+    봇의 게이트(``risk.drawdown_level``)와 같은 경계·허용오차를 쓴다: 센트 단위로 반올림된 자본에서
+    낙폭이 0.0599999999999999처럼 경계 바로 아래로 떨어져도 봇과 같은 단계를 보여준다.
+    """
+    if not math.isfinite(drawdown_pct):
         return "stop_all"
-    if drawdown_pct >= HardLimits.DRAWDOWN_BLOCK:
-        return "block"
-    if drawdown_pct >= HardLimits.DRAWDOWN_CAUTION:
-        return "caution"
-    return "none"
+    # peak=1, equity=1-dd 로 환산하면 risk 와 정확히 같은 비교가 된다.
+    return _RISK_LEVEL_TO_DASH[risk.drawdown_level(1.0 - float(drawdown_pct), 1.0)]
 
 
-def compute_equity(state: BotState) -> float:
-    """현금 + 포지션 평가액(마크 없으면 진입가)."""
-    total = float(state.paper_quote_balance)
+def positions_value(state: BotState) -> float:
+    """보유 포지션 평가액 합(마크 없으면 진입가)."""
+    total = 0.0
     for pos in state.positions.values():
         mark = pos.last_mark if pos.last_mark is not None else pos.entry_price
         total += float(pos.base_amount) * float(mark)
     return total
 
 
-def summarize_state(state: BotState, now_ms: int | None = None) -> dict:
-    """헤더에 쓰는 요약값. 금액은 USDT, 비율은 소수."""
+def compute_equity(state: BotState) -> float:
+    """paper 모드의 자본: 현금(paper_quote_balance) + 포지션 평가액.
+
+    testnet/live 에서는 현금이 거래소에 있어 ``paper_quote_balance``가 0이므로 이 값은 자본이 아니다.
+    그 경우 ``summarize_state(..., equity=...)``로 사이클 보고서의 자본을 넘긴다.
+    """
+    return float(state.paper_quote_balance) + positions_value(state)
+
+
+def summarize_state(state: BotState, now_ms: int | None = None, equity: float | None = None) -> dict:
+    """헤더에 쓰는 요약값. 금액은 USDT, 비율은 소수.
+
+    - paper: 자본 = 현금 + 포지션 평가액 (``equity`` 인자는 무시).
+    - testnet/live: 현금은 거래소에 있어 파일만으로는 알 수 없다. ``equity``(최신 사이클 보고서의 자본)가 주어지면
+      그것을 쓰고, 없으면 자본·현금·낙폭은 ``None``, 낙폭 단계는 ``"unknown"``. 포지션 평가액을 자본으로
+      내놓아 가짜 stop_all 을 표시하지 않는다.
+    - 당일 손익 = 자본 - 당일 시작자본 (reports.daily_summary 와 같은 정의; 전날 미실현을 이중 계산하지 않음).
+      자본을 모르거나 시작자본이 없으면 실현손익만.
+    """
     now_ms = _now_ms() if now_ms is None else now_ms
-    equity = compute_equity(state)
-    peak = max(float(state.peak_equity), equity) if state.peak_equity > 0 else equity
-    dd = (peak - equity) / peak if peak > 0 else 0.0
+    pos_value = positions_value(state)
+    if state.mode == "paper":
+        cash: float | None = float(state.paper_quote_balance)
+        equity = cash + pos_value
+    else:
+        cash = None
+        equity = float(equity) if equity is not None and math.isfinite(float(equity)) else None
+
+    peak_state = float(state.peak_equity) if state.peak_equity > 0 else 0.0
+    if equity is not None:
+        peak: float | None = max(peak_state, equity)
+        dd: float | None = max(0.0, (peak - equity) / peak) if peak > 0 else 0.0
+        level = _RISK_LEVEL_TO_DASH[risk.drawdown_level(equity, peak)] if peak > 0 else "none"
+    else:
+        peak = peak_state if peak_state > 0 else None
+        dd = None
+        level = "unknown"
+
     start = float(state.daily.start_equity)
+    realized = float(state.daily.realized_pnl)
     unrealized = sum(
         float(p.base_amount) * ((p.last_mark if p.last_mark is not None else p.entry_price) - p.entry_price)
         for p in state.positions.values()
     )
-    daily_pnl = float(state.daily.realized_pnl) + unrealized
+    if equity is not None and start > 0:
+        daily_pnl = equity - start
+    else:
+        daily_pnl = realized
     llm_paused = state.llm_paused_until_ts is not None and state.llm_paused_until_ts > now_ms
     return {
         "mode": state.mode,
         "cycle": state.cycle,
         "equity": equity,
-        "cash": float(state.paper_quote_balance),
+        "cash": cash,
+        "positions_value": pos_value,
         "peak_equity": peak,
-        "drawdown_pct": max(0.0, dd),
-        "drawdown_level": drawdown_level(dd),
+        "drawdown_pct": dd,
+        "drawdown_level": level,
         "daily_date": state.daily.date,
         "daily_start_equity": start,
-        "daily_realized_pnl": float(state.daily.realized_pnl),
+        "daily_realized_pnl": realized,
         "daily_unrealized_pnl": unrealized,
         "daily_pnl": daily_pnl,
         "daily_pnl_pct": (daily_pnl / start) if start > 0 else 0.0,
@@ -300,10 +354,22 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
     logs_dir = data_dir / LOGS_DIRNAME
     cycles_dir = logs_dir / CYCLES_DIRNAME
 
-    # 토큰 준비 (파일 권한은 소유자만 읽기)
+    #: STOP/CLEAR 쓰기 직렬화 (두 엔드포인트는 스레드풀에서 동시에 실행될 수 있다)
+    control_lock = threading.Lock()
+
+    def _read_token_file() -> str | None:
+        """토큰 파일 내용(strip). 없거나·비었거나·읽기/디코드 실패면 None."""
+        try:
+            if token_path.is_file():
+                return token_path.read_text(encoding="utf-8").strip() or None
+        except _READ_ERRORS as e:
+            log.warning("토큰 파일 읽기 실패 %s: %s", token_path, type(e).__name__)
+        return None
+
+    # 토큰 준비 (파일 권한은 소유자만 읽기). 비었거나 깨진(UTF-8 아님) 파일은 새로 만든다.
     try:
         control_dir.mkdir(parents=True, exist_ok=True)
-        if not token_path.is_file() or not token_path.read_text(encoding="utf-8").strip():
+        if _read_token_file() is None:
             token = secrets.token_urlsafe(24)
             token_path.write_text(token + "\n", encoding="utf-8")
             try:
@@ -337,12 +403,32 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             return None
 
     def _read_token() -> str | None:
+        return _read_token_file()
+
+    def _latest_cycle_equity() -> float | None:
+        """최신 사이클 보고서의 ``equity`` (testnet/live 자본 출처). 없거나 숫자가 아니면 None."""
+        files = _list_cycle_files()
+        if not files:
+            return None
+        payload = _read_json(files[0][2])
+        if not isinstance(payload, dict):
+            return None
+        eq = payload.get("equity")
+        if isinstance(eq, bool) or not isinstance(eq, (int, float)):
+            return None
+        return float(eq) if math.isfinite(float(eq)) else None
+
+    def _write_control_file(target: Path, payload: str) -> None:
+        """tmp 쓰기 -> os.replace. tmp 이름은 pid+난수로 요청마다 다르다."""
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         try:
-            if token_path.is_file():
-                return token_path.read_text(encoding="utf-8").strip() or None
-        except OSError as e:
-            log.warning("토큰 파일 읽기 실패: %s", e)
-        return None
+            tmp.write_text(payload + "\n", encoding="utf-8")
+            os.replace(tmp, target)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def _require_token(header_value: str | None) -> None:
         expected = _read_token()
@@ -414,10 +500,11 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
         if state is None:
             return {"exists": False, "state": None, "summary": None, "stop_pending": _stop_info() is not None}
         dumped = state.model_dump()
+        equity = _latest_cycle_equity() if state.mode != "paper" else None
         return {
             "exists": True,
             "state": dumped,
-            "summary": summarize_state(state),
+            "summary": summarize_state(state, equity=equity),
             "stop_pending": _stop_info() is not None,
         }
 
@@ -516,21 +603,20 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
         _require_token(x_dashboard_token)
         reason = ""
         if isinstance(body, dict):
-            reason = str(body.get("reason") or "").strip()
-        reason = reason[:500] or "dashboard"
+            reason = _clean_text(str(body.get("reason") or ""), 500)
+        reason = reason or "dashboard"
         ts = _now_ms()
         payload = json.dumps({"reason": reason, "ts": ts}, sort_keys=True, ensure_ascii=False)
         try:
-            control_dir.mkdir(parents=True, exist_ok=True)
-            tmp = stop_path.with_name(stop_path.name + ".tmp")
-            tmp.write_text(payload + "\n", encoding="utf-8")
-            tmp.replace(stop_path)
-            if clear_path.exists():
-                clear_path.unlink()
+            with control_lock:
+                control_dir.mkdir(parents=True, exist_ok=True)
+                _write_control_file(stop_path, payload)
+                if clear_path.exists():
+                    clear_path.unlink()
         except OSError as e:
             log.error("STOP 파일 쓰기 실패: %s", e)
             raise HTTPException(status_code=500, detail="STOP 파일을 쓸 수 없습니다") from e
-        log.warning("대시보드에서 STOP 요청: %s", reason[:120])
+        log.warning("대시보드에서 STOP 요청: %r", reason[:120])
         return {"ok": True, "reason": reason, "ts": ts, "path": str(stop_path)}
 
     @app.post("/api/kill/clear")
@@ -541,23 +627,22 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
         _require_token(x_dashboard_token)
         reason = ""
         if isinstance(body, dict):
-            reason = str(body.get("reason") or "").strip()
-        reason = reason[:500] or "dashboard"
+            reason = _clean_text(str(body.get("reason") or ""), 500)
+        reason = reason or "dashboard"
         ts = _now_ms()
         removed = False
         try:
-            control_dir.mkdir(parents=True, exist_ok=True)
-            if stop_path.exists():
-                stop_path.unlink()
-                removed = True
-            payload = json.dumps({"reason": reason, "ts": ts}, sort_keys=True, ensure_ascii=False)
-            tmp = clear_path.with_name(clear_path.name + ".tmp")
-            tmp.write_text(payload + "\n", encoding="utf-8")
-            tmp.replace(clear_path)
+            with control_lock:
+                control_dir.mkdir(parents=True, exist_ok=True)
+                if stop_path.exists():
+                    stop_path.unlink()
+                    removed = True
+                payload = json.dumps({"reason": reason, "ts": ts}, sort_keys=True, ensure_ascii=False)
+                _write_control_file(clear_path, payload)
         except OSError as e:
             log.error("CLEAR 파일 쓰기 실패: %s", e)
             raise HTTPException(status_code=500, detail="CLEAR 파일을 쓸 수 없습니다") from e
-        log.warning("대시보드에서 킬스위치 해제 요청: %s (STOP 제거=%s)", reason[:120], removed)
+        log.warning("대시보드에서 킬스위치 해제 요청: %r (STOP 제거=%s)", reason[:120], removed)
         return {"ok": True, "reason": reason, "ts": ts, "stop_removed": removed, "path": str(clear_path)}
 
     return app

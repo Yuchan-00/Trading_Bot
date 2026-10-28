@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradingbot"
+version = "0.1.0"
+description = "Claude API 멀티에이전트 Binance 현물 트레이딩 봇 (코드 강제 리스크 한도, paper 기본, 로컬 대시보드, 텔레그램 알림)"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "anthropic>=2.3,<3",
+    "ccxt>=4.5,<5",
+    "pydantic>=2.6,<3",
+    "python-dotenv>=1.0",
+    "feedparser>=6.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "numpy>=1.26",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2.3"]
+
+[project.scripts]
+tradingbot = "tradingbot.main:main"
+
+[tool.setuptools.packages.find]
+include = ["tradingbot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+timeout = 120
+filterwarnings = ["ignore::DeprecationWarning"]

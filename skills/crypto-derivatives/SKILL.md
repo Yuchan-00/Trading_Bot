@@ -12,7 +12,7 @@ license: MIT
 
 Apply when `flow_pack.perp_premium_pct` or `flow_pack.funding_annualized_pct` is present. This skill adds two things on top of the funding-band reading: a basis (premium) regime, and a sustainability test that flags funding levels no market can hold for long. Only the perpetual contract matters here; dated futures, options and arbitrage trades are outside this bot and must not appear in your output.
 
-Inputs: `perp_premium_pct`, `funding_now`, `funding_7d_mean`, `funding_annualized_pct`, `funding_regime`, `oi_change_24h_pct`, `data_confidence`.
+Inputs: `perp_premium_pct`, `funding_now`, `funding_7d_mean`, `funding_annualized_pct`, `funding_regime`, `oi_change_24h_pct`, `oi_funding_label`, `divergence_flags`, `data_confidence`.
 
 ## Definitions
 
@@ -33,7 +33,7 @@ Inputs: `perp_premium_pct`, `funding_now`, `funding_7d_mean`, `funding_annualize
 
 1. Annualized funding above 50% (8h rate above about +0.046%) or `funding_regime == "extreme_long"`: label this unsustainable. The expected path is funding reverting toward zero. Set `squeeze_direction: "down"` and `block_new_longs: true` with a Korean `block_reason` citing `funding_annualized_pct`.
 2. Annualized funding below −30% (8h rate below about −0.027%): equally unsustainable on the short side. Set `squeeze_direction: "up"`. This supports `washout_setup` only with the OI condition from the funding skill; on its own it raises `posture` to `fear` or `capitulation` and leaves `flow_bias` at `neutral`.
-3. Acceleration: when `funding_now` exceeds 2 × `funding_7d_mean` and both are positive, the crowd is piling in faster than the weekly norm. Raise `crowding_risk` one notch even if the absolute band is only `elevated_long`.
+3. Acceleration: when `divergence_flags` contains `funding_up_price_flat`, longs are paying more without price following, which means the crowd is piling in faster than the move justifies. Raise `crowding_risk` one notch even if the absolute band is only `elevated_long`. Do not compute your own ratio of `funding_now` to `funding_7d_mean`; use the flag.
 
 ## Consistency checks
 

@@ -291,10 +291,13 @@ class AnthropicBackend(AgentBackend):
     # client 기본: anthropic.Anthropic(api_key=settings.anthropic_api_key, max_retries=2, timeout=timeout 기본 60)
     # complete():
     #   1) ledger.check(projected = estimate(model, len(system)/4 + len(payload)/4, 0, max_tokens))  -> BudgetExceeded는 그대로 전파(호출자가 LLM 일시정지 처리)
-    #   2) client.messages.parse(model=settings.model_for(tier), max_tokens=max_tokens,
+    #   2) client.messages.create(model=settings.model_for(tier), max_tokens=max_tokens,
     #        system=[{"type":"text","text":system,"cache_control":{"type":"ephemeral","ttl":cache_ttl}}],
     #        messages=[{"role":"user","content": json.dumps(user_payload, ensure_ascii=False, sort_keys=True)}],
-    #        output_format=output_model, output_config={"effort": effort}, timeout=timeout_s)
+    #        output_config={"effort": effort, "format": {"type":"json_schema","schema": <output_model JSON 스키마(SDK transform_schema 적용)>}},
+    #        timeout=timeout_s)  → 본문 text 를 output_model.model_validate_json 으로 직접 검증.
+    #      (원래 parse(output_format=...) 를 쓰려 했으나, SDK 2.x 의 parse() 는 본문이 스키마에 안 맞으면(잘림·거부) usage/stop_reason 을
+    #       읽기 전에 ValidationError 를 던져 (3)·(5)를 지킬 수 없다. create() 는 항상 원본 Message 를 돌려준다. — 구현 리뷰 LLM-1/2)
     #      thinking 파라미터는 보내지 않는다(5.5 계열은 기본 adaptive). tool_choice 강제 금지.
     #   3) stop_reason == "refusal" -> ok=False, error="refusal:<category>"; "max_tokens" -> ok=False, error="max_tokens"
     #   4) parsed_output이 None/검증 실패 -> ok=False, error="parse_error"

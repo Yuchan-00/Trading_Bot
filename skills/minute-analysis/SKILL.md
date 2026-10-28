@@ -33,7 +33,7 @@ Use on every technical call. The bot runs on 15-minute cycles, so intraday price
    - `cgo_60` > +20 → most recent buyers sit on large gains and may sell into strength; subtract 1 from `score` for continuation setups.
    - `cgo_60` < −30 → selling pressure from trapped holders is likely exhausted; add 1 to `score` for mean-reversion setups when volume confirms.
    - Values in between carry no adjustment.
-4. **Sanity-check the stop against intraday range.** The session VWAP level is `price / (1 + vwap_distance_pct / 100)`. If `stop_candidate_price` sits above that level, price can hit the stop without even revisiting VWAP, so the stop is inside normal intraday rotation. Prefer a stop just below VWAP when that still fits inside the 2.0% cap; otherwise keep the structural stop and note the fragility in `invalidation`.
+4. **Sanity-check the stop against intraday rotation.** Do not build a stop from VWAP; `sl_reference` only allows `zone`, `kijun`, `atr` or `none`, so the stop always comes from the structure, Kijun or ATR channels. Use VWAP only as a fragility test: if `vwap_distance_pct` is positive and larger than the chosen `stop_pct`, price can hit the stop before it even revisits the session average, which means the stop sits inside ordinary intraday rotation. In that case keep the structural stop, set `noise_check: false`, mention the fragility in `invalidation`, and prefer `timing: "wait_pullback"` so the entry moves closer to the stop.
 5. **Write the invalidation line** in market terms, for example a 15m close back below the session VWAP, or `volume_vs_hour_avg` staying below 1.0 for the next 4 bars after a breakout.
 
 ## Score contribution (into `score`)
@@ -49,7 +49,7 @@ Use on every technical call. The bot runs on 15-minute cycles, so intraday price
 
 ## Open positions
 
-- Price has fallen more than 1.0% below the session VWAP (`vwap_distance_pct` < −1.0) after an entry made above it, with `volume_vs_hour_avg` ≥ 1.5 → report the deterioration in `evidence`; set `exit_flag: true` only if the stored invalidation also references VWAP or a structure channel confirms.
+- Price has fallen more than 1.0% below the session VWAP (`vwap_distance_pct` < −1.0) after an entry made above it, with `volume_vs_hour_avg` ≥ 1.5 → report the deterioration in `evidence`; set `exit_flag: true` only if the `position.thesis` text you receive mentions VWAP or a structure label (`smc_1h.structure`, `per_tf.1h.vote`) also turned bearish.
 - A spike in `abnormal_volume_multiple` ≥ 4 on a bar closing lower is a distribution warning; mention it in `exit_reason` when combined with a structure break.
 
 ## What NOT to do
@@ -62,4 +62,4 @@ Use on every technical call. The bot runs on 15-minute cycles, so intraday price
 
 ## Output mapping summary
 
-`timing` (now / wait_pullback / wait_confirmation), `confidence` caps and adjustments, `score` ±1 per row above, `direction` downgrade on thin spikes, `invalidation` phrasing, `exit_flag` / `exit_reason` for positions, and `evidence` items such as `vwap_distance_pct: 0.4`, `volume_vs_hour_avg: 1.6`, `abnormal_volume_multiple: 3.4`, `cgo_60: -12`.
+`timing` (now / wait_pullback / wait_confirmation), `confidence` caps and adjustments, `score` ±1 per row above, `direction` downgrade on thin spikes, `noise_check: false` when the stop sits inside VWAP rotation, `invalidation` phrasing, `exit_flag` / `exit_reason` for positions, and `evidence` items such as `vwap_distance_pct: 0.4`, `volume_vs_hour_avg: 1.6`, `abnormal_volume_multiple: 3.4`, `cgo_60: -12`.

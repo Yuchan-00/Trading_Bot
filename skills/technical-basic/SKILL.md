@@ -10,7 +10,7 @@ license: MIT
 
 ## When to apply
 
-Use this on every call. It is your baseline read of `feature_pack.per_tf` before Ichimoku, candlestick, SMC or volatility refinements. The three axes are already computed in code and labelled per timeframe (`per_tf.15m`, `per_tf.1h`, `per_tf.4h`, `per_tf.1d` when present). Your job is to combine the labels, not to recompute them. You never see candles beyond `last_closes_1h`, so any claim about a moving average, RSI or OBV must point at the label field that carries it.
+Use this on every call. It is your baseline read of `feature_pack.per_tf` before Ichimoku, candlestick, SMC or volatility refinements. The three axes are computed in code and labelled per timeframe (`per_tf.15m`, `per_tf.1h`, `per_tf.4h`, `per_tf.1d` when present). Combine the labels, do not recompute them. You never see candles beyond `last_closes_1h`, so any claim about a moving average, RSI or OBV must point at the label field carrying it.
 
 ## The three axes and their fields
 
@@ -24,14 +24,14 @@ The code summarises each timeframe in `vote` with values `trend_up`, `trend_down
 
 ## Procedure
 
-1. Read the 4h row first. It sets the regime: `bull_aligned` allows trend entries, `mixed` allows only mean-reversion entries, `bear_aligned` allows nothing new.
+1. Read the 4h row first. It sets the regime: `bull_aligned` allows new entries; `mixed` allows them only with `per_tf.1d.ema_state == bull_aligned` (the same condition code uses for `mtf_agreement`), otherwise `flat`; `bear_aligned` allows nothing new.
 2. Read the 1h row for the setup. `trend_up` → candidate `setup_type: trend_continuation`. `mean_reversion_long` → candidate `setup_type: mean_reversion`. `trend_down` or `mean_reversion_short` → `direction: avoid` for entries.
 3. Read the 15m row for timing. `trend_up` or `none` with `obv_trend != down` → `timing: now`. A 15m `trend_down` against a 1h long setup → `timing: wait_pullback` (do not buy into a falling intraday leg). `rsi_5 > 80` on 15m → `timing: wait_pullback`.
 4. Apply the volume gate. A long requires `obv_trend` of `up` or `flat` on 1h; `down` on 1h and 4h together downgrades the direction to `flat`.
 5. Apply the overbought veto. If 1h or 4h shows `rsi_14 > 70` or `bb_position > 0.95`, the direction is at most `flat` regardless of the trend axis. This is the one rule that overrides everything else on the long side.
 6. Copy `feature_pack.mtf_agreement` into the output field `mtf_agreement` unchanged. Do not derive your own version; the code definition is the contract the entry gate checks.
-7. Build `score` in −5..+5: start at 0; +2 for 4h `bull_aligned`; +1 for 1h `vote` in {`trend_up`, `mean_reversion_long`}; +1 for 1h `obv_trend == up`; +1 for 15m `vote != trend_down`. Mirror with negatives for the bearish readings. A long needs `score >= 3`; `score <= 0` means `direction: flat`; `score <= -3` means `direction: avoid`.
-8. Set `confidence`. Base 0.50 for a qualifying long; +0.10 if `mtf_agreement` is true; +0.05 if 1h `adx_14 > 25`; +0.05 if 1h `volume_ratio_20 > 1.2`; −0.10 if the 15m row contradicts the 1h row; −0.15 if `per_tf.4h` is missing or any axis is `unknown`. Clamp to 0..1. Only `confidence >= 0.55` matters downstream, so do not inflate a marginal read past it.
+7. Build `score` in −5..+5: start at 0; +2 for 4h `bull_aligned` (or 4h `mixed` with 1d `bull_aligned`); +1 for 1h `vote` in {`trend_up`, `mean_reversion_long`}; +1 for 1h `obv_trend == up`; +1 for 15m `vote != trend_down`. Mirror with negatives for the bearish readings. A long needs `score >= 3`; `score <= 0` means `direction: flat`; `score <= -3` means `direction: avoid`.
+8. Set `confidence` with the role prompt's step 8 recipe only (0.50 base, +0.10 `mtf_agreement`, the Ichimoku/SMC increments named there, step 5-6 deductions, cap 0.90). `adx_14` and `volume_ratio_20` inform `score` and `timing`, not confidence. A missing `per_tf.4h` or `unknown` axis falls under the prompt's data check (`flat`, confidence ≤ 0.3). Do not inflate a marginal read past 0.55.
 
 ## Stop and target
 

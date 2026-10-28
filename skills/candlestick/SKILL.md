@@ -21,10 +21,10 @@ The detectors behind the labels use the classic geometry: a doji is a body under
 
 | Context (from `per_tf` and Ichimoku) | Bullish pattern on 1h | Bearish pattern on 1h |
 |---|---|---|
-| 4h `bull_aligned`, 1h `vote == trend_up` | confirms `timing: now`, +0.05 confidence | downgrade `timing` to `wait_pullback`; no direction change |
+| 4h `bull_aligned`, 1h `vote == trend_up` | confirms `timing: now` | downgrade `timing` to `wait_pullback`; no direction change |
 | 4h `mixed`, 1h `mean_reversion_long` (`rsi_14 < 30`, `bb_position < 0.05`) | the trigger for `timing: now`; without one, `wait_confirmation` | hold at `flat`; reversal not started |
 | 4h `bear_aligned` or 4h `price_vs_cloud == below` | ignore (counter-trend bounce bait) | reinforces `avoid` |
-| Open position | neutral | `score <= -2` on 1h plus a broken 1h vote → `exit_flag` consideration |
+| Open position | neutral | `candles_1h.score <= -2` while `price < position.entry_price` → `exit_flag: true` (role prompt step 10); above entry it is an `invalidation` note |
 
 Rules of thumb:
 
@@ -37,11 +37,11 @@ Rules of thumb:
 
 Add `candles_1h.score` to your working `score` only when its sign agrees with the provisional direction from the trend and Ichimoku reads; when it disagrees, subtract 1 and move `timing` one step more cautious (`now` → `wait_pullback` → `wait_confirmation`). Ignore `candles_15m.score` for `score`; use it for `timing` only. The final `score` must still respect the −5..+5 range and the +3 threshold for a long.
 
-Confidence: +0.05 for an agreeing 1h pattern in the right context, −0.05 for a disagreeing one, 0 for indecision labels. A pattern can never lift `confidence` above what the trend and multi-timeframe reads justify.
+Confidence: patterns add no increment of their own; the role prompt's step 8 recipe is authoritative. A pattern influences `score` and `timing` only, and can never lift `confidence` above what the trend and multi-timeframe reads justify.
 
 ## Stops from patterns
 
-A reversal bar gives a natural stop: the low of a `hammer` or `pin_bar_bull`, or the low of the engulfed range. The pack does not carry bar lows, so you cannot cite that price. Anchor the stop with `atr_pct_1h` instead (`stop_pct = min(2.0, 1.5 * atr_pct_1h)`, `sl_reference: atr`) or with an SMC demand zone (`sl_reference: zone`), and state in `invalidation` that a 1h close below the pattern bar's low (as it will be visible through `bb_position`/`vote` flipping) voids the read. Do not set `sl_reference: zone` or quote a `stop_candidate_price` derived from an imagined wick.
+A reversal bar gives a natural stop: the low of a `hammer` or `pin_bar_bull`, or the low of the engulfed range. The pack does not carry bar lows, so you cannot cite that price. Anchor the stop with `atr_pct_1h` instead (`stop_pct = min(2.0, 1.5 * atr_pct_1h)`, `sl_reference: atr`) or with an SMC demand zone (`sl_reference: zone`), and state in `invalidation` that a 1h close below the pattern bar's low (as it will be visible through `bb_position`/`vote` flipping) voids the read. Do not quote a `stop_candidate_price`, or claim a zone, derived from an imagined wick.
 
 ## What not to do
 

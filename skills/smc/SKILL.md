@@ -53,10 +53,10 @@ Use this skill whenever `feature_pack.smc_1h` or `feature_pack.smc_4h` is presen
 | `smc_1h.fvg_dir == "bullish"` | +1 |
 | `distance_to_demand_pct` ≤ 1.0 (price at the zone) | +1 |
 | `smc_1h.structure` ∈ {bos_down, choch_down} | −2 |
-| `smc_4h.structure == "choch_down"` | −2 |
+| `smc_4h.structure` ∈ {bos_down, choch_down} | −2 |
 | `smc_1h.fvg_dir == "bearish"` while bias is long | −1 |
 
-Combine with the other technical channels; SMC alone should never carry the whole score.
+Cap the net SMC contribution at +3 / −3 before combining with the other technical channels (Ichimoku, volatility, intraday); SMC alone must not carry the whole score. The bearish rows mirror step 1 and the Open-positions section: any 4h `bos_down` or `choch_down` both forbids `long` and scores −2.
 
 ## Open positions
 

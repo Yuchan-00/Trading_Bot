@@ -6,7 +6,7 @@
    - ``derivatives_flow``: 1회 일괄. 대상 심볼의 flow_pack 중 ``data_confidence != "none"`` 인 것이
      하나도 없으면 호출하지 않고 기권(``derivatives_flow:*:no_data``).
    - ``news_sentiment``: ``news_store.new_headlines(scan.news)`` 가 비어 있지 않을 때만 1회.
-2. 뉴스 저장소 갱신(이벤트 24h 만료) → ``news_risk_symbols`` 계산.
+2. 뉴스 점수를 고정 7단계 척도로 맞춤 → 뉴스 저장소 갱신(이벤트 24h 만료) → ``news_risk_symbols`` 계산.
 3. G1(후보별) → 4. 생존 후보의 bull·bear 를 **한 번의** ``run_many`` 로 → 5. G2(약세 킬).
 6. ``risk_manager`` 1회(생존 후보 또는 보유 종목이 있을 때) → 7. G3(코드가 다시 강제).
 8. ``head`` 1회(승인/조건부 후보 ≥1 또는 플래그 포지션 ≥1 일 때만). 아니면 ``head_skipped_reason``.
@@ -74,6 +74,7 @@ log = logging.getLogger("tradingbot.agents.pipeline")
 __all__ = [
     "CandidateContext", "PositionContext", "PipelineResult", "NewsStore", "run_pipeline",
     "effective_gate", "flag_position", "BTC_SYMBOL", "HEALTH_FLAG_MAX", "NEWS_EVENT_TTL_H",
+    "NEWS_SCORE_STEPS", "snap_news_score",
 ]
 
 BTC_SYMBOL = "BTC/USDT"
@@ -83,6 +84,7 @@ NEWS_SEEN_TTL_H = 7 * 24.0        # 본 헤드라인 id 보관 기간(시간)
 NEWS_SEEN_CAP = 5000              # 본 헤드라인 id 상한
 NEWS_EVENTS_CAP = 500             # 저장 이벤트 상한
 NEWS_RISK_SCORE = -0.66           # 이 점수 이하 이벤트의 심볼도 뉴스 위험으로 본다(7단계 척도의 '강한 악재')
+NEWS_SCORE_STEPS: tuple[float, ...] = (-1.0, -0.66, -0.33, 0.0, 0.33, 0.66, 1.0)   # 뉴스 점수 고정 척도(CONTRACT-8)
 
 _STAGE_G1 = "g1"
 _STAGE_BEAR = "bear_decline"
@@ -164,12 +166,41 @@ def _finite(x: Any) -> bool:
         return False
 
 
+def snap_news_score(score: Any, *, headline_id: str | None = None) -> float | None:
+    """뉴스 점수를 고정 7단계 척도(``NEWS_SCORE_STEPS``)의 가장 가까운 값으로 맞춘다(CONTRACT-8).
+
+    스키마는 [-1, 1] 범위만 강제하므로 LLM 이 −0.65 같은 중간값을 내면 ``score <= -0.66`` 뉴스 위험 판정을
+    빠져나간다. 같은 거리면 더 낮은(보수적인) 단계를 고른다. 유한한 수가 아니면 None. 값이 바뀌면 DEBUG 로그.
+    """
+    if not _finite(score):
+        return None
+    x = float(score)
+    snapped = min(NEWS_SCORE_STEPS, key=lambda step: (abs(step - x), step))
+    if snapped != x:
+        log.debug("뉴스 점수 척도 맞춤 headline_id=%s %r -> %r", headline_id, x, snapped)
+    return snapped
+
+
+def _snap_news_output(out: NewsOutput) -> NewsOutput:
+    """NewsOutput 의 모든 이벤트 점수를 척도에 맞춘 사본(바뀐 것이 없으면 그대로)."""
+    events = []
+    changed = False
+    for ev in out.events:
+        snapped = snap_news_score(ev.score, headline_id=ev.headline_id)
+        if snapped is not None and snapped != ev.score:
+            ev = ev.model_copy(update={"score": snapped})
+            changed = True
+        events.append(ev)
+    return out.model_copy(update={"events": events}) if changed else out
+
+
 class NewsStore:
     """본 헤드라인 id·뉴스 이벤트·뉴스 위험 심볼의 영속 저장소(JSON, 원자 저장).
 
     - ``new_headlines(items)``: 아직 처리하지 않은 헤드라인만(목록 안 중복도 제거). id = ``payloads.headline_id``.
     - ``mark_seen(items, now_ms)``: 뉴스 분석이 **성공한 뒤** 호출(실패하면 다음 사이클에 다시 시도).
     - ``add_events(events, now_ms, ts_by_id)``: NewsEvent 저장. 만료 = 헤드라인 시각(없으면 now) + 24h.
+      점수는 저장 전에 고정 7단계 척도로 맞춘다(``snap_news_score``).
     - ``add_risk_symbols(symbols, now_ms)``: risk_event 심볼을 24h 동안 기억(새 헤드라인이 없는 사이클에도 G1 차단 유지).
     - ``active_events(now_ms)`` / ``risk_symbols(now_ms)``: 만료 전 항목만.
     - ``path`` 가 None 이면 메모리 전용(테스트). 손상 파일은 경고 후 빈 상태로 시작한다(캐시이므로).
@@ -268,8 +299,7 @@ class NewsStore:
                 prev = self.events.get(hid)
                 ts = prev.get("ts") if prev and _finite(prev.get("ts")) else int(now_ms)
             ts = int(ts)
-            score = d.get("score")
-            rec = {"headline_id": hid, "score": float(score) if _finite(score) else None,
+            rec = {"headline_id": hid, "score": snap_news_score(d.get("score"), headline_id=hid),
                    "event_type": d.get("event_type"), "symbols": [str(s) for s in d.get("symbols") or []],
                    "summary": d.get("summary"), "stale": bool(d.get("stale")), "ts": ts,
                    "expires_ts": ts + self.event_ttl_ms}
@@ -637,6 +667,8 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
                 acc.abstain(_abst("derivatives_flow", "*", res.error))
         elif role == "news_sentiment":
             news_out = _output(res, NewsOutput)
+            if news_out is not None:
+                news_out = _snap_news_output(news_out)   # 저장·뉴스 위험 판정·토론 payload 모두 척도 값으로
             if news_out is None:
                 acc.abstain(_abst("news_sentiment", "*", res.error))
     for s in tech_syms:
@@ -657,7 +689,8 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
         news_store.mark_seen(sent_heads, now_ms)        # 페이로드에서 잘린 헤드라인은 다음 사이클에 다시
         raw_risk: list[str] = list(news_out.risk_event_symbols)
         for ev in news_out.events:
-            if ev.score <= NEWS_RISK_SCORE and not ev.stale:
+            ev_score = snap_news_score(ev.score, headline_id=ev.headline_id)
+            if ev_score is not None and ev_score <= NEWS_RISK_SCORE and not ev.stale:
                 raw_risk.extend(ev.symbols)
         news_store.add_risk_symbols(sorted(_norm_symbols(raw_risk, risk_universe)), now_ms)
     news_risk = news_store.risk_symbols(now_ms)

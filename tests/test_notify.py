@@ -666,3 +666,78 @@ def test_signatures_match_spec():
         assert q[name].kind is inspect.Parameter.KEYWORD_ONLY and q[name].default == default
     assert inspect.signature(Notifier.flush).parameters["timeout_s"].default == 5.0
     assert isinstance(inspect.getattr_static(Notifier, "format"), staticmethod)
+
+
+# ================================================================ 중단·재개·하트비트 (전용 kind + 구버전 호환)
+class TestHaltHeartbeatFormat:
+    def test_halt_lists_korean_reasons_and_equity(self):
+        e = ev("halt", equity=9650.0, reason="신규 진입 중단 (G0): 당일 실현손실 ... (daily_loss_limit): 당일 신규 진입 중단",
+               extra={"stage": "g0", "code": "halt", "halt_codes": ["daily_loss_limit", "consecutive_losses"]})
+        text = Notifier.format(e)
+        lines = text.splitlines()
+        assert lines[0] == "⛔ 신규 진입 중단 [paper]"
+        assert "- 당일 실현손실 한도(−3%) 도달 (daily_loss_limit)" in lines
+        assert "- 연속 손실 한도(3연패) 도달 (consecutive_losses)" in lines
+        assert "자본 9,650.0" in lines
+        assert any(line.startswith("상세: 당일 실현손실") for line in lines)
+
+    @pytest.mark.parametrize("code,needle", [
+        ("daily_loss", "당일 손실"), ("consecutive_losses", "연속 손실"), ("drawdown_block", "낙폭 차단"),
+        ("drawdown_stop_all", "전면 중단"), ("kill_switch", "킬스위치"), ("llm_budget", "LLM 예산"),
+        ("llm_paused", "LLM 일시정지"), ("weird_code", "weird_code"),
+    ])
+    def test_halt_reason_codes_in_korean(self, code, needle):
+        text = Notifier.format(ev("halt", extra={"halt_codes": [code]}))
+        assert needle in text
+
+    def test_halt_lifted(self):
+        text = Notifier.format(ev("halt_lifted", reason="신규 진입 중단 해제: drawdown_block",
+                                  extra={"event": "halt_lifted", "halt_codes": ["drawdown_block"]}))
+        lines = text.splitlines()
+        assert lines[0] == "✅ 신규 진입 재개 [paper]"
+        assert "해제된 중단:" in lines and any("낙폭 차단" in x and "drawdown_block" in x for x in lines)
+
+    def test_heartbeat_full(self):
+        e = ev("heartbeat", equity=10_123.4, pnl_quote=23.4, pnl_pct=0.00234, reason="하트비트: ...",
+               extra={"heartbeat": True, "cycle": 42, "kill_switch": False, "exposure_pct": 0.1234,
+                      "llm_cost_today_usd": 1.5,
+                      "positions": [{"symbol": "ETH/USDT", "unrealized_pct": 0.0123, "value_quote": 812.5},
+                                    {"symbol": "SOL/USDT", "unrealized_pct": -0.005}]})
+        lines = Notifier.format(e).splitlines()
+        assert lines[0] == "💓 하트비트 [paper]"
+        assert "정상 동작 중 — 사이클 42, 킬스위치 OFF" in lines
+        assert "자본 10,123.4" in lines and "당일 손익 +23.40 USDT (+0.23%)" in lines
+        assert "보유 2개:" in lines
+        assert "- ETH/USDT 미실현 +1.23% (812.5 USDT)" in lines and "- SOL/USDT 미실현 -0.50%" in lines
+        assert "노출 12.34%" in lines and "오늘 LLM 비용 $1.50" in lines
+        assert "일일 요약" not in "\n".join(lines)
+
+    def test_heartbeat_no_positions(self):
+        lines = Notifier.format(ev("heartbeat", equity=1.0, extra={"positions": []})).splitlines()
+        assert "보유 0개" in lines
+
+    # 구버전 이벤트(배포 전 failed_log 재전송 등)도 알아볼 수 있게
+    def test_legacy_daily_summary_heartbeat(self):
+        text = Notifier.format(ev("daily_summary", equity=10_000.0, reason="하트비트: 정상 동작 중 (cycle 3)",
+                                  extra={"heartbeat": True}))
+        assert text.startswith("💓 하트비트 [paper]") and "cycle 3" in text and "일일 요약" not in text
+
+    def test_legacy_error_halt(self):
+        text = Notifier.format(ev("error", equity=9_700.0, reason="신규 진입 중단 (G0): 낙폭 (drawdown_block): 금지",
+                                  extra={"stage": "g0", "code": "halt", "halt_codes": ["drawdown_block"]}))
+        assert text.startswith("⛔ 신규 진입 중단 [paper]") and "낙폭 차단" in text and "오류" not in text
+        # 일반 오류는 그대로
+        assert Notifier.format(ev("error", reason="x", extra={"stage": "scan"})).startswith("❗ 오류")
+
+    def test_legacy_startup_halt_lifted(self):
+        text = Notifier.format(ev("startup", reason="신규 진입 중단 해제: consecutive_losses",
+                                  extra={"event": "halt_lifted", "halt_codes": ["consecutive_losses"]}))
+        assert text.startswith("✅ 신규 진입 재개 [paper]") and "연속 손실" in text and "봇 시작" not in text
+        assert Notifier.format(ev("startup", reason="루프 시작")).startswith("▶️ 봇 시작")
+
+    def test_bad_extra_values_do_not_crash(self):
+        for kind in ("halt", "halt_lifted", "heartbeat"):
+            e = ev(kind, extra={"halt_codes": "drawdown_block", "positions": [1, None, {"symbol": None,
+                                "unrealized_pct": float("nan"), "value_quote": True}],
+                                "exposure_pct": "x", "llm_cost_today_usd": float("inf"), "cycle": True})
+            assert Notifier.format(e).strip()

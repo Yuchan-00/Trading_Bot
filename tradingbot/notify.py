@@ -52,7 +52,29 @@ EMOJI: dict[str, str] = {
     "shutdown": "⏹",
     "llm_paused": "⏸",
     "post_trade_review": "📝",
+    "halt": "⛔",
+    "halt_lifted": "✅",
+    "heartbeat": "💓",
 }
+
+# G0 중단 사유 코드 → 한국어 설명 (risk.global_gates / gates.g0_preflight 의 괄호 코드)
+HALT_REASON_KO: dict[str, str] = {
+    "daily_loss": "당일 손실 한도(−3%) 도달",
+    "daily_loss_limit": "당일 실현손실 한도(−3%) 도달",
+    "daily_loss_limit_equity": "당일 자본 손실 한도(−3%) 도달",
+    "consecutive_losses": "연속 손실 한도(3연패) 도달",
+    "drawdown_block": "낙폭 차단 단계(−4.5%) — 신규 진입 금지",
+    "drawdown_stop_all": "낙폭 전면 중단 단계(−6%) — 사람이 해제해야 함",
+    "kill_switch": "킬스위치 활성",
+    "llm_budget": "LLM 예산 소진",
+    "llm_paused": "LLM 일시정지 중",
+    "max_positions": "최대 보유 포지션 수 도달",
+    "funding_window": "펀딩 정산 창(±1분)",
+    "invalid_equity": "자본 값 이상",
+    "invalid_start_equity": "당일 시작자본 값 이상",
+    "invalid_realized_pnl": "당일 실현손익 값 이상",
+}
+HALT_DETAIL_MAX_CHARS = 500     # cycle._notify_halts 가 사유를 500자로 자른다 — 구 error 형식과 같은 길이
 
 # 체결 후 상태 저장 실패(extra.state_saved == False) 경고 줄 — 진입/청산 메시지 헤더 바로 아래에 붙인다
 STATE_SAVE_WARNING = "⚠️ 상태 저장 실패 — 체결은 됐으나 장부 미저장, 수동 확인 필요"
@@ -716,13 +738,8 @@ def _format_budget_exceeded(e: TradeEvent) -> str:
 def _format_daily_summary(e: TradeEvent) -> str:
     ex = e.extra or {}
     if ex.get("heartbeat"):
-        # main.run_loop 4시간 하트비트 — 진짜 일일 요약(UTC 롤오버)과 구분되는 제목
-        lines = [_header("💓", "하트비트", e, with_symbol=False)]
-        if e.equity is not None:
-            lines.append(f"자본 {_fmt_quote(e.equity)}")
-        if e.reason:
-            lines.append(_truncate(e.reason))
-        return "\n".join(lines)
+        # 구버전 하트비트(kind=daily_summary + extra.heartbeat) — 진짜 일일 요약과 구분되게 하트비트로 그린다
+        return _format_heartbeat(e)
     title = "일일 요약"
     date = ex.get("date")
     if date:
@@ -759,7 +776,111 @@ def _format_daily_summary(e: TradeEvent) -> str:
     return "\n".join(lines)
 
 
+def _finite_num(x: object) -> float | None:
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    f = float(x)
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _halt_codes(e: TradeEvent) -> list[str]:
+    raw = (e.extra or {}).get("halt_codes")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(c) for c in dict.fromkeys(raw) if str(c).strip()]
+
+
+def _halt_label(code: str) -> str:
+    ko = HALT_REASON_KO.get(code)
+    return f"{ko} ({code})" if ko else code
+
+
+def _format_halt(e: TradeEvent) -> str:
+    """G0 신규 진입 중단(cycle._notify_halts). 구버전(kind=error + extra.code='halt')도 같은 모양."""
+    lines = [_header(EMOJI["halt"], "신규 진입 중단", e, with_symbol=False)]
+    codes = _halt_codes(e)
+    if codes:
+        lines.append("사유:")
+        lines.extend(f"- {_halt_label(c)}" for c in codes)
+    detail = (e.reason or "").strip()
+    for prefix in ("신규 진입 중단 (G0):", "신규 진입 중단(G0):"):
+        if detail.startswith(prefix):
+            detail = detail[len(prefix):].strip()
+    if detail:
+        lines.append(f"상세: {_truncate(detail, HALT_DETAIL_MAX_CHARS)}")
+    elif not codes:
+        lines.append("사유: -")
+    if e.equity is not None:
+        lines.append(f"자본 {_fmt_quote(e.equity)}")
+    lines.append("보유 포지션의 코드 청산 검사는 계속합니다")
+    return "\n".join(lines)
+
+
+def _format_halt_lifted(e: TradeEvent) -> str:
+    """G0 중단 해제(cycle._notify_halts). 구버전(kind=startup + extra.event='halt_lifted')도 같은 모양."""
+    lines = [_header(EMOJI["halt_lifted"], "신규 진입 재개", e, with_symbol=False)]
+    codes = _halt_codes(e)
+    if codes:
+        lines.append("해제된 중단:")
+        lines.extend(f"- {_halt_label(c)}" for c in codes)
+    elif e.reason:
+        lines.append(_truncate(e.reason))
+    if e.equity is not None:
+        lines.append(f"자본 {_fmt_quote(e.equity)}")
+    return "\n".join(lines)
+
+
+def _format_heartbeat(e: TradeEvent) -> str:
+    """main.run_loop 4시간 하트비트: 자본·당일 손익·보유 포지션(미실현 %)·노출 %·오늘 LLM 비용."""
+    ex = e.extra or {}
+    lines = [_header(EMOJI["heartbeat"], "하트비트", e, with_symbol=False)]
+    status: list[str] = []
+    cycle = ex.get("cycle")
+    if isinstance(cycle, int) and not isinstance(cycle, bool):
+        status.append(f"사이클 {cycle}")
+    if isinstance(ex.get("kill_switch"), bool):
+        status.append(f"킬스위치 {'ON' if ex['kill_switch'] else 'OFF'}")
+    if status:
+        lines.append("정상 동작 중 — " + ", ".join(status))
+    if e.equity is not None:
+        lines.append(f"자본 {_fmt_quote(e.equity)}")
+    if e.pnl_quote is not None or e.pnl_pct is not None:
+        line = f"당일 손익 {_fmt_pnl(e.pnl_quote)} USDT"
+        if e.pnl_pct is not None:
+            line += f" ({_fmt_pct(e.pnl_pct)})"
+        lines.append(line)
+    positions = ex.get("positions")
+    if isinstance(positions, (list, tuple)):
+        lines.append(f"보유 {len(positions)}개" + (":" if positions else ""))
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            sym = str(p.get("symbol") or "?")
+            upct = _finite_num(p.get("unrealized_pct"))
+            val = _finite_num(p.get("value_quote"))
+            line = f"- {sym} 미실현 {_fmt_pct(upct)}"
+            if val is not None:
+                line += f" ({_fmt_quote(val)} USDT)"
+            lines.append(line)
+    exposure = _finite_num(ex.get("exposure_pct"))
+    if exposure is not None:
+        lines.append(f"노출 {exposure * 100:.2f}%")
+    cost = _finite_num(ex.get("llm_cost_today_usd"))
+    if cost is not None:
+        lines.append(f"오늘 LLM 비용 ${cost:,.2f}")
+    if e.reason and not isinstance(positions, (list, tuple)):
+        # 구버전 하트비트: 상태 요약이 reason 문자열에만 있다
+        lines.append(_truncate(e.reason))
+    return "\n".join(lines)
+
+
 def _format_error(e: TradeEvent) -> str:
+    if (e.extra or {}).get("code") == "halt":
+        return _format_halt(e)      # 구버전 G0 중단 알림(kind=error)
     lines = [_header(EMOJI["error"], "오류", e)]
     lines.append(_truncate(e.reason, 500) or "(상세 없음)")
     stage = (e.extra or {}).get("stage")
@@ -769,6 +890,8 @@ def _format_error(e: TradeEvent) -> str:
 
 
 def _format_startup(e: TradeEvent) -> str:
+    if (e.extra or {}).get("event") == "halt_lifted":
+        return _format_halt_lifted(e)   # 구버전 G0 중단 해제 알림(kind=startup)
     lines = [_header(EMOJI["startup"], "봇 시작", e, with_symbol=False)]
     ex = e.extra or {}
     syms = ex.get("symbols")
@@ -824,12 +947,16 @@ _FORMATTERS: dict[str, Callable[[TradeEvent], str]] = {
     "startup": _format_startup,
     "shutdown": _format_shutdown,
     "llm_paused": _format_llm_paused,
+    "halt": _format_halt,
+    "halt_lifted": _format_halt_lifted,
+    "heartbeat": _format_heartbeat,
 }
 
 __all__ = [
     "DEFAULT_RETRY_DELAYS",
     "EMOJI",
     "EXIT_REASON_KO",
+    "HALT_REASON_KO",
     "Notifier",
     "STATE_SAVE_WARNING",
     "TelegramTransport",

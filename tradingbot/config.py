@@ -217,8 +217,11 @@ def _feeds(raw: str) -> tuple[str, ...]:
     return feeds
 
 
-def _read_env(dotenv_path: Path | None) -> dict[str, str]:
-    """os.environ 위에 .env를 얹되, 이미 있는 환경변수가 우선."""
+def read_env(dotenv_path: Path | None = None) -> dict[str, str]:
+    """os.environ 위에 .env(기본 ``./.env``)를 얹은 사본. 이미 있는 환경변수가 우선한다.
+
+    검증은 하지 않는다 — ``load_settings`` 가 실패해도 ``DATA_DIR`` 같은 값만 꺼내 쓸 때(CLI stop/status) 쓴다.
+    """
     merged: dict[str, str] = dict(os.environ)
     path = dotenv_path if dotenv_path is not None else Path(".env")
     if path.exists():
@@ -233,10 +236,13 @@ def _read_env(dotenv_path: Path | None) -> dict[str, str]:
     return merged
 
 
+_read_env = read_env  # 하위 호환 별칭
+
+
 def load_settings(env: Mapping[str, str] | None = None, *, dotenv_path: Path | None = None) -> Settings:
     """환경(또는 주어진 매핑)에서 Settings를 만든다. 위험한 조합은 ConfigError."""
     if env is None:
-        src: Mapping[str, str] = _read_env(dotenv_path)
+        src: Mapping[str, str] = read_env(dotenv_path)
     elif dotenv_path is not None:
         merged = dict(env)
         if dotenv_path.exists():

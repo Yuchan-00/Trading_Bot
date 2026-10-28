@@ -5,6 +5,7 @@ ScanResult 는 features/scanner 모델로 직접 만든다(네트워크 없음).
 from __future__ import annotations
 
 import json
+import logging
 import threading
 
 import pytest
@@ -854,3 +855,63 @@ def test_invalid_equity_fails_closed_at_g1(make_runner):
     res = run_pipeline(make_scan(), make_state(), 0.0, runner, JournalState(), NOW, news_store=NewsStore())
     assert res.candidates[0].dropped_at == "g1"
     assert "bull" not in roles_called(backend) and "head" not in roles_called(backend)
+
+
+# ======================================================================= 뉴스 점수 7단계 척도 맞춤 (CONTRACT-8)
+from tradingbot.agents.pipeline import NEWS_SCORE_STEPS, snap_news_score  # noqa: E402
+
+
+@pytest.mark.parametrize("raw,want", [(-0.65, -0.66), (0.1, 0.0), (-0.66, -0.66), (0.5, 0.66), (-0.2, -0.33),
+                                      (0.95, 1.0), (-1.0, -1.0), (0.0, 0.0), (0.165, 0.0)])
+def test_snap_news_score_nearest_step(raw, want):
+    assert snap_news_score(raw) == want
+    assert want in NEWS_SCORE_STEPS
+
+
+@pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), "x", True])
+def test_snap_news_score_invalid_is_none(bad):
+    assert snap_news_score(bad) is None
+
+
+def test_news_store_add_events_snaps_scores_and_logs_debug(caplog):
+    s = NewsStore()
+    with caplog.at_level(logging.DEBUG, logger="tradingbot.agents.pipeline"):
+        recs = s.add_events([
+            NewsEvent(headline_id="a", score=-0.65, event_type="hack", symbols=["ETH/USDT"], summary="s", stale=False),
+            {"headline_id": "b", "score": 0.1, "event_type": "other", "symbols": [], "summary": "s", "stale": False},
+            {"headline_id": "c", "score": 0.33, "event_type": "etf", "symbols": [], "summary": "s", "stale": False},
+        ], NOW)
+    assert [r["score"] for r in recs] == [-0.66, 0.0, 0.33]
+    assert s.events["a"]["score"] == -0.66 and s.events["b"]["score"] == 0.0
+    snapped = [r for r in caplog.records if r.levelno == logging.DEBUG and "척도" in r.getMessage()]
+    assert len(snapped) == 2                                     # 이미 척도 값인 0.33 은 로그 없음
+    assert any("a" in r.getMessage() and "-0.65" in r.getMessage() for r in snapped)
+
+
+def _news_with_score(score: float, sym: str = "ETH/USDT"):
+    def news(p):
+        return NewsOutput(events=[NewsEvent(headline_id=p["headlines"][0]["id"], score=score, event_type="regulatory",
+                                            symbols=[sym], summary="악재", stale=False)],
+                          risk_event=False, risk_event_symbols=[], market_tone=-0.2, market_note="n",
+                          feed_health_note="정상")
+    return news
+
+
+def test_news_score_minus_065_snaps_to_risk_and_blocks_g1(make_runner):
+    store = NewsStore()
+    runner, backend = make_runner(happy_responses(news_sentiment=_news_with_score(-0.65)))
+    res = run(runner, make_scan(news=[news_item("ETH 규제 조사")]), store=store)
+    assert res.news_risk_symbols == ["ETH/USDT"]               # −0.65 → −0.66 → 뉴스 위험
+    assert res.candidates[0].dropped_at == "g1"
+    assert [e["score"] for e in store.active_events(NOW)] == [-0.66]
+    assert res.news is not None and res.news.events[0].score == -0.66
+
+
+def test_news_score_0_1_snaps_to_zero_no_risk(make_runner):
+    store = NewsStore()
+    runner, backend = make_runner(happy_responses(news_sentiment=_news_with_score(0.1)))
+    res = run(runner, make_scan(news=[news_item("ETH 의견 기사")]), store=store)
+    assert res.news_risk_symbols == []
+    assert [e["score"] for e in store.active_events(NOW)] == [0.0]
+    bull_p = payloads_for(backend, "bull")
+    assert bull_p and [e["score"] for e in bull_p[0]["news_events"]] == [0.0]

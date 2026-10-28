@@ -702,13 +702,14 @@ class Cycle:
             reasons = [r for r in g0.reasons if any(f"({c})" in r or r.startswith(f"{c}:") for c in new)]
             text = "신규 진입 중단 (G0): " + "; ".join(reasons or new)
             eq = run.equity if _finite(run.equity) else None
-            self._notify(self._event("error", run, reason=text[:500], equity=eq,
+            self._notify(self._event("halt", run, reason=text[:500], equity=eq,
                                      extra={"stage": "g0", "code": "halt", "halt_codes": new}))
             self._lifted_halts -= set(new)
         if lifted:
             self._lifted_halts |= set(lifted)
-            self._notify(self._event("startup", run, reason=f"신규 진입 중단 해제: {', '.join(lifted)}",
-                                     extra={"event": "halt_lifted", "halt_codes": lifted}))
+            eq = run.equity if _finite(run.equity) else None
+            self._notify(self._event("halt_lifted", run, reason=f"신규 진입 중단 해제: {', '.join(lifted)}",
+                                     equity=eq, extra={"stage": "g0", "event": "halt_lifted", "halt_codes": lifted}))
 
     # ================================================================ 본체
     def run_once(self) -> CycleSummary:
@@ -1423,7 +1424,9 @@ class Cycle:
         tech_stop = ctx.technical.stop_pct if ctx.technical is not None else None
         g4, plan = G.g4_final(d, ctx.risk, float(gate["confidence_floor"]), mult, run.equity,
                               mark if mark is not None else float("nan"), atr_1h, free_quote,
-                              tech_stop_pct=tech_stop)
+                              tech_stop_pct=tech_stop,
+                              # G3 가 잰 실효 비용(스캐너 스프레드·주문액/깊이 충격 포함)이 이 팩에 기록돼 있다
+                              exec_cost_pct=getattr(run.scan.risk_packs.get(sym), "exec_cost_pct", None))
         ctx.gates.append(g4)
         if plan is None:
             self._downgrade(run, sym, "; ".join(g4.reasons) or "G4 HOLD")

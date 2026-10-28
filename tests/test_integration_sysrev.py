@@ -215,7 +215,10 @@ def test_control_commands_work_without_api_key(tmp_path, argv, fname):
     assert "설정 경고" in err.getvalue()
 
 
-def test_status_still_requires_valid_config(tmp_path):
+def test_status_works_without_valid_config(tmp_path):
+    """status 도 stop/clear-stop 처럼 백엔드 키 없이 DATA_DIR 의 파일만 읽어 출력한다(설정 경고는 stderr)."""
     env = {"AGENT_BACKEND": "anthropic", "ANTHROPIC_API_KEY": "", "MODE": "paper", "DATA_DIR": str(tmp_path / "d")}
-    code = M.main(["status"], env=env, out=io.StringIO(), err=io.StringIO(), input_fn=lambda p: "")
-    assert code == M.EXIT_USAGE
+    out, err = io.StringIO(), io.StringIO()
+    code = M.main(["status"], env=env, out=out, err=err, input_fn=lambda p: "")
+    assert code == M.EXIT_OK
+    assert "설정 경고" in err.getvalue() and str(tmp_path / "d") in out.getvalue()

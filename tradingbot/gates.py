@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -467,7 +467,8 @@ def g3_risk(
     - risk_pack/liquidity 의 symbol 이 후보와 다르면 탈락. 리스크 팩이 없거나 값이 전부 미상이면 탈락.
     - 24h 거래대금이 없으면 risk_pack 의 비율과 팩 주문액(impact·depth/100)으로 15분 거래대금을 복원(불가 시 탈락).
     - 실행비용: ``risk_pack.exec_cost_pct`` 와 ``impact_bps_est/100 + spread_bps/200 + 2·FEE_PCT·100`` 중 큰 값 > 0.25 × 손절거리 → 탈락.
-      손절거리 = min(stop_pct, verdict.stop_pct, 2.0) (% 단위; 무효값은 제외).
+      손절거리 = min(stop_pct, verdict.stop_pct, 2.0) (% 단위; 무효값은 제외). 잰 비용이 팩 값보다 크면(또는 팩 값이
+      None 이면) ``risk_pack.exec_cost_pct`` 를 그 값으로 올려 둔다 — G4 최종 손절 재검사가 같은 비용을 보게(MONEY-7).
     - CVaR 사이즈 상한: 배수 ×= min(1, cvar_size_pct / 10).
 
     ``planned_notional`` 은 이 후보에 낼 수 있는 **최대** 주문액(예: equity × 10%)으로 넘긴다 —
@@ -630,6 +631,8 @@ def g3_risk(
                                   f"실행비용 {cost:.3f}% > {G3_EXEC_COST_STOP_SHARE:g} × 손절거리 {stop_eff:.3f}% (= {limit:.3f}%)"))
             else:
                 notes.append(_r("exec_cost_ok", f"실행비용 {cost:.3f}% ≤ {limit:.3f}%"))
+            # G4 재검사(MONEY-7)가 G3 와 같은(더 나쁜) 비용을 보도록 측정값을 리스크 팩에 남긴다(올리기만).
+            _record_exec_cost(risk_pack, cost)
 
         # --- CVaR 사이즈 상한
         cvar_size = _num(_get(risk_pack, "cvar_size_pct"))
@@ -656,6 +659,29 @@ def g3_risk(
         return _fail("G3", exc)
 
 
+def _record_exec_cost(risk_pack: Any, cost: float) -> None:
+    """G3 가 잰 실효 실행비용(%)을 ``risk_pack.exec_cost_pct`` 에 기록한다 — 기존 값보다 클 때(또는 없을 때)만.
+
+    G3 비용은 ``max(risk_pack.exec_cost_pct, impact/100 + max(팩·스캐너 스프레드)/200 + 왕복 수수료)`` 이고
+    주문액/깊이 충격도 포함하므로 팩 값보다 클 수 있다. cycle 은 G4 에 ``risk_pack.exec_cost_pct`` 를 넘기므로,
+    여기 남기지 않으면 G4 가 G3 보다 약한(또는 None 이라 생략되는) 비용으로 최종 손절을 재검사한다.
+    기록할 수 없는 객체(불변·None)는 조용히 넘어간다 — 판정에는 영향이 없다.
+    """
+    c = _num(cost)
+    if risk_pack is None or c is None:
+        return
+    try:
+        prev = _num(_get(risk_pack, "exec_cost_pct"))
+        if prev is not None and prev >= c:
+            return
+        if isinstance(risk_pack, MutableMapping):
+            risk_pack["exec_cost_pct"] = c
+        else:
+            setattr(risk_pack, "exec_cost_pct", c)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("G3 실행비용 기록 실패: %s", type(exc).__name__)
+
+
 # ====================================================================== G4
 def _hold(reasons: list[str], notes: list[str], floor: float, mult: float) -> tuple[GateDecision, None]:
     log.info("G4 HOLD: %s", "; ".join(reasons))
@@ -674,6 +700,7 @@ def g4_final(
     free_quote: float,
     *,
     tech_stop_pct: float | None = None,
+    exec_cost_pct: float | None = None,
 ) -> tuple[GateDecision, OrderPlan | None]:
     """총괄 BUY 결정 → 최종 주문 계획. 위반은 HOLD(계획 None)로 강등한다.
 
@@ -683,6 +710,9 @@ def g4_final(
     size_pct 상한 적용 → MIN_ORDER_USDT 미만이면 HOLD.
     ``tech_stop_pct``(% 단위)를 주면 최종 손절은 기술분석 손절 후보보다 넓어지지 않는다(v2.1).
     ``atr_1h`` 는 손절이 1h ATR 노이즈 안으로 조여졌는지 notes 에 남기는 데만 쓴다.
+    ``exec_cost_pct``(% 단위, 보통 ``RiskPack.exec_cost_pct`` — G3 가 잰 실효 비용으로 올려 둔 값)를 주면 clamp_stops·enforce_net_rr 로 **최종** 손절거리가
+    정해진 뒤 실행비용 > ``G3_EXEC_COST_STOP_SHARE``(0.25) × 최종 손절거리(%) 이면 HOLD 한다(MONEY-7: G3 는 조여지기
+    전 손절로 판단하므로 head·tech·net-RR 이 손절을 조이면 재검사가 필요). 유한한 수가 아니면 무시하고 notes 에 남긴다.
     """
     floor_eff = HardLimits.MIN_CONFIDENCE
     try:
@@ -770,6 +800,20 @@ def g4_final(
                          notes, floor_eff, 0.0)
         sl_dist = (entry - sl) / entry
         tp_dist = (tp - entry) / entry
+
+        # 3b) 실행비용 vs 최종 손절거리(MONEY-7) — G3 이후 조여진 손절로 다시 본다
+        if exec_cost_pct is not None:
+            ec = _num(exec_cost_pct)
+            final_stop_pct = sl_dist * 100.0
+            if ec is None:
+                notes.append(_r("exec_cost_invalid", f"실행비용 {exec_cost_pct!r} 무효 → 최종 손절 재검사 생략"))
+            else:
+                limit = G3_EXEC_COST_STOP_SHARE * final_stop_pct
+                if ec > limit + _TOL:
+                    return _hold([_r("exec_cost_too_high",
+                                     f"실행비용 {ec:.3f}% > {G3_EXEC_COST_STOP_SHARE:g} × 최종 손절거리 "
+                                     f"{final_stop_pct:.3f}% (= {limit:.3f}%) → HOLD")], notes, floor_eff, 0.0)
+                notes.append(_r("exec_cost_final_ok", f"실행비용 {ec:.3f}% ≤ 최종 손절 기준 {limit:.3f}%"))
         atr = _pos(atr_1h)
         if atr is not None and sl_dist < atr / entry:
             notes.append(_r("stop_inside_atr", f"손절거리 {sl_dist:.3%} < 1h ATR {atr / entry:.3%} (노이즈 손절 위험)"))

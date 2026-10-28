@@ -1169,3 +1169,74 @@ def test_gate_pipeline_end_to_end_combination():
 def test_reason_codes_g0_extracts_parenthesized_token():
     d = g0_preflight(make_state(kill=True), 10_000.0, NOW, False, False)
     assert "kill_switch" in reason_codes(d) and "llm_budget" in reason_codes(d)
+
+
+# ---------------------------------------------------------------- G4 실행비용 재검사 (MONEY-7)
+def test_g4_exec_cost_none_is_backward_compatible():
+    d0, p0 = g4()
+    d1, p1 = g4(exec_cost_pct=None)
+    assert d1.passed and p1 is not None and p0 is not None
+    assert p1.quote_amount == p0.quote_amount and p1.stop_loss_price == p0.stop_loss_price
+    assert not any(n.startswith("exec_cost") for n in d1.notes)
+
+
+def test_g4_exec_cost_boundary_at_quarter_of_final_stop():
+    # 최종 손절 1.5% → 기준 0.25×1.5 = 0.375%
+    d, plan = g4(exec_cost_pct=0.375)
+    assert d.passed and plan is not None, d.reasons
+    assert any(n.startswith("exec_cost_final_ok") for n in d.notes)
+    d, plan = g4(exec_cost_pct=0.376)
+    assert plan is None and not d.passed and codes(d) == ["exec_cost_too_high"]
+    assert d.size_multiplier == 0.0
+    assert "최종 손절거리" in d.reasons[0] and "HOLD" in d.reasons[0]
+
+
+def test_g4_exec_cost_rechecked_after_enforce_net_rr_tightens_stop():
+    # 손절 2% → G3 기준 0.5% 통과 수준의 비용(0.45%)이라도, net-RR 이 손절을 조이면 최종 손절로 다시 본다
+    head, verdict = make_head(stop_pct=2.0, tp_pct=2.5), make_verdict(stop_pct=2.0)
+    _, base = g4(decision=head, verdict=verdict)
+    assert base is not None
+    final_stop_pct = (100.0 - base.stop_loss_price) / 100.0 * 100.0
+    assert final_stop_pct < 2.0 and 0.45 > 0.25 * final_stop_pct   # 조여진 손절 기준을 넘는다
+    assert 0.45 <= 0.25 * 2.0                                      # 조이기 전 손절(2%) 기준으로는 통과
+    d, plan = g4(decision=head, verdict=verdict, exec_cost_pct=0.45)
+    assert plan is None and codes(d) == ["exec_cost_too_high"]
+    # 최종 손절 기준 바로 아래 비용은 통과
+    ok_cost = 0.25 * final_stop_pct - 1e-6
+    d, plan = g4(decision=head, verdict=verdict, exec_cost_pct=ok_cost)
+    assert d.passed and plan is not None, d.reasons
+
+
+@pytest.mark.parametrize("bad", [NAN, INF, "x", True])
+def test_g4_invalid_exec_cost_ignored_with_note(bad):
+    d, plan = g4(exec_cost_pct=bad)
+    assert d.passed and plan is not None
+    assert any(n.startswith("exec_cost_invalid") for n in d.notes)
+
+
+# ---------------------------------------------------------------- G3 → G4 실행비용 전달(MONEY-7 보완)
+def test_g3_records_effective_exec_cost_on_risk_pack():
+    """G3 가 스캐너 스프레드로 잰 비용(0.315%)이 팩 값(0.24%)보다 크면 팩에 올려 둔다 — G4 재검사가 같은 값을 본다."""
+    rp = make_rp(exec_cost_pct=0.24)
+    d = g3(risk_pack=rp, liquidity=make_liq(spread_bps=18.0))
+    assert d.passed, d.reasons
+    assert rp.exec_cost_pct == pytest.approx(2.5 / 100 + 18.0 / 200 + 0.20)
+
+
+def test_g3_records_exec_cost_when_pack_value_missing():
+    rp = make_rp(exec_cost_pct=None, impact_bps_est=12.5)
+    assert g3(risk_pack=rp, stop_pct=2.0).passed
+    assert rp.exec_cost_pct == pytest.approx(12.5 / 100 + 3.0 / 200 + 0.20)
+
+
+def test_g3_never_lowers_pack_exec_cost():
+    rp = make_rp(exec_cost_pct=0.30, impact_bps_est=0.0, depth_taker_usdt=1e9)
+    g3(risk_pack=rp)
+    assert rp.exec_cost_pct == pytest.approx(0.30)
+
+
+def test_g3_exec_cost_record_tolerates_immutable_pack():
+    from types import MappingProxyType
+
+    rp = MappingProxyType(make_rp(exec_cost_pct=0.10).model_dump())
+    assert g3(risk_pack=rp).passed

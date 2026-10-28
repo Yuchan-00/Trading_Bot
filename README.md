@@ -97,7 +97,7 @@ python -m tradingbot.main backtest --days 90   # 규칙 전용 기준선 백테�
 ```
 
 ```bash
-python -m tradingbot.main status         # 상태 요약
+python -m tradingbot.main status         # 상태 요약 (파일만 읽음 — API 키가 없거나 설정이 깨져 있어도 DATA_DIR 만 있으면 동작)
 ```
 
 ```bash
@@ -110,7 +110,7 @@ python -m tradingbot.main clear-stop     # control/STOP 삭제 + control/CLEAR �
 
 킬스위치는 자동으로 풀리지 않습니다. `stop`(또는 낙폭 사다리 −6% 자동 STOP_ALL)으로 멈춘 뒤 거래를 재개하려면 사람이 `clear-stop`(또는 대시보드 **해제(CLEAR)** 버튼)을 실행해야 합니다.
 
-키·네트워크 없이 동작을 확인하려면 `--offline-fixture`(paper 전용)를 씁니다. ccxt 시세 대신 결정적 합성 시세를 쓰고 뉴스 조회를 끄며, 백엔드는 mock 으로 강제되고 텔레그램 전송은 꺼집니다. 데이터는 실제 paper 기록을 오염시키지 않도록 `<DATA_DIR>/offline_fixture/` 에 따로 씁니다.
+키·네트워크 없이 동작을 확인하려면 `--offline-fixture`(paper 전용)를 씁니다. ccxt 시세 대신 결정적 합성 시세를 쓰고 뉴스·공포탐욕(Fear & Greed) 조회를 끄며, 백엔드는 mock 으로 강제되고 텔레그램 전송은 꺼집니다. 데이터는 실제 paper 기록을 오염시키지 않도록 `<DATA_DIR>/offline_fixture/` 에 따로 씁니다.
 
 ```bash
 MODE=paper AGENT_BACKEND=mock MOCK_SCENARIO=approve python -m tradingbot.main run --once --offline-fixture       # 진입 경로
@@ -134,7 +134,11 @@ MODE=paper AGENT_BACKEND=mock MOCK_SCENARIO=conservative python -m tradingbot.ma
 
 ## 5. 텔레그램 알림
 
-진입 · 청산(모든 사유와 손익) · 부분체결/거부/거래소 오류 · 게이트에 의한 강등(총괄 BUY→HOLD, 리스크 거부, 약세 킬) · 중단/해제(일일 한도, 연속 손실, 낙폭 사다리, 킬스위치) · 레짐 전환 · 뉴스 risk_event · 포지션 건강도 하락 · 일일 리뷰(00:05 UTC) · 시작/종료/오류/LLM 일시정지 · 하트비트(4시간).
+진입 · 청산(모든 사유와 손익) · 부분체결/거부/거래소 오류 · 게이트에 의한 강등(총괄 BUY→HOLD, 리스크 거부, 약세 킬) · 중단/해제(일일 한도, 연속 손실, 낙폭 사다리, 킬스위치) · 레짐 전환 · 뉴스 risk_event · 포지션 건강도 하락 · 일일 리뷰(00:05 UTC) · 시작/종료/오류/LLM 일시정지 · 하트비트(4시간: 자본·당일 손익·보유 포지션 미실현 %·노출 %·오늘 LLM 비용).
+
+신규 진입 중단은 `⛔ 신규 진입 중단`(사유별 한국어 설명), 해제는 `✅ 신규 진입 재개` 로 따로 옵니다.
+
+`bot.lock` 은 기록된 프로세스가 죽었거나 갱신 시각이 `max(3 × 사이클 분, 30분)` 보다 오래됐으면 낡은 잠금으로 보고 새 실행이 가져갑니다. 다른 호스트의 잠금(공유 DATA_DIR)은 프로세스를 확인할 수 없으므로 갱신 시각만 보고, 신선하면 가져오지 않습니다. 갱신(ts 쓰기)이 기준의 절반 넘게 계속 실패하면 봇은 스스로 오류 종료합니다.
 
 알림은 큐에 넣고 별도 스레드가 보내므로 텔레그램 장애가 거래를 막지 않습니다. 실패한 메시지는 `logs/failed_notifications.jsonl`에 남습니다.
 

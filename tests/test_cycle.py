@@ -910,3 +910,51 @@ def test_read_control_file_variants(tmp_path):
     assert C.read_control_file(p) == {"reason": "r", "ts": 5}
     p.write_text("", encoding="utf-8")
     assert C.read_control_file(p)["reason"] is None
+
+
+# ======================================================================= G4 실행비용 재검사 전달 (MONEY-7)
+def test_buy_passes_risk_pack_exec_cost_to_g4(tmp_path, monkeypatch):
+    seen: list[tuple[str, object]] = []
+    orig = C.G.g4_final
+
+    def spy(decision, *a, **kw):
+        seen.append((decision.symbol, kw.get("exec_cost_pct", "missing")))
+        return orig(decision, *a, **kw)
+
+    monkeypatch.setattr(C.G, "g4_final", spy)
+    rig = Rig(tmp_path)
+    rig.cycle.run_once()
+    # 팩 값 0.21% 가 아니라 G3 가 잰 실효 비용(주문액/깊이 충격 포함, 0.211%)이 팩에 기록돼 G4 로 간다
+    assert len(seen) == 1 and seen[0][0] == "ETH/USDT"
+    assert seen[0][1] == pytest.approx(0.211) and seen[0][1] >= 0.21
+    assert "ETH/USDT" in rig.state.positions          # 0.211% ≤ 0.25 × 최종 손절 → 진입 유지
+
+
+# ======================================================================= G0 중단/재개 이벤트 종류
+def test_g0_halt_and_lift_emit_dedicated_kinds(tmp_path):
+    """_notify_halts 는 kind 'halt'(새 중단) / 'halt_lifted'(해제)로 알린다(구버전 error/startup 아님)."""
+    events: list = []
+    rig = Rig(tmp_path, candidates=())
+    orig = rig.notifier.notify
+    rig.notifier.notify = lambda e: (events.append(e), orig(e))
+    st = rig.state
+    st.daily.date = "2026-10-28"
+    st.daily.start_equity = 10_000.0
+    st.daily.consecutive_losses = 3
+    st.daily.trades, st.daily.losses = 3, 3
+    st.daily.realized_pnl = -10.0
+    rig.cycle.run_once()
+    halts = [e for e in events if e.kind == "halt"]
+    assert len(halts) == 1 and halts[0].extra["halt_codes"] == ["consecutive_losses"]
+    assert halts[0].equity is not None and not [e for e in events if e.kind == "error"]
+    assert any(m.startswith("⛔ 신규 진입 중단 [paper]") and "연속 손실" in m for m in rig.transport.sent)
+    # 다음 사이클도 같은 중단이면 다시 알리지 않는다
+    rig.cycle.run_once()
+    assert len([e for e in events if e.kind == "halt"]) == 1
+    # 해제 → halt_lifted 한 번
+    st.daily.consecutive_losses = 0
+    rig.cycle.run_once()
+    lifted = [e for e in events if e.kind == "halt_lifted"]
+    assert len(lifted) == 1 and lifted[0].extra["halt_codes"] == ["consecutive_losses"]
+    assert not [e for e in events if e.kind == "startup"]
+    assert any(m.startswith("✅ 신규 진입 재개 [paper]") and "consecutive_losses" in m for m in rig.transport.sent)

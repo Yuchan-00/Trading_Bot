@@ -84,7 +84,7 @@ ROLES: dict[str, RoleSpec] = {
         output_model=BullOutput,
         max_tokens=8000,
         effort="medium",
-        timeout_s=60.0,
+        timeout_s=50.0,
         batched=False,
     ),
     "bear": RoleSpec(
@@ -95,7 +95,7 @@ ROLES: dict[str, RoleSpec] = {
         output_model=BearOutput,
         max_tokens=8000,
         effort="medium",
-        timeout_s=60.0,
+        timeout_s=50.0,
         batched=False,
     ),
     "risk_manager": RoleSpec(
@@ -118,7 +118,7 @@ ROLES: dict[str, RoleSpec] = {
         output_model=RiskOutput,
         max_tokens=12000,
         effort="medium",
-        timeout_s=75.0,
+        timeout_s=65.0,
         batched=True,
     ),
     "head": RoleSpec(

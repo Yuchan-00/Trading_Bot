@@ -133,8 +133,15 @@ def test_main_usage_errors_return_code(tmp_path):
 
 
 def test_main_config_error(tmp_path):
-    code, out, err = call(["status"], tmp_path, env=env_for(tmp_path, MODE="moon"))
+    code, out, err = call(["run", "--once"], tmp_path, env=env_for(tmp_path, MODE="moon"))
     assert code == M.EXIT_USAGE and "설정 오류" in err
+
+
+def test_status_with_config_error_falls_back_to_files(tmp_path):
+    """status 는 stop/clear-stop 처럼 설정 오류여도 DATA_DIR 의 파일만 읽어 출력한다."""
+    code, out, err = call(["status"], tmp_path, env=env_for(tmp_path, MODE="moon"))
+    assert code == M.EXIT_OK and "설정 경고" in err
+    assert "설정 검증 실패" in out and "state.json 없음" in out
 
 
 def test_cycle_minutes_override_and_validation(tmp_path):
@@ -443,7 +450,10 @@ def test_status_corrupt_state(tmp_path):
 def test_status_shows_lock_and_costs(tmp_path):
     _write_state(tmp_path)
     data = tmp_path / "data"
-    (data / "bot.lock").write_text(json.dumps({"pid": os.getpid(), "ts": 1_793_000_000_000}), encoding="utf-8")
+    import socket
+    import time as _time
+    (data / "bot.lock").write_text(json.dumps({"pid": os.getpid(), "ts": int(_time.time() * 1000),
+                                               "host": socket.gethostname()}), encoding="utf-8")
     from tradingbot.llm.cost import CostLedger
     CostLedger(data / "cost_ledger.jsonl", 10, 200).record(role="head", model="claude-opus-5-5", input_tokens=1000,
                                                            cached_tokens=0, output_tokens=100)
@@ -566,3 +576,325 @@ def test_run_once_end_to_end_with_real_cycle(tmp_path):
     assert json.loads((data / "state.json").read_text(encoding="utf-8"))["cycle"] == 1
     assert not (data / "bot.lock").exists()
     assert notifier.kinds()[0] == "startup" and "error" in notifier.kinds() and notifier.kinds()[-1] == "shutdown"
+
+
+# ======================================================================= PERS-8: 잠금 정체 판정(호스트·ts)
+def _write_lock(path: Path, **info) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(info), encoding="utf-8")
+
+
+def test_lock_stale_after_s_formula():
+    assert M.lock_stale_after_s(15) == 2700.0
+    assert M.lock_stale_after_s(5) == 1800.0          # 하한 30분
+    assert M.lock_stale_after_s(60) == 3 * 3600.0
+    assert M.lock_stale_after_s(None) == 2700.0 and M.lock_stale_after_s(0) == 2700.0
+
+
+def test_lock_live_pid_but_stale_ts_is_taken_over(tmp_path):
+    now = 10_000_000_000
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001, host="me", ts=now - 2701 * 1000)
+    lk = M.BotLock(p, pid=1002, pid_alive=lambda pid: True, clock_ms=lambda: now, hostname=lambda: "me",
+                   stale_after_s=M.lock_stale_after_s(15))
+    lk.acquire()
+    assert lk.held and lk.holder()["pid"] == 1002 and lk.holder()["host"] == "me"
+
+
+def test_lock_live_pid_fresh_ts_same_host_is_held(tmp_path):
+    now = 10_000_000_000
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001, host="me", ts=now - 2699 * 1000)
+    lk = M.BotLock(p, pid=1002, pid_alive=lambda pid: True, clock_ms=lambda: now, hostname=lambda: "me",
+                   stale_after_s=2700)
+    with pytest.raises(M.LockHeldError):
+        lk.acquire()
+    assert json.loads(p.read_text())["pid"] == 1001
+
+
+def test_lock_other_host_fresh_ts_is_held(tmp_path):
+    """공유 DATA_DIR: 다른 호스트의 PID 는 검사할 수 없으므로 신선한 ts 가 생존 신호 — 가져오지 않는다."""
+    now = 10_000_000_000
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001, host="old-box", ts=now - 2699 * 1000)
+    lk = M.BotLock(p, pid=1002, pid_alive=lambda pid: False, clock_ms=lambda: now, hostname=lambda: "new-box",
+                   stale_after_s=2700)
+    with pytest.raises(M.LockHeldError, match="old-box"):
+        lk.acquire()
+    assert json.loads(p.read_text())["host"] == "old-box"
+
+
+def test_lock_other_host_stale_ts_is_taken_over(tmp_path, caplog):
+    now = 10_000_000_000
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001, host="old-box", ts=now - 2701 * 1000)
+    lk = M.BotLock(p, pid=1002, pid_alive=lambda pid: True, clock_ms=lambda: now, hostname=lambda: "new-box",
+                   stale_after_s=2700)
+    with caplog.at_level("WARNING", logger="tradingbot.main"):
+        lk.acquire()
+    assert lk.holder()["pid"] == 1002 and lk.holder()["host"] == "new-box"
+    assert any("다른 호스트" in r.getMessage() for r in caplog.records)
+
+
+def test_lock_other_host_without_ts_is_taken_over(tmp_path):
+    now = 10_000_000_000
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001, host="old-box")
+    lk = M.BotLock(p, pid=1002, pid_alive=lambda pid: True, clock_ms=lambda: now, hostname=lambda: "new-box")
+    lk.acquire()
+    assert lk.holder()["pid"] == 1002
+
+
+def test_lock_same_pid_other_host_is_not_reentrant(tmp_path):
+    """같은 PID 숫자라도 다른 호스트의 잠금이면 내 것이 아니다 — ts 가 신선하면 막고, 낡았으면 가져온다.
+    refresh 는 파일의 호스트가 내가 쓴 호스트인지도 본다."""
+    now = 10_000_000_000
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001, host="other", ts=now)
+    lk = M.BotLock(p, pid=1001, pid_alive=lambda pid: True, clock_ms=lambda: now, hostname=lambda: "me")
+    with pytest.raises(M.LockHeldError):
+        lk.acquire()
+    _write_lock(p, pid=1001, host="other", ts=now - 2701 * 1000)
+    lk.acquire()
+    assert lk.holder()["host"] == "me"
+    _write_lock(p, pid=1001, host="other", ts=now)
+    with pytest.raises(C.LockLostError):
+        lk.refresh()
+
+
+def test_lock_host_is_pinned_at_acquire(tmp_path):
+    """실행 중 hostname 이 바뀌어도 파일에는 획득 시점 이름을 계속 쓰고 refresh 는 잠금을 잃지 않는다."""
+    p = tmp_path / "bot.lock"
+    names = ["mac.local"]
+    lk = M.BotLock(p, pid=111, pid_alive=lambda _: True, clock_ms=lambda: 10_000_000_000, hostname=lambda: names[0])
+    lk.acquire()
+    names[0] = "mac-2.local"
+    lk.refresh()
+    lk.refresh()
+    assert lk.holder()["host"] == "mac.local" and lk.held
+
+
+def test_lock_refresh_write_failure_becomes_fatal_before_lock_goes_stale(tmp_path):
+    """ts 쓰기가 계속 실패하면 stale_after_s × LOCK_REFRESH_FAIL_SHARE 전까지는 원래 예외(호출자 WARNING),
+    그 뒤에는 LockLostError(다른 인스턴스가 낡은 잠금으로 가져가기 전에 스스로 멈춘다)."""
+    import errno
+
+    p = tmp_path / "bot.lock"
+    clock = [10_000_000_000]
+    lk = M.BotLock(p, pid=111, pid_alive=lambda _: True, clock_ms=lambda: clock[0], hostname=lambda: "h",
+                   stale_after_s=2700)
+    lk.acquire()
+
+    def broken():
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    lk._write = broken  # type: ignore[method-assign]
+    clock[0] += 1000 * int(2700 * M.LOCK_REFRESH_FAIL_SHARE) - 1000
+    with pytest.raises(OSError):
+        lk.refresh()
+    clock[0] += 2000
+    with pytest.raises(C.LockLostError, match="갱신"):
+        lk.refresh()
+
+
+def test_lock_legacy_without_host_or_ts_uses_pid_rule(tmp_path):
+    p = tmp_path / "bot.lock"
+    _write_lock(p, pid=1001)
+    with pytest.raises(M.LockHeldError):
+        M.BotLock(p, pid=1002, pid_alive=lambda pid: True).acquire()
+
+
+def test_run_takes_over_live_pid_lock_with_stale_ts(tmp_path):
+    """살아 있는 PID(이 테스트 프로세스)라도 ts 가 정체 기준보다 오래되면 run 은 잠금을 가져온다."""
+    import socket
+    import time as _time
+    data = tmp_path / "data"
+    _write_lock(data / "bot.lock", pid=os.getpid(), host=socket.gethostname(),
+                ts=int(_time.time() * 1000) - 2701 * 1000)
+    f = Factory()
+    code, _, err = call(["run", "--once"], tmp_path, factory=f, pid=os.getpid() + 100000)
+    assert code == M.EXIT_OK and f.calls == 1, err
+    assert f.lock.stale_after_s == 2700.0
+
+
+def test_run_refuses_fresh_lock_from_other_host(tmp_path):
+    """공유 DATA_DIR 에서 다른 호스트가 방금 갱신한 잠금은 가져오지 않는다(두 인스턴스 동시 거래 방지)."""
+    import time as _time
+    data = tmp_path / "data"
+    _write_lock(data / "bot.lock", pid=os.getpid(), host="definitely-not-this-host.invalid",
+                ts=int(_time.time() * 1000))
+    f = Factory()
+    code, _, err = call(["run", "--once"], tmp_path, factory=f, pid=os.getpid() + 100000)
+    assert code == M.EXIT_LOCKED and f.calls == 0, err
+
+
+def test_run_takes_over_stale_lock_from_other_host(tmp_path):
+    import time as _time
+    data = tmp_path / "data"
+    _write_lock(data / "bot.lock", pid=os.getpid(), host="definitely-not-this-host.invalid",
+                ts=int(_time.time() * 1000) - 2701 * 1000)
+    f = Factory()
+    code, _, err = call(["run", "--once"], tmp_path, factory=f, pid=os.getpid() + 100000)
+    assert code == M.EXIT_OK and f.calls == 1, err
+
+
+def test_status_marks_stale_lock(tmp_path):
+    import socket
+    data = tmp_path / "data"
+    _write_lock(data / "bot.lock", pid=os.getpid(), host=socket.gethostname(), ts=1_000_000_000_000)
+    _, out, _ = call(["status"], tmp_path)
+    assert f"pid={os.getpid()} (낡음: 갱신이" in out
+    _write_lock(data / "bot.lock", pid=os.getpid(), host="elsewhere.invalid", ts=1_000_000_000_000)
+    _, out, _ = call(["status"], tmp_path)
+    assert "낡음: 다른 호스트(elsewhere.invalid)의 잠금, 갱신이" in out
+    import time as _time
+    _write_lock(data / "bot.lock", pid=999_999_999, host="elsewhere.invalid", ts=int(_time.time() * 1000))
+    _, out, _ = call(["status"], tmp_path)
+    assert "실행 중(다른 호스트 elsewhere.invalid)" in out
+
+
+class CountingLock:
+    def __init__(self, fail_at: int | None = None, exc: BaseException | None = None) -> None:
+        self.n = 0
+        self.fail_at = fail_at
+        self.exc = exc
+
+    def refresh(self) -> None:
+        self.n += 1
+        if self.fail_at is not None and self.n >= self.fail_at:
+            raise self.exc
+
+
+def test_run_loop_refreshes_lock_while_sleeping(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    stop = threading.Event()
+    comp = fake_components(settings, cycle=FakeCycle(stop_after=2, stop_event=stop))
+    lock = CountingLock()
+    waits = []
+    code = M.run_loop(comp, once=False, stop_event=stop, clock=lambda: 1000.0, monotonic=lambda: 0.0, lock=lock,
+                      wait=lambda s: waits.append(s) or False, max_cycles=2)
+    assert code == M.EXIT_OK
+    assert waits == [300.0, 300.0, 205.0]          # 805초 대기를 5분 조각으로
+    assert lock.n == 2                              # 조각 사이마다 ts 갱신
+    assert max(waits) <= M.LOCK_REFRESH_S
+
+
+def test_run_loop_uses_cycle_lock_by_default(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    cyc = FakeCycle()
+    cyc.lock = CountingLock()
+    comp = fake_components(settings, cycle=cyc)
+    waits = []
+    M.run_loop(comp, once=False, stop_event=threading.Event(), clock=lambda: 1000.0, monotonic=lambda: 0.0,
+               wait=lambda s: waits.append(s) or False, max_cycles=2)
+    assert waits == [300.0, 300.0, 205.0] and cyc.lock.n == 2
+
+
+def test_run_loop_lock_lost_while_sleeping_is_fatal(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    comp = fake_components(settings, cycle=FakeCycle())
+    lock = CountingLock(fail_at=1, exc=C.LockLostError("taken"))
+    code = M.run_loop(comp, once=False, stop_event=threading.Event(), clock=lambda: 1000.0, monotonic=lambda: 0.0,
+                      lock=lock, wait=lambda s: False, max_cycles=5)
+    assert code == M.EXIT_ERROR and comp.cycle.n == 1
+    assert comp.notifier.kinds() == ["error", "shutdown"]
+    assert comp.notifier.events[0].extra["stage"] == "lock_refresh"
+
+
+def test_run_loop_lock_refresh_oserror_while_sleeping_continues(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    comp = fake_components(settings, cycle=FakeCycle())
+    lock = CountingLock(fail_at=1, exc=OSError("disk"))
+    code = M.run_loop(comp, once=False, stop_event=threading.Event(), clock=lambda: 1000.0, monotonic=lambda: 0.0,
+                      lock=lock, wait=lambda s: False, max_cycles=2)
+    assert code == M.EXIT_OK and comp.cycle.n == 2
+
+
+def test_run_loop_stop_during_chunked_sleep(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    comp = fake_components(settings, cycle=FakeCycle())
+    lock = CountingLock()
+    calls = []
+    code = M.run_loop(comp, once=False, stop_event=threading.Event(), clock=lambda: 1000.0, monotonic=lambda: 0.0,
+                      lock=lock, wait=lambda s: calls.append(s) or len(calls) == 2)
+    assert code == M.EXIT_OK and calls == [300.0, 300.0] and lock.n == 1
+    assert "신호" in comp.notifier.events[-1].reason
+
+
+# ======================================================================= 하트비트 kind 'heartbeat'
+def test_heartbeat_event_fields(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    comp = fake_components(settings)
+    st = comp.portfolio.state
+    st.cycle = 12
+    st.paper_quote_balance = 9_000.0
+    st.positions["ETH/USDT"] = Position(symbol="ETH/USDT", base_amount=5.0, entry_price=200.0, quote_spent=1000.0, opened_ts=1,
+                                        opened_cycle=3, stop_loss_price=196.0, take_profit_price=208.0,
+                                        last_mark=210.0)
+    st.daily.realized_pnl = -5.0
+    st.daily.llm_cost_usd = 0.75
+
+    class Port(type(comp.portfolio)):
+        def equity(self, marks, quote_balance=None):
+            return self.state.paper_quote_balance + 5.0 * 210.0
+    comp.portfolio.__class__ = Port
+
+    class Ledger:
+        def spent_today(self):
+            return 1.25
+    comp.ledger = Ledger()
+    e = M.heartbeat_event(comp)
+    assert e.kind == "heartbeat" and e.equity == pytest.approx(10_050.0)
+    assert e.pnl_quote == pytest.approx(50.0) and e.pnl_pct == pytest.approx(0.005)
+    x = e.extra
+    assert x["heartbeat"] is True and x["cycle"] == 12 and x["kill_switch"] is False
+    assert x["positions"] == [{"symbol": "ETH/USDT", "unrealized_pct": pytest.approx(0.05),
+                               "value_quote": pytest.approx(1050.0)}]
+    assert x["exposure_pct"] == pytest.approx(1050.0 / 10_050.0)
+    assert x["llm_cost_today_usd"] == 1.25 and x["realized_pnl"] == -5.0
+    from tradingbot.notify import Notifier
+    text = Notifier.format(e)
+    assert text.startswith("💓 하트비트 [paper]") and "ETH/USDT 미실현 +5.00%" in text and "$1.25" in text
+    comp.ledger = None
+    assert M.heartbeat_event(comp).extra["llm_cost_today_usd"] == 0.75    # 원장 없으면 상태 값
+
+
+def test_run_loop_heartbeat_kind(tmp_path):
+    settings = load_settings(env_for(tmp_path))
+    clock = {"t": 0.0}
+
+    def mono():
+        clock["t"] += 3 * 3600.0
+        return clock["t"]
+    comp = fake_components(settings, cycle=FakeCycle())
+    M.run_loop(comp, once=False, stop_event=threading.Event(), clock=lambda: 0.0, monotonic=mono, max_cycles=4,
+               wait=lambda s: False)
+    hb = [e for e in comp.notifier.events if e.kind == "heartbeat"]
+    assert hb and not [e for e in comp.notifier.events if e.kind == "daily_summary"]
+    assert hb[0].extra["positions"] == [] and hb[0].equity == 10_000.0
+
+
+# ======================================================================= read_env 공개 / Fear&Greed 연결
+def test_read_env_public_and_alias(tmp_path, monkeypatch):
+    from tradingbot import config
+    assert config._read_env is config.read_env
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("TB_TEST_ONLY_X=from_dotenv\nTB_TEST_ONLY_Y=dotenv_y\n", encoding="utf-8")
+    monkeypatch.setenv("TB_TEST_ONLY_Y", "env_wins")
+    got = config.read_env(dotenv)
+    assert got["TB_TEST_ONLY_X"] == "from_dotenv" and got["TB_TEST_ONLY_Y"] == "env_wins"
+
+
+def test_build_components_wires_fear_greed_fetcher(tmp_path):
+    from tradingbot.sentiment_sources import FearGreedFetcher
+    settings = load_settings(env_for(tmp_path))
+    comp = M.build_components(settings)
+    fg = comp.cycle.scanner.fear_greed_fetcher
+    assert isinstance(fg, FearGreedFetcher)
+    assert fg.cache_path == tmp_path / "data" / "cache" / "fear_greed.json"
+
+
+def test_build_components_offline_fixture_has_no_fear_greed(tmp_path):
+    settings = M.offline_fixture_settings(load_settings(env_for(tmp_path)))
+    comp = M.build_components(settings, offline_fixture=True)
+    assert comp.cycle.scanner.fear_greed_fetcher is None

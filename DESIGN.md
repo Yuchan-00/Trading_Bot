@@ -45,13 +45,14 @@
 - **G1 후보 사전게이트**: technical.direction==long ∧ mtf_agreement ∧ confidence≥0.55 ∧ noise_check, 또는 derivatives washout_setup ∧ direction≠avoid. 탈락: block_new_longs, stop_inside_cascade, 연쇄청산 위험 high(2% 이내 군집), 뉴스 risk_event, 종합심리>80(평균회귀 셋업 제외), 포지션 3개, |상관|>0.8인 보유 종목.
 - **G2 약세 킬**: bear.verdict==decline → 탈락(사유 기록, 저널이 반사실 추적).
 - **G3 리스크 거부(코드가 다시 강제)**: veto 탈락, FUSED 사이즈 50%·하한 0.75, 쇠퇴/과매매·추격 심함 → 하한 0.75 또는 진입 중단, 주문액 > 24h 거래대금/96의 5% → 축소/차단, 스프레드·깊이 부족 차단, 예상 슬리피지+2×수수료 > 손절거리 25% 차단, CVaR 기반 사이즈 상한.
-- **G4 최종**: 총괄 확신도 ≥ 하한(0.65/0.75), 사이즈 ≤ 리스크 상한 ≤ 10%, 손절 ≤ 2%, 익절 ≤ 4%, 순손익비 ≥ 1.5(손절만 조임), 최소 주문액. 위반은 HOLD로 강등 + 사유 텔레그램.
+- **G4 최종**: 총괄 확신도 ≥ 하한(0.65/0.75), 사이즈 ≤ 리스크 상한 ≤ 10%, 손절 ≤ 2%, 익절 ≤ 4%, 순손익비 ≥ 1.5(손절만 조임), 조여진 최종 손절 기준 실행비용 ≤ 25% 재검사(MONEY-7; G3 가 잰 실효 비용을 리스크 팩에 남겨 같은 값으로 본다), 최소 주문액. 위반은 HOLD로 강등 + 사유 텔레그램.
 
 ## 4. Claude API 사용 규칙 (`llm/anthropic_backend.py`)
 
-- `client.messages.parse(... output_format=<pydantic>)` 구조화 출력. `tool_choice` 강제 없음, `thinking` 미지정(5.5 계열 기본 adaptive), `output_config.effort`로 깊이 제어(분석 low, 리서치 medium, 총괄 high).
+- `client.messages.parse(... output_format=<pydantic>)` 구조화 출력. `tool_choice` 강제 없음, `thinking` 미지정(5.5 계열 기본 adaptive), `output_config.effort`로 깊이 제어(분석 low, 리서치 medium, 총괄 medium — SPEC v2.1 CLAUDE-API-4).
 - 시스템 프롬프트(역할 프롬프트 + 스킬 본문)는 **바이트 고정** + `cache_control {ephemeral, ttl 1h}`. 변동 데이터는 전부 user 메시지(JSON, `sort_keys`). 15분 주기라 1시간 TTL이 5분보다 싸다.
-- 타임아웃: Haiku 25~30s, Sonnet 45~60s, Opus 90s. 재시도는 백엔드가 직접 최대 2회, 역할 타임아웃(과 사이클 기한) 안에서만 한다(SDK `max_retries=0`, 타임아웃 뒤 재시도 없음). 호출 전 예산 검사는 system 프롬프트를 캐시 쓰기 단가 × 토크나이저 여유 1.3 으로 잡는다. 실패·거부·max_tokens → 기권.
+- **thinking 과 max_tokens(CLAUDE-API-4)**: Opus 5.5 는 thinking 을 끌 수 없고 thinking 토큰이 `max_tokens` 에 포함된다(thinking 이 켜진 다른 티어도 토큰 계산은 같다). 출력 JSON 크기만 보고 잡은 예산은 생각만 하다 `stop_reason=max_tokens` 로 기권한다. 그래서 역할 예산을 technical 6000, journal 6000, derivatives_flow·news_sentiment·bull·bear 8000, risk_manager 12000(medium), head 16000 으로 올렸다. 총괄 effort 는 'high' 가 아니라 Opus 5.5 기본값 'medium' 이다: 'high' 는 15분 주기의 300초 사이클 기한 안에 끝나지 않을 만큼 오래 생각하고, 기한에 걸린 총괄은 HOLD 일 뿐이다. 순차 4단계 타임아웃 합(분석가 35 + bull/bear 50 + risk 65 + head 120 = 270s)이 실제 LLM 예산(300s − 예비 25s = 275s, 스캔 시간은 더 빠짐) 안에 들어 앞 단계가 타임아웃까지 가도 총괄이 자기 몫을 받고, 실제로는 `set_deadline`(기한 − 경과 − 25s 예비)이 각 호출 타임아웃을 남은 시간으로 자르고 `should_stop` 이 단계 경계에서 멈추므로 파이프라인 전체가 사이클 기한을 넘지 않는다. 예산 사전검사가 `max_tokens` 전부를 출력 비용으로 잡으므로 일일 예산이 빠듯하면 더 일찍 막힌다.
+- 타임아웃: Haiku 25~30s, Sonnet 45~65s(bull/bear 50s, risk_manager 65s), Opus 120s(head). 재시도는 백엔드가 직접 최대 2회, 역할 타임아웃(과 사이클 기한) 안에서만 한다(SDK `max_retries=0`, 타임아웃 뒤 재시도 없음). 호출 전 예산 검사는 system 프롬프트를 캐시 쓰기 단가 × 토크나이저 여유 1.3 으로 잡는다. 실패·거부·max_tokens → 기권.
 - 비용 원장(`cost_ledger.jsonl`): 호출마다 토큰·비용 기록, 호출 전 예산 검사. 인증 실패 → LLM 60분 일시정지.
 - 비밀값은 SDK 클라이언트에만 전달. 프롬프트·로그·텔레그램·예외 메시지에 키가 들어가지 않는다(마스킹 테스트).
 - 서버측 refusal fallback은 쓰지 않는다(거부는 HOLD로 충분하고 모델 티어를 고정하는 편이 비용·재현성에 낫다). 필요하면 설정으로 추가 가능.
@@ -71,6 +72,8 @@
 ## 7. 텔레그램 이벤트 (`notify.py`)
 
 진입 체결 / 청산 체결(모든 사유, 손익) / 부분체결·거부·거래소 오류 / 하드 게이트에 의한 강등(총괄 BUY→HOLD, 리스크 거부, 약세 킬) / 중단·해제(일일 한도·연속손실·낙폭 사다리·킬스위치·진입 일시중단) / 레짐 전환 / 뉴스 risk_event / 포지션 건강도 하락·레드라인 / 일일 리뷰 / 운영(시작·종료·크래시·LLM 일시정지·사이클 기한 초과·데이터 품질) / 하트비트(기본 4시간).
+
+중단·해제는 전용 종류 `halt`(⛔ 신규 진입 중단 + 코드별 한국어 사유 + 자본) / `halt_lifted`(✅ 신규 진입 재개)로, 하트비트는 `heartbeat`(💓: 자본·당일 손익·포지션별 미실현 %·노출 %·오늘 LLM 비용)로 보낸다. 구버전 표현(`error`+code=halt, `startup`+event=halt_lifted, `daily_summary`+heartbeat)도 같은 모양으로 그린다.
 
 ## 8. 대시보드 (`dashboard/`)
 

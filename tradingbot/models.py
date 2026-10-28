@@ -16,6 +16,7 @@ Side = Literal["buy", "sell"]
 EventKind = Literal[
     "entry", "exit", "partial_exit", "order_rejected", "kill_switch", "budget_exceeded",
     "daily_summary", "error", "startup", "shutdown", "llm_paused",
+    "halt", "halt_lifted", "heartbeat",
 ]
 
 

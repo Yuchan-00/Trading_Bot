@@ -20,6 +20,8 @@
    논지·진입 판단 스냅샷(실패해도 체결·저장·알림에 영향 없음). G4 강등은 notify(order_rejected, "gate_downgrade: ...").
    HOLD 는 로그만.
 8. 결정 로그(``logs/decisions.jsonl``), 사이클 보고서(``logs/cycles/``), 상태 저장, ``CycleSummary`` 반환.
+9. 경보(DESIGN §7, ``kind="alert"``): 상태 저장 뒤 레짐 전환·뉴스 위험·포지션 점검을 판정하고
+   ``alert_state.json`` 에 기록한 다음 notify 한다(재시작해도 같은 경보를 다시 보내지 않는다; 실패는 사이클을 멈추지 않는다).
 
 체결 안전장치(testnet/live)
 - 주문 뒤 브로커가 예외를 내도 주문 전후 거래소 잔고 변화로 체결을 확인하면 그 체결로 기록한다(손절 없는 고아 보유·
@@ -56,7 +58,16 @@ from tradingbot import journal as J
 from tradingbot import reports
 from tradingbot import risk
 from tradingbot.agents import payloads as P
-from tradingbot.agents.pipeline import CandidateContext, NewsStore, PipelineResult, effective_gate, run_pipeline
+from tradingbot.agents.pipeline import (
+    HEALTH_FLAG_MAX,
+    NEWS_RISK_SCORE,
+    CandidateContext,
+    NewsStore,
+    PipelineResult,
+    effective_gate,
+    run_pipeline,
+    snap_news_score,
+)
 from tradingbot.agents.runner import AgentRunner, _raised_from_cost_ledger
 from tradingbot.agents.schemas import HeadDecision, Thesis
 from tradingbot.config import ConfigError, HardLimits, Settings, mask_secret
@@ -66,7 +77,7 @@ from tradingbot.llm.backend import AgentBackend
 from tradingbot.llm.cost import BudgetExceeded, CostLedger
 from tradingbot.models import ClosedTrade, ExitReason, Fill, OrderRequest, Position, TradeEvent
 from tradingbot.notify import STATE_SAVE_WARNING, Notifier  # noqa: F401 - STATE_SAVE_WARNING 재노출(호환)
-from tradingbot.portfolio import PARTIAL_FILL_TOLERANCE, CorruptStateError, Portfolio
+from tradingbot.portfolio import PARTIAL_FILL_TOLERANCE, CorruptStateError, Portfolio, _fsync_dir
 from tradingbot.scanner import ScanResult, Scanner
 from tradingbot.skills import SkillRegistry
 
@@ -114,6 +125,15 @@ RECOVERY_MIN_SHARE = 0.01                # 주문 예외 뒤 잔고 변화가 �
 # G0 중단 알림에서 뺄 코드: 포지션 수·펀딩 창은 일상적, 킬스위치·예산·LLM 일시정지는 각자 알림이 따로 있다
 HALT_SILENT_CODES = frozenset({"max_positions", "funding_window", "kill_switch", "drawdown_stop_all",
                                "llm_budget", "llm_paused"})
+ALERT_STATE_FILENAME = "alert_state.json"   # 경보 중복 방지 상태(마지막 레짐·뉴스 위험 키·포지션 점검 조건)
+NEWS_ALERT_DEDUPE_MS = 24 * 3_600_000    # 같은 심볼+헤드라인 뉴스 위험 경보는 24h 에 한 번
+NEWS_ALERT_NO_HEADLINE = "risk_event"    # 이벤트 없이 risk_event_symbols 로만 들어온 뉴스 위험의 헤드라인 키
+HEALTH_ALERT_MAX = HEALTH_FLAG_MAX       # 건강도 ≤4 → 포지션 점검 경보
+HEALTH_ALERT_RECOVER = HEALTH_ALERT_MAX + 2   # 경보 중이면 건강도 ≥6 이어야 해소(4/5 진동에 반복 경보하지 않게)
+HEALTH_ALERT_DECLINE_STEP = 2            # 경보 중 마지막으로 알린 건강도보다 2 이상 더 떨어지면 다시 경보
+HEALTH_ACTION_NAMES: tuple[str, ...] = ("hold", "trim", "exit")
+HEALTH_ACTION_RANK: dict[str, int] = {a: i for i, a in enumerate(HEALTH_ACTION_NAMES)}  # 조치가 강해지면 다시 경보
+REGIME_FLAP_COOLDOWN_MS = 3_600_000      # 직전 판정으로 되돌아가는 레짐 전환·해제된 NAME 알람 재경보는 1h 뒤
 
 
 # ======================================================================= 예외·요약
@@ -332,6 +352,8 @@ class Cycle:
         self._reconcile_strikes: dict[str, int] = {}  # 거래소 잔고 < 장부 가 연속 관찰된 횟수(일시 오류 방지)
         self.series_path = self.data_dir / EQUITY_SERIES_FILENAME
         self._series: dict[str, Any] = self._load_series()
+        self.alert_state_path = self.data_dir / ALERT_STATE_FILENAME
+        self._alert_state: dict[str, Any] = self._load_alert_state()
         self._secrets = tuple(s for s in (settings.anthropic_api_key, settings.binance_api_key,
                                           settings.binance_api_secret, settings.telegram_bot_token) if s)
 
@@ -711,6 +733,346 @@ class Cycle:
             self._notify(self._event("halt_lifted", run, reason=f"신규 진입 중단 해제: {', '.join(lifted)}",
                                      equity=eq, extra={"stage": "g0", "event": "halt_lifted", "halt_codes": lifted}))
 
+    # ------------------------------------------------------------ 경보(DESIGN §7: 레짐·뉴스 위험·포지션 점검)
+    def _load_alert_state(self) -> dict[str, Any]:
+        """``alert_state.json``: {"regime": 마지막으로 알린 판정(키가 없으면 첫 실행), "regime_prev": 그 직전 판정,
+        "regime_ts": 마지막 레짐 경보 시각, "name_alarm": {심볼: 시각}, "news": {"심볼|헤드라인": ts},
+        "health": {심볼: 조건 기록}}. 손상·없음·형식 오류 → 빈 상태(첫 실행처럼 동작; 예외를 밖으로 내지 않는다)."""
+        p = self.alert_state_path
+        try:
+            if not p.is_file():
+                return self._empty_alert_state()
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            return self._parse_alert_state(obj)
+        except Exception as exc:  # noqa: BLE001 - OSError·ValueError·RecursionError·형식 오류 모두 새로 시작
+            log.warning("경보 상태 파일을 읽지 못함(%s) — 새로 시작", type(exc).__name__)
+            return self._empty_alert_state()
+
+    @staticmethod
+    def _empty_alert_state() -> dict[str, Any]:
+        return {"news": {}, "health": {}, "name_alarm": {}}
+
+    @staticmethod
+    def _parse_alert_state(obj: Any) -> dict[str, Any]:
+        out = Cycle._empty_alert_state()
+        if not isinstance(obj, Mapping):
+            return out
+
+        def _ts_map(raw: Any) -> dict[str, int]:
+            res: dict[str, int] = {}
+            if isinstance(raw, Mapping):
+                for k, v in raw.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool) and _finite(v):
+                        res[str(k)] = int(float(v))
+            return res
+
+        out["news"] = _ts_map(obj.get("news"))
+        out["name_alarm"] = _ts_map(obj.get("name_alarm"))
+        health = obj.get("health")
+        if isinstance(health, Mapping):
+            out["health"] = {str(k): v for k, v in health.items() if isinstance(v, str)}
+        for key in ("regime", "regime_prev"):
+            v = obj.get(key)
+            if isinstance(v, str) and v:
+                out[key] = v
+        ts = obj.get("regime_ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and _finite(ts):
+            out["regime_ts"] = int(float(ts))
+        return out
+
+    def _save_alert_state(self, run: _Run) -> None:
+        """tmp → fsync → replace → 디렉터리 fsync(state.json·저널·뉴스 저장소와 같은 내구성)."""
+        p = self.alert_state_path
+        tmp = p.with_name(p.name + ".tmp")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self._alert_state, ensure_ascii=False, sort_keys=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:  # 일부 파일시스템은 fsync 미지원
+                    pass
+            os.replace(tmp, p)
+            _fsync_dir(p.parent)
+        except OSError as exc:
+            # 보조 상태 — 사이클을 멈추지 않는다(다음 사이클에 같은 경보가 다시 갈 수는 있다)
+            run.errors.append(f"alert_state_save: {type(exc).__name__}")
+            log.error("경보 상태 저장 실패 type=%s", type(exc).__name__)
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    def _emit_alerts(self, run: _Run) -> None:
+        """경보를 판정하고, 중복 방지 상태를 먼저 저장한 뒤 notify 한다(각 판정 실패는 서로 막지 않는다)."""
+        events: list[TradeEvent] = []
+        for name, fn in (("regime", self._regime_alerts), ("news_risk", self._news_risk_alerts),
+                         ("position_health", self._health_alerts)):
+            try:
+                events.extend(fn(run))
+            except Exception as exc:  # noqa: BLE001 - 경보 판정 실패는 사이클을 죽이지 않는다
+                run.errors.append(f"alert:{name}: {type(exc).__name__}")
+                log.error("경보 판정 실패 alert=%s type=%s", name, type(exc).__name__)
+        self._save_alert_state(run)
+        for ev in events:
+            self._notify(ev)
+
+    @staticmethod
+    def _effective_regime(rg: Any) -> str:
+        """G3 가 실제로 적용하는 레짐 규칙(gates.g3_portfolio 와 같은 판정): macro_alarm → 신규 진입 금지,
+        ``verdict == "fused"`` 또는 ``fused is True`` → FUSED(×0.5·하한 0.75), 그 밖에는 normal.
+        BTC 데이터 실패로 scanner 가 verdict 만 normal 로 바꾸고 fused=True 를 남기면 FUSED 규칙이 그대로다."""
+        v = str(getattr(rg, "verdict", "") or "")
+        if v == "macro_alarm":
+            return "macro_alarm"
+        if v == "fused" or getattr(rg, "fused", None) is True:
+            return "fused"
+        return "normal"
+
+    def _held_symbols(self, run: _Run) -> set[str]:
+        res = run.result
+        held = set(self.state.positions)
+        if res is not None:
+            held |= {pc.symbol for pc in res.positions}
+        return held
+
+    def _regime_alerts(self, run: _Run) -> list[TradeEvent]:
+        """레짐(G3 가 적용하는 규칙 기준) 이 마지막으로 알린 판정과 다르면 한 번. 기록이 없는 첫 실행은 normal 이
+        아닐 때만. 직전 판정으로 되돌아가는 전환은 마지막 경보 뒤 ``REGIME_FLAP_COOLDOWN_MS`` 동안 미룬다(임계값
+        근처 진동 방지 — 그 뒤에도 다르면 그때 알린다). 보유 종목에 새 NAME 알람이 생기면 판정이 같아도 알린다."""
+        scan = run.scan
+        if scan is None:
+            return []
+        rg = scan.regime
+        now = int(run.now_ms)
+        new = self._effective_regime(rg)
+        raw = str(rg.verdict)
+        st = self._alert_state
+        first = "regime" not in st
+        old = st.get("regime")
+        changed = False
+        if first:
+            st["regime"] = new
+            changed = new != "normal"
+        elif old != new:
+            last_ts = st.get("regime_ts")
+            flap = (new == st.get("regime_prev") and isinstance(last_ts, int)
+                    and now - last_ts < REGIME_FLAP_COOLDOWN_MS)
+            if flap:
+                log.info("레짐 %s → %s 되돌림 — 경보 보류(마지막 경보 뒤 %ds)", old, new, (now - last_ts) // 1000)
+            else:
+                changed = True
+        if changed:
+            st["regime_prev"] = None if first else old
+            if st["regime_prev"] is None:
+                st.pop("regime_prev", None)
+            st["regime"] = new
+            st["regime_ts"] = now
+
+        # 보유 종목 NAME 알람(신규 진입 금지·총괄 SELL 전량) — 심볼당 한 번, 해제 뒤 쿨다운이 지나야 다시
+        alarms = [str(s) for s in (rg.name_alarm_symbols or [])]
+        st_na: dict[str, int] = st.setdefault("name_alarm", {})
+        for k in [k for k, ts in st_na.items() if k not in alarms and now - int(ts) >= REGIME_FLAP_COOLDOWN_MS]:
+            st_na.pop(k, None)
+        held = self._held_symbols(run)
+        held_alarms = sorted(s for s in set(alarms) if s in held)
+        new_alarms = [s for s in held_alarms if s not in st_na]
+        for s in held_alarms:
+            if changed or s in new_alarms:
+                st_na[s] = now
+        if not changed and not new_alarms:
+            return []
+        extra = {"alert": "regime", "verdict_changed": changed,
+                 "old_verdict": (None if first else old) if changed else new, "new_verdict": new,
+                 "raw_verdict": raw, "fused": bool(rg.fused),
+                 "btc_shock": bool(rg.btc_shock), "name_alarm_symbols": alarms,
+                 "name_alarm_held_new": new_alarms,
+                 "btc_regime_4h": rg.btc_regime_4h,
+                 "avg_pairwise_corr_1h": rg.avg_pairwise_corr_1h if _finite(rg.avg_pairwise_corr_1h) else None}
+        if changed:
+            log.info("레짐 전환 %s → %s", extra["old_verdict"], new)
+            reason = f"regime {extra['old_verdict']} -> {new}"
+        else:
+            log.info("보유 종목 NAME 알람 %s", ",".join(new_alarms))
+            reason = f"name_alarm {','.join(new_alarms)}"
+        return [self._event("alert", run, reason=reason, extra=extra)]
+
+    def _news_risk_alerts(self, run: _Run) -> list[TradeEvent]:
+        """관심 종목(설정 SYMBOLS·스캔 유니버스)이나 보유 종목이 뉴스 위험 집합에 들어오면 심볼+헤드라인당 24h 에 한 번.
+        헤드라인은 그 심볼의 뉴스 위험 이벤트(점수 ≤ −0.66)만 쓴다 — 없으면(risk_event_symbols 로만 들어옴) 고정 키
+        ``risk_event`` 이고, 같은 심볼을 24h 안에 이미 알렸으면(이벤트가 위험 심볼보다 먼저 만료된 경우 등) 다시 알리지 않는다."""
+        res = run.result
+        st_news: dict[str, int] = self._alert_state.setdefault("news", {})
+        now = int(run.now_ms)
+        for k in [k for k, ts in st_news.items() if now - int(ts) >= NEWS_ALERT_DEDUPE_MS]:
+            st_news.pop(k, None)
+        if res is None or not res.news_risk_symbols:
+            return []
+        held = self._held_symbols(run)
+        watch = set(self.settings.symbols) | held
+        if run.scan is not None:
+            watch |= set(run.scan.universe)
+        pcs = {pc.symbol: pc for pc in res.positions}
+        try:
+            active = self.news_store.active_events(now)
+        except Exception:  # noqa: BLE001 - 저장소 조회 실패면 헤드라인 없이 알린다
+            active = []
+        out: list[TradeEvent] = []
+        for sym in sorted(set(res.news_risk_symbols)):
+            if sym not in watch:
+                continue
+            ev = self._worst_news_event(sym, active)
+            hid = str(ev.get("headline_id")) if ev is not None and ev.get("headline_id") else NEWS_ALERT_NO_HEADLINE
+            key = f"{sym}|{hid}"
+            if key in st_news:
+                continue
+            if hid == NEWS_ALERT_NO_HEADLINE and any(k.split("|", 1)[0] == sym for k in st_news):
+                continue                     # 같은 심볼 위험을 24h 안에 이미 알림(헤드라인만 먼저 만료)
+            st_news[key] = now
+            pc = pcs.get(sym)
+            is_held = sym in held
+            extra: dict[str, Any] = {
+                "alert": "news_risk", "headline_id": None if ev is None else hid,
+                "event_type": ev.get("event_type") if ev is not None else None,
+                "score": snap_news_score(ev.get("score")) if ev is not None else None,
+                "summary": self._scrub(ev.get("summary"))[:500] if ev is not None and ev.get("summary") else None,
+                "held": is_held,
+                "flagged_for_head": bool(pc.flagged_for_head) if pc is not None else None,
+                "flag_reason": pc.flag_reason if pc is not None else None,
+            }
+            log.info("뉴스 위험 경보 %s headline=%s", sym, hid)
+            out.append(self._event("alert", run, symbol=sym, reason=f"news_risk {sym}", extra=extra))
+        return out
+
+    @staticmethod
+    def _worst_news_event(symbol: str, events: list[dict]) -> dict | None:
+        """심볼을 언급한 만료 전 뉴스 위험 이벤트(점수 ≤ −0.66, 묵지 않음) 중 가장 낮은 점수·최신. 없으면 None
+        (중립 기사를 위험 근거로 보여주거나 새 기사마다 키가 바뀌지 않게)."""
+        def _score(e: Mapping) -> float:
+            v = snap_news_score(e.get("score"))
+            return float(v) if v is not None else 0.0
+
+        risky = [e for e in events if isinstance(e, Mapping) and P._symbol_in(symbol, e.get("symbols") or [])
+                 and _score(e) <= NEWS_RISK_SCORE and not e.get("stale")]
+        if not risky:
+            return None
+        return dict(min(risky, key=lambda e: (_score(e), -int(e.get("ts") or 0), str(e.get("headline_id") or ""))))
+
+    @staticmethod
+    def _red_line_key(hit: str) -> str:
+        """레드라인 적중 문구에서 현재값을 뺀 규칙 부분(조건 서명용 — 현재값이 바뀌어도 같은 조건)."""
+        return str(hit).split(" — 현재", 1)[0].strip()
+
+    @staticmethod
+    def _health_record(raw: Any) -> dict[str, Any] | None:
+        """저장된 조건 기록(JSON 문자열) → {low, red, health, act}. 구버전({low, red})·손상은 기본값으로."""
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            obj = json.loads(raw)
+        except (ValueError, RecursionError):
+            obj = None
+        if not isinstance(obj, Mapping):
+            return {"low": False, "red": [], "health": None, "act": -1}
+        h = obj.get("health")
+        a = obj.get("act")
+        red = obj.get("red")
+        return {"low": obj.get("low") is True,
+                "red": sorted({str(x) for x in red}) if isinstance(red, list) else [],
+                "health": int(h) if isinstance(h, int) and not isinstance(h, bool) else None,
+                "act": int(a) if isinstance(a, int) and not isinstance(a, bool) else -1}
+
+    def _health_alerts(self, run: _Run) -> list[TradeEvent]:
+        """보유 포지션의 건강도 ≤4 이거나 코드 레드라인이 적중하면 조건이 나빠질 때마다 한 번(매 사이클 아님).
+
+        - 건강도: ≤4 로 내려오면 경보, ``HEALTH_ALERT_RECOVER`` 이상이어야 해소(히스테리시스 — 4/5 진동 방지).
+          경보 중 마지막으로 알린 건강도보다 ``HEALTH_ALERT_DECLINE_STEP`` 이상 더 떨어지거나 리스크 조치가
+          hold → trim → exit 로 강해지면 다시 알린다. 리스크 관리자 기권이면 건강도 조건은 지난 판정 유지.
+        - 레드라인: 새 규칙이 적중하면 경보. 이번 사이클에 레드라인을 평가하지 못했으면(파이프라인 조기 종료·평가
+          실패) 지난 기록을 유지한다(빈 적중을 '해소'로 읽지 않는다).
+        - 모두 해소되면 기록 삭제(다시 나빠지면 새로 알림). 개선만 된 변화는 기록만 고친다."""
+        st_h: dict[str, str] = self._alert_state.setdefault("health", {})
+        res = run.result
+        out: list[TradeEvent] = []
+        for pc in (res.positions if res is not None else []):
+            sym = pc.symbol
+            prev = self._health_record(st_h.get(sym))
+            prev_low = bool(prev and prev["low"])
+            prev_red: list[str] = list(prev["red"]) if prev else []
+            prev_health = prev["health"] if prev else None
+            prev_act = int(prev["act"]) if prev else -1
+            risk_view = pc.risk
+            health = int(risk_view.health) if risk_view is not None else None
+            if health is None:
+                low = prev_low
+            elif prev_low:
+                low = health < HEALTH_ALERT_RECOVER
+            else:
+                low = health <= HEALTH_ALERT_MAX
+            checked = bool(getattr(pc, "red_lines_checked", True))
+            red_keys = sorted({self._red_line_key(h) for h in pc.red_line_hits}) if checked else prev_red
+            if not low and not red_keys:
+                st_h.pop(sym, None)          # 조건 해소 → 다시 나빠지면 새로 알린다
+                continue
+            act = HEALTH_ACTION_RANK.get(str(risk_view.action), -1) if risk_view is not None else -1
+            became_low = low and not prev_low
+            new_red = sorted(set(red_keys) - set(prev_red))
+            declined = (low and prev_low and health is not None and prev_health is not None
+                        and health <= prev_health - HEALTH_ALERT_DECLINE_STEP)
+            escalated = prev is not None and act >= 1 and act > prev_act
+            alert = prev is None or became_low or bool(new_red) or declined or escalated
+            if alert:
+                rec_health = health if low and health is not None else (prev_health if low else None)
+                rec_act = max(prev_act, act)
+            else:
+                rec_health = prev_health if low else None
+                rec_act = prev_act
+            st_h[sym] = json.dumps({"low": low, "red": red_keys, "health": rec_health, "act": rec_act},
+                                   ensure_ascii=False, sort_keys=True)
+            if not alert:
+                continue
+            pos = self.state.positions.get(sym)
+            upct = None
+            if pos is not None:
+                upct = P.unrealized_pct(pos.entry_price, self._mark_for(run, pos))
+            else:
+                done = next((x for x in reversed(run.exits) if x.get("symbol") == sym), None)
+                if done is not None and _finite(done.get("pnl_pct")):
+                    upct = float(done["pnl_pct"]) * 100.0
+            hits = list(pc.red_line_hits) if checked else list(prev_red)
+            reds = list(dict.fromkeys([*hits, *(risk_view.red_lines_triggered if risk_view else [])]))
+            head: dict[str, Any] | None = None
+            d = res.decision_for(sym) if res is not None else None
+            if d is not None:
+                act_rec = run.actions.get(sym) or {}
+                head = {"action": d.action, "confidence": d.confidence, "rationale": self._scrub(d.rationale)[:300]}
+                if d.action in ("SELL", "BUY"):
+                    head["executed"] = bool(act_rec.get("executed")) and act_rec.get("action") == d.action
+            worse: dict[str, Any] = {}
+            if declined:
+                worse["health"] = [prev_health, health]
+            if escalated and prev_act >= 0:
+                worse["risk_action"] = [HEALTH_ACTION_NAMES[prev_act], HEALTH_ACTION_NAMES[act]]
+            extra: dict[str, Any] = {
+                "alert": "position_health", "health": health, "health_low": low,
+                "red_lines": [self._scrub(r)[:200] for r in reds],
+                "risk_action": risk_view.action if risk_view is not None else None,
+                "risk_reason": self._scrub(risk_view.reason)[:200] if risk_view is not None else None,
+                "assumption_status": list(risk_view.assumption_status) if risk_view is not None else [],
+                "unrealized_pct": upct if _finite(upct) else None,
+                "flag_reason": pc.flag_reason, "head_decision": head,
+                "worsened": worse or None,
+            }
+            log.info("포지션 점검 경보 %s health=%s red=%d", sym, health, len(red_keys))
+            out.append(self._event("alert", run, symbol=sym, reason=f"position_health {sym}", extra=extra))
+        # 보유하지 않는 심볼의 조건 기록은 지운다(다시 사면 새로 판정)
+        for sym in [k for k in st_h if k not in self.state.positions]:
+            st_h.pop(sym, None)
+        return out
+
     # ================================================================ 본체
     def run_once(self) -> CycleSummary:
         run = _Run(self._now(), float(self._mono()))
@@ -787,6 +1149,8 @@ class Cycle:
         self._stage(run, "cycle_report", lambda: self._write_report(run, cycle, summary))
         self._save()
         self._save_journal(run)
+        # 9. 경보(레짐 전환·뉴스 위험·포지션 점검) — 상태 저장 뒤, 실패해도 사이클은 계속
+        self._stage(run, "alerts", lambda: self._emit_alerts(run))
         summary.errors = list(run.errors)
         summary.duration_s = round(self._elapsed(run), 3)
         log.info("사이클 %d 완료: equity=%.2f entries=%d exits=%d llm_calls=%d errors=%d",

@@ -118,6 +118,9 @@ class PositionContext(_Model):
     technical: TechnicalOutput | None = None
     risk: RiskPositionView | None = None
     red_line_hits: list[str] = Field(default_factory=list)
+    # 이번 사이클에 코드 레드라인 평가를 마쳤는지(앞 단계에서 끝나거나 평가가 실패하면 False — cycle 경보가
+    # 빈 ``red_line_hits`` 를 '해소'로 읽지 않게)
+    red_lines_checked: bool = False
     health_history: list[int] = Field(default_factory=list)
     flagged_for_head: bool = False
     flag_reason: str | None = None
@@ -783,14 +786,17 @@ def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: Any, 
         pc.technical = tech_out.get(s)
         thesis = journal_state.thesis.get(s)
         hits: list[str] = []
+        checked = True
         if thesis is not None:
             fpk = scan.flow_packs.get(s)
             try:
                 hits = evaluate_red_lines(thesis, _mark(scan, pos), pos, fpk.funding_now if fpk else None, btc_ret,
                                           sent_score, int(now_ms))
             except Exception as exc:  # noqa: BLE001 - 평가 실패는 적중 없음 + 경고
+                checked = False
                 log.warning("레드라인 평가 실패 symbol=%s type=%s", s, type(exc).__name__)
         pc.red_line_hits = hits
+        pc.red_lines_checked = checked
         pc.health_history = list(journal_state.health_history.get(s, []))
 
     planned_notional = max(0.0, float(equity) * HardLimits.MAX_POSITION_PCT) if _finite(equity) else 0.0

@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from .config import mask_secret
+from .config import HardLimits, mask_secret
 from .models import TradeEvent
 
 log = logging.getLogger("tradingbot.notify")
@@ -55,6 +55,10 @@ EMOJI: dict[str, str] = {
     "halt": "⛔",
     "halt_lifted": "✅",
     "heartbeat": "💓",
+    "alert": "🔔",
+    "regime": "🌐",
+    "news_risk": "📰",
+    "position_health": "🩺",
 }
 
 # G0 중단 사유 코드 → 한국어 설명 (risk.global_gates / gates.g0_preflight 의 괄호 코드)
@@ -928,6 +932,227 @@ def _format_llm_paused(e: TradeEvent) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- 경보(kind="alert", extra.alert 로 분기)
+FUSED_CONFIDENCE_FLOOR = 0.75        # gates.RAISED_CONFIDENCE_FLOOR 와 같은 값(테스트로 고정)
+FUSED_SIZE_MULTIPLIER = 0.5          # gates.g3: FUSED → 사이즈 ×0.5
+ALERT_SUMMARY_MAX_CHARS = 300
+ALERT_RATIONALE_MAX_CHARS = 200
+
+REGIME_VERDICT_KO: dict[str, str] = {
+    "normal": "정상",
+    "fused": "상관 융합(FUSED)",
+    "macro_alarm": "매크로 경보(BTC 충격 ∧ 상관 융합)",
+}
+
+NEWS_EVENT_TYPE_KO: dict[str, str] = {
+    "hack": "해킹",
+    "regulatory": "규제",
+    "listing": "상장",
+    "delisting": "상장폐지",
+    "macro": "거시",
+    "etf": "ETF",
+    "exchange": "거래소",
+    "protocol": "프로토콜",
+    "sentiment": "심리",
+    "technical_break": "기술적 이탈",
+    "other": "기타",
+}
+
+# 뉴스 점수 고정 7단계 척도(SPEC §20.3a.3) → 한국어 라벨
+NEWS_SCORE_SCALE: tuple[tuple[float, str], ...] = (
+    (-1.0, "매우 강한 악재"), (-0.66, "강한 악재"), (-0.33, "약한 악재"), (0.0, "중립"),
+    (0.33, "약한 호재"), (0.66, "강한 호재"), (1.0, "매우 강한 호재"),
+)
+
+RISK_ACTION_KO: dict[str, str] = {"hold": "유지", "trim": "축소", "exit": "청산"}
+ASSUMPTION_STATUSES: tuple[str, ...] = ("holding", "weakening", "impaired", "broken")
+HEAD_ACTION_KO: dict[str, str] = {"BUY": "매수", "SELL": "매도", "HOLD": "보유"}
+
+
+def _regime_label(verdict: object) -> str:
+    if verdict is None or str(verdict) == "":
+        return "시작(이전 기록 없음)"
+    v = str(verdict)
+    ko = REGIME_VERDICT_KO.get(v)
+    return f"{v}({ko})" if ko else v
+
+
+def regime_rule_text(verdict: object) -> str:
+    """레짐 판정이 만드는 규칙 변화(gates.g3_portfolio 와 같은 규칙)."""
+    v = str(verdict) if verdict is not None else ""
+    if v == "macro_alarm":
+        return "신규 진입 금지(G3 탈락) — 보유 포지션 코드 청산 검사는 계속"
+    if v == "fused":
+        return (f"신규 진입 사이즈 절반(×{FUSED_SIZE_MULTIPLIER:g}), "
+                f"확신도 하한 {FUSED_CONFIDENCE_FLOOR:.2f}")
+    if v == "normal":
+        return f"기본 규칙(사이즈 ×1, 확신도 하한 {HardLimits.MIN_CONFIDENCE:.2f})"
+    return "-"
+
+
+def _news_scale(score: float | None) -> tuple[float, str] | None:
+    """점수를 7단계 척도의 가장 가까운 값과 라벨로(같은 거리면 낮은 쪽)."""
+    if score is None:
+        return None
+    best = min(NEWS_SCORE_SCALE, key=lambda kv: (abs(kv[0] - score), kv[0]))
+    return best
+
+
+def _str_list(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x) for x in raw if str(x).strip()]
+
+
+def _format_regime_alert(e: TradeEvent) -> str:
+    ex = e.extra or {}
+    old, new = ex.get("old_verdict"), ex.get("new_verdict")
+    held_new = _str_list(ex.get("name_alarm_held_new"))
+    if ex.get("verdict_changed") is False:
+        # 판정은 그대로, 보유 종목에 새 NAME 알람
+        lines = [_header(EMOJI["regime"], "NAME 알람(보유 종목)", e, with_symbol=False)]
+        lines.append(f"레짐 판정 유지: {_regime_label(new)}")
+    else:
+        lines = [_header(EMOJI["regime"], "레짐 전환", e, with_symbol=False)]
+        lines.append(f"{_regime_label(old)} → {_regime_label(new)}")
+    lines.append(f"규칙: {regime_rule_text(new)}")
+    raw = ex.get("raw_verdict")
+    if isinstance(raw, str) and raw and new is not None and raw != str(new):
+        lines.append(f"스캐너 판정: {_regime_label(raw)} — 상관 융합 플래그(fused)가 남아 위 규칙이 적용됨"
+                     " (BTC 데이터 없음 등)")
+    detail: list[str] = []
+    btc4h = ex.get("btc_regime_4h")
+    if isinstance(btc4h, str) and btc4h:
+        detail.append(f"BTC 4h {btc4h}")
+    corr = _finite_num(ex.get("avg_pairwise_corr_1h"))
+    if corr is not None:
+        detail.append(f"평균 상관 {corr:.2f}")
+    if detail:
+        lines.append(" · ".join(detail))
+    shock = ex.get("btc_shock")
+    if isinstance(shock, bool):
+        lines.append(f"BTC 충격: {'예' if shock else '아니오'}")
+    alarms = _str_list(ex.get("name_alarm_symbols"))
+    if alarms:
+        lines.append("NAME 알람: " + ", ".join(alarms) + " — 해당 종목 신규 진입 금지, 보유 시 총괄 SELL 은 전량")
+    else:
+        lines.append("NAME 알람: 없음")
+    if held_new:
+        lines.append("보유 종목 새 NAME 알람: " + ", ".join(held_new))
+    return "\n".join(lines)
+
+
+def _format_news_risk_alert(e: TradeEvent) -> str:
+    ex = e.extra or {}
+    lines = [_header(EMOJI["news_risk"], "뉴스 위험", e)]
+    et = ex.get("event_type")
+    if isinstance(et, str) and et:
+        ko = NEWS_EVENT_TYPE_KO.get(et)
+        lines.append(f"유형: {et}" + (f"({ko})" if ko else ""))
+    else:
+        lines.append("유형: - (뉴스 분석가 risk_event 표시)")
+    scale = _news_scale(_finite_num(ex.get("score")))
+    if scale is not None:
+        lines.append(f"점수: {scale[0]:+.2f} ({scale[1]}, 7단계 척도 −1.0~+1.0)")
+    else:
+        lines.append("점수: -")
+    summary = ex.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"요약: {_truncate(summary, ALERT_SUMMARY_MAX_CHARS)}")
+    held = ex.get("held") is True
+    lines.append(f"보유: {'예' if held else '아니오'}")
+    lines.append("조치: 신규 진입 차단(G1 뉴스 위험, 24시간)")
+    if held:
+        flagged = ex.get("flagged_for_head")
+        reason = ex.get("flag_reason")
+        if flagged is True:
+            line = "보유 중 → 총괄 검토 대상으로 표시됨"
+            if isinstance(reason, str) and reason.strip():
+                line += f" ({_truncate(reason, 120)})"
+        else:
+            line = "보유 중 → 리스크 관리자 점검에 뉴스 위험 전달(위험 판정 시 총괄 검토)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_position_health_alert(e: TradeEvent) -> str:
+    ex = e.extra or {}
+    lines = [_header(EMOJI["position_health"], "포지션 점검", e)]
+    health = ex.get("health")
+    if isinstance(health, int) and not isinstance(health, bool):
+        line = f"건강도 {health}/10"
+        if health <= 4:
+            line += " (≤4 경고)"
+        lines.append(line)
+    else:
+        lines.append("건강도 -")
+    reds = _str_list(ex.get("red_lines"))
+    lines.append("레드라인: " + ("; ".join(_truncate(r, 120) for r in reds) + " (적중)" if reds else "적중 없음"))
+    action = ex.get("risk_action")
+    if isinstance(action, str) and action:
+        line = f"리스크 조치: {action}({RISK_ACTION_KO.get(action, action)})"
+        reason = ex.get("risk_reason")
+        if isinstance(reason, str) and reason.strip():
+            line += f" — {_truncate(reason, 120)}"
+        lines.append(line)
+    statuses = _str_list(ex.get("assumption_status"))
+    if statuses:
+        counts = {k: statuses.count(k) for k in ASSUMPTION_STATUSES}
+        lines.append("가정: " + " · ".join(f"{k} {counts[k]}" for k in ASSUMPTION_STATUSES))
+    upct = _finite_num(ex.get("unrealized_pct"))
+    if upct is not None:
+        lines.append(f"미실현 {upct:+.2f}%")
+    worse = ex.get("worsened")
+    if isinstance(worse, dict):
+        parts: list[str] = []
+        wh = worse.get("health")
+        if isinstance(wh, (list, tuple)) and len(wh) == 2:
+            parts.append(f"건강도 {wh[0]} → {wh[1]}")
+        wa = worse.get("risk_action")
+        if isinstance(wa, (list, tuple)) and len(wa) == 2:
+            parts.append(f"리스크 조치 {wa[0]} → {wa[1]}")
+        if parts:
+            lines.append("악화: " + " · ".join(parts))
+    head = ex.get("head_decision")
+    if isinstance(head, dict) and head.get("action"):
+        act = str(head.get("action"))
+        line = f"총괄 결정: {act}({HEAD_ACTION_KO.get(act, act)})"
+        conf = _finite_num(head.get("confidence"))
+        if conf is not None:
+            line += f" 확신도 {conf:.2f}"
+        executed = head.get("executed")
+        if isinstance(executed, bool):
+            line += " — 실행됨" if executed else " — 미실행"
+        rationale = head.get("rationale")
+        if isinstance(rationale, str) and rationale.strip():
+            line += f"\n근거: {_truncate(rationale, ALERT_RATIONALE_MAX_CHARS)}"
+        lines.append(line)
+    else:
+        lines.append("총괄 결정: 이번 사이클 없음")
+    return "\n".join(lines)
+
+
+_ALERT_FORMATTERS: dict[str, Callable[[TradeEvent], str]] = {
+    "regime": _format_regime_alert,
+    "news_risk": _format_news_risk_alert,
+    "position_health": _format_position_health_alert,
+}
+
+
+def _format_alert(e: TradeEvent) -> str:
+    """kind="alert": ``extra.alert`` 로 레짐 전환·뉴스 위험·포지션 점검을 그린다(DESIGN §7)."""
+    sub = str((e.extra or {}).get("alert") or "")
+    fn = _ALERT_FORMATTERS.get(sub)
+    if fn is None:
+        lines = [_header(EMOJI["alert"], f"경보 {sub or '-'}", e)]
+        if e.reason:
+            lines.append(_truncate(e.reason))
+        return "\n".join(lines)
+    return fn(e)
+
+
 def _format_generic(e: TradeEvent) -> str:  # 알 수 없는 kind 방어
     lines = [_header("ℹ️", str(e.kind), e)]
     if e.reason:
@@ -950,10 +1175,16 @@ _FORMATTERS: dict[str, Callable[[TradeEvent], str]] = {
     "halt": _format_halt,
     "halt_lifted": _format_halt_lifted,
     "heartbeat": _format_heartbeat,
+    "alert": _format_alert,
 }
 
 __all__ = [
+    "ALERT_SUMMARY_MAX_CHARS",
     "DEFAULT_RETRY_DELAYS",
+    "FUSED_CONFIDENCE_FLOOR",
+    "NEWS_EVENT_TYPE_KO",
+    "REGIME_VERDICT_KO",
+    "regime_rule_text",
     "EMOJI",
     "EXIT_REASON_KO",
     "HALT_REASON_KO",

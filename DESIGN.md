@@ -75,6 +75,8 @@
 
 중단·해제는 전용 종류 `halt`(⛔ 신규 진입 중단 + 코드별 한국어 사유 + 자본) / `halt_lifted`(✅ 신규 진입 재개)로, 하트비트는 `heartbeat`(💓: 자본·당일 손익·포지션별 미실현 %·노출 %·오늘 LLM 비용)로 보낸다. 구버전 표현(`error`+code=halt, `startup`+event=halt_lifted, `daily_summary`+heartbeat)도 같은 모양으로 그린다.
 
+레짐 전환·뉴스 risk_event·포지션 건강도 하락/레드라인은 **구현됨**: 전용 종류 `alert`(`extra.alert` = `regime` 🌐 / `news_risk` 📰 / `position_health` 🩺)로, 상태 저장 뒤 `alert_state.json`(tmp → fsync → replace)으로 중복을 막아(레짐은 G3 가 실제 적용하는 판정이 바뀔 때 — 직전 판정으로 되돌아가는 진동은 1h 보류, 보유 종목 새 NAME 알람도 알림; 뉴스는 심볼+위험 헤드라인당 24h; 건강도는 조건이 나빠질 때 — ≤4 진입, ≥6 이어야 해소, 2 이상 추가 하락·리스크 조치 강화·새 레드라인) 보낸다. 연결 확인은 `python -m tradingbot.main notify-test`(텔레그램 값만 필요, 성공 0/실패 1/설정 없음 2).
+
 ## 8. 대시보드 (`dashboard/`)
 
 FastAPI + 단일 HTML(외부 CDN 없음), localhost 바인딩, 파일 읽기 전용. 상태 헤더, 포지션, 최근 결정(역할별 요약·게이트 사유), 거래 내역, 비용(오늘/이달/예산 막대), 백테스트 결과, 자본 스파크라인, STOP 버튼(토큰 필요 → `control/STOP` 파일 → 다음 사이클에 킬스위치).

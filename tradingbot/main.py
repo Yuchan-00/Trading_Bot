@@ -12,6 +12,8 @@
 - ``status``                            상태 요약 출력(네트워크·LLM 없음, 파일만 읽음).
 - ``stop --reason ...``                 ``control/STOP`` 작성 → 다음 사이클에 킬스위치.
 - ``clear-stop``                        ``control/STOP`` 삭제 + ``control/CLEAR`` 작성 → 다음 사이클에 해제.
+- ``notify-test``                       텔레그램 연결 테스트 메시지 1건을 동기 전송(``TELEGRAM_BOT_TOKEN``/``TELEGRAM_CHAT_ID``
+                                        만 필요 — 다른 설정·API 키 없이 동작). 성공 0, 전송 실패 1(토큰은 가림), 설정 없음 2.
 
 안전장치
 - ``MODE=live`` 이면 ``run`` 시작 시 콘솔에 ``LIVE`` 를 직접 입력해야 진행한다(환경변수로 우회 불가).
@@ -44,7 +46,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from tradingbot import cycle as C
-from tradingbot.config import ConfigError, Settings, load_settings, read_env
+from tradingbot.config import ConfigError, Settings, load_settings, mask_secret, read_env
 from tradingbot.models import BotState, TradeEvent
 
 log = logging.getLogger("tradingbot.main")
@@ -54,7 +56,7 @@ __all__ = [
     "run_loop", "next_run_ts", "install_signal_handlers", "status_text", "write_stop", "write_clear",
     "HEARTBEAT_S", "RUN_OFFSET_S", "LIVE_CONFIRM_WORD", "OFFLINE_FIXTURE_DIRNAME", "offline_fixture_settings",
     "LOCK_STALE_MIN_S", "LOCK_REFRESH_S", "LOCK_REFRESH_FAIL_SHARE", "lock_stale_after_s", "heartbeat_event", "FEAR_GREED_CACHE_FILENAME",
-    "status_text_from_env",
+    "status_text_from_env", "notify_test", "NOTIFY_TEST_TEXT",
 ]
 
 HEARTBEAT_S = 4 * 3600.0
@@ -72,6 +74,7 @@ LOCK_REFRESH_S = 300.0           # 사이클 사이 대기 중 잠금 ts 갱신 
 LOCK_REFRESH_FAIL_SHARE = 0.5    # ts 갱신 실패가 stale_after_s 의 이 비율 이상 이어지면 잠금 상실로 보고 중단
 DEFAULT_CYCLE_MINUTES = 15
 FEAR_GREED_CACHE_FILENAME = "fear_greed.json"
+NOTIFY_TEST_TEXT = "✅ 텔레그램 연결 테스트 [{mode}] — 이 메시지가 보이면 거래 알림이 정상 전송됩니다"
 
 
 # ======================================================================= 잠금
@@ -778,6 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stop", help="킬스위치 요청(control/STOP)")
     s.add_argument("--reason", required=True)
     sub.add_parser("clear-stop", help="킬스위치 해제 요청(control/CLEAR)")
+    sub.add_parser("notify-test", help="텔레그램 연결 테스트 메시지 1건 전송")
     return p
 
 
@@ -789,7 +793,8 @@ def _positive_int(v: int | None, name: str) -> None:
 def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None,
          input_fn: Callable[[str], str] | None = None, out: TextIO | None = None, err: TextIO | None = None,
          components_factory: Callable[..., Components] | None = None,
-         stop_event: threading.Event | None = None, pid: int | None = None) -> int:
+         stop_event: threading.Event | None = None, pid: int | None = None,
+         http_post: Callable[[str, dict], object] | None = None) -> int:
     out = out or sys.stdout
     err = err or sys.stderr
     parser = build_parser()
@@ -797,6 +802,9 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else EXIT_USAGE
+    if args.command == "notify-test":
+        # 텔레그램 값만 있으면 된다 — API 키·백엔드 설정이 없어도 연결을 확인할 수 있어야 한다(stop/clear-stop 처럼)
+        return notify_test(env, out, err, http_post=http_post)
     try:
         settings = load_settings(env)
         if args.command == "run":
@@ -836,6 +844,45 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     return _cmd_run(settings, args, input_fn=input_fn or input, out=out, err=err,
                     components_factory=components_factory, stop_event=stop_event, pid=pid,
                     mock_scenario=mock_scenario, require_tty=require_tty)
+
+
+def notify_test(env: Mapping[str, str] | None, out: TextIO, err: TextIO, *,
+                http_post: Callable[[str, dict], object] | None = None) -> int:
+    """``notify-test``: ``TelegramTransport`` 로 테스트 메시지 1건을 동기 전송한다(재시도·큐 없음).
+
+    설정 검증 없이 ``read_env()``(os.environ 위에 .env)에서 ``TELEGRAM_BOT_TOKEN``·``TELEGRAM_CHAT_ID``·``MODE`` 만 읽는다.
+    출력·오류 어디에도 토큰을 쓰지 않는다(전송기 ``_scrub`` + 토큰 문자열 재확인). 종료 코드: 성공 0, 실패 1, 설정 없음 2.
+    """
+    from tradingbot.notify import TelegramTransport  # noqa: PLC0415 - 다른 명령의 import 비용을 늘리지 않는다
+
+    src: Mapping[str, str] = read_env(None) if env is None else env
+    token = (src.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (src.get("TELEGRAM_CHAT_ID") or "").strip()
+    mode = (src.get("MODE") or "").strip().lower()[:16] or "paper"
+    missing = [k for k, v in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat_id)) if not v]
+    if missing:
+        err.write(f"텔레그램 설정 없음: {', '.join(missing)} 이(가) 비어 있습니다 — "
+                  ".env 또는 환경변수에 설정한 뒤 다시 실행하세요\n")
+        return EXIT_USAGE
+
+    def _mask(text: str) -> str:
+        return text.replace(token, mask_secret(token)) if token and token in text else text
+
+    transport = TelegramTransport(token, chat_id, http_post=http_post)   # 둘 다 비어 있지 않음 → 예외 없음
+    try:
+        transport.send(NOTIFY_TEST_TEXT.format(mode=mode))
+    except Exception as exc:  # noqa: BLE001 - 어떤 실패든 가린 메시지로 보고하고 1
+        # TransportError 는 이미 토큰·URL 을 가린다. 다른 예외도 한 번 더 가린다.
+        msg = _mask(transport._scrub(str(exc)))[:300]
+        log.warning("notify-test 실패 type=%s", type(exc).__name__)
+        detail = msg or type(exc).__name__
+        prefix = "텔레그램 전송 실패: "
+        if detail.startswith(prefix):  # TransportError 메시지가 이미 같은 접두어를 가짐
+            detail = detail[len(prefix):]
+        err.write(f"{prefix}{detail} (chat_id={mask_secret(chat_id)})\n")
+        return EXIT_ERROR
+    out.write(f"텔레그램 전송 성공 [{mode}] (chat_id={mask_secret(chat_id)}) — 채팅에서 테스트 메시지를 확인하세요\n")
+    return EXIT_OK
 
 
 def _control_data_dir(env: Mapping[str, str] | None) -> Path:

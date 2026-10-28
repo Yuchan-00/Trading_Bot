@@ -17,6 +17,7 @@ EventKind = Literal[
     "entry", "exit", "partial_exit", "order_rejected", "kill_switch", "budget_exceeded",
     "daily_summary", "error", "startup", "shutdown", "llm_paused",
     "halt", "halt_lifted", "heartbeat",
+    "alert",            # extra.alert: "regime" | "news_risk" | "position_health" (DESIGN §7)
 ]
 
 

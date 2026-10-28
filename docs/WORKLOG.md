@@ -48,6 +48,13 @@
 - **거래가 일어날 때마다 텔레그램 메시지** 전송(진입·청산·부분청산·손절/익절 집행·킬스위치·일일 요약·오류).
 - 진행: 스킬 90개 전수 조사 → 암호화폐 현물 봇 관련성 평가 → 역할 구성안(판정 패널 3개 관점 → 종합) 워크플로 실행.
 
+### 05:20~06:15 설계 확정과 병렬 구현 시작
+- 스킬 조사 워크플로 완료(에이전트 20, 90/90 스킬, 메커니즘 6, 제안 3 → 최종 역할표). 결과: `docs/research/agent_roster.md`, `vibe_skill_survey.md`, `vibe_mechanisms/`.
+- `SPEC.md` v1(기반 모듈) → `tradingbot/models.py`, `config.py` 직접 구현·검증·커밋. 기반 10개 모듈 구현 워크플로(구현→적대적 리뷰→수정→통합) 실행 중.
+- `DESIGN.md` + `SPEC.md` v2(features/scanner/gates/agents/journal/cycle/프롬프트·스킬 규약) 작성·커밋. `agents/schemas.py`(역할별 출력 모델, 검증자, 보수적 기본값) 직접 구현·검증·커밋.
+- 콘텐츠 워크플로(스킬 25개 재작성 + 프롬프트 8개 + THIRD_PARTY_NOTICES, 라이선스·일관성 검토) 실행 중.
+- v2 코드 워크플로 스크립트 준비(기반 모듈 완료 후 실행): Group1 features/runner/journal → Group2 scanner/payloads → Group3 gates/pipeline → Group4 cycle+main → 통합 + 오프라인 paper e2e(`--offline-fixture`).
+
 ### 진행 원칙
 - 이전 세션 트랜스크립트 원문은 비밀(키) 포함 가능성 때문에 저장소에 올리지 않음. 비밀 검사(정규식)를 통과한 요약만 커밋.
 - 기존 봇의 하드 리밋(`risk.py`), paper 기본 모드, 실자금 매매 금지 원칙은 유지.

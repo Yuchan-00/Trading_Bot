@@ -664,3 +664,121 @@ def code_metrics(trades: list[ClosedTrade], equity_curve: list[float], btc_curve
 
 ## 24. 테스트 요구 (v2)
 `test_features.py`(라벨 함수별 합성 캔들), `test_scanner.py`(가짜 MarketData: 게이트·랭킹·레짐·제외·펀딩창), `test_gates.py`(G1~G4 경계·기권), `test_schemas.py`(검증자·conservative_example), `test_runner.py`(시스템 프롬프트 바이트 고정·병렬 순서), `test_pipeline.py`(MockBackend 시나리오: 전원 기권→HOLD, 약세 decline→탈락, 리스크 veto→탈락, 승인→BUY, 예산 초과), `test_journal.py`, `test_cycle.py`(paper 1사이클 end-to-end: 진입·저장·텔레그램 가짜 전송 기록·결정 로그·청산 사이클), `test_main.py`(CLI 인자·live 확인 입력). 목표 v1+v2 합계 600개 이상.
+
+---
+
+# SPEC v2.1 — payload 필드 계약 (§20.3a) 과 보완 (2026-10-28 프롬프트 교차검토 반영)
+
+프롬프트(`prompts/*.md`)는 이 절의 필드 경로만 인용한다. payload 빌더는 이 절의 키를 **정확히** 만든다(추가 키 금지, 없는 값은 `null`). 모든 숫자는 `features.compact`(4유효자리)로 반올림, 퍼센트는 % 단위, 펀딩은 8h 원시 소수. 모든 payload 에 `"role"` 과 `"hard_limits"` 가 있다.
+
+```python
+HARD_LIMITS_PAYLOAD = {"max_position_pct": 10, "max_positions": 3, "max_stop_pct": 2, "max_tp_pct": 4, "min_confidence": 0.65}
+FLOW_THRESHOLDS = {"funding_extreme_long": 0.0005, "funding_elevated_long": 0.0002, "funding_negative": -0.0001, "funding_squeeze": -0.0002,
+                   "oi_buildup_pct": 5.0, "oi_buildup_funding": 0.0003, "oi_deleveraging_pct": -5.0,
+                   "ls_crowded_long": 2.0, "ls_crowded_short": 0.8, "cascade_high_distance_pct": 2.0, "cascade_moderate_distance_pct": 3.0}
+```
+
+## 20.3a.1 technical — `build_technical(symbol, fp, position, mark, cycle) -> dict`
+```
+{"role":"technical","symbol":str,"feature_pack":FeaturePack,
+ "position": null | {"entry_price","stop_loss_price","take_profit_price","last_mark","unrealized_pct","bars_held","opened_ts"},
+ "hard_limits":…}
+```
+- `unrealized_pct = (mark/entry_price − 1)×100`, `bars_held = cycle − position.opened_cycle`. **`thesis`·`confidence` 는 넣지 않는다**(총괄 출력이 분석가 입력이 되지 않게 코드로 강제).
+
+## 20.3a.2 derivatives_flow — `build_flow(flow_packs, symbols) -> dict`
+```
+{"role":"derivatives_flow","symbols":[…],"flow_packs":{sym:FlowPack},"thresholds":FLOW_THRESHOLDS,"hard_limits":…}
+```
+`symbols` 는 후보 ∪ 보유, 입력 순서 유지. `flow_packs` 키 집합 == `symbols`.
+
+## 20.3a.3 news_sentiment — `build_news(headlines_new, aliases, now_ms, feed_health, prev_events) -> dict`
+```
+{"role":"news_sentiment",
+ "headlines":[{"id","ts","age_h","source","source_grade","title"}],   # 최신순, 최대 40, id = sha1(url or title)[:12], source_grade = "high"(tier 1) | "low"(tier 2·3), age_h = (now_ms − ts)/3.6e6 (ts 없으면 null)
+ "aliases":{alias_lower: symbol},                                       # news.py 별칭 + base 티커 소문자
+ "now_ms":int, "feed_health":{"items_fetched","oldest_ts","newest_ts","errors":[…]},
+ "prev_events":[{"headline_id","score","event_type","symbols","ts"}],  # 만료 전(24h) 이벤트, 재채점 금지
+ "hard_limits":…}
+```
+뉴스 점수 척도(고정 7단계): −1.0, −0.66, −0.33, 0, +0.33, +0.66, +1.0. `stale = age_h > 24`, 7일 초과는 |score| ≤ 0.33.
+
+## 20.3a.4 bull / bear — `build_bull(...)`, `build_bear(...)`
+```
+{"role":"bull"|"bear","symbol",
+ "technical": TechnicalOutput | null,
+ "feature_extract": null | {"cgo_60","rsi_5","rsi_14","bb_position","obv_trend","abnormal_volume_multiple","volume_vs_hour_avg","change_24h_pct"},   # rsi_5/rsi_14/bb_position/obv_trend 은 1h 값
+ "flow": FlowSymbolView | null,
+ "news_events":[{"headline_id","score","event_type","symbols","summary","stale","age_h"}],   # 이 심볼의 24h 내 이벤트
+ "news_context": null | {"market_tone","risk_event_for_symbol":bool,"feed_health_note"},   # news 채널 기권이면 null
+ "event_signal": {"score": float|null, "n_events": int},   # clip(Σ score·0.5^(age_h/12), −1, 1); 이벤트 없으면 score null
+ "sentiment": SentimentComposite,
+ "scanner_row": Candidate + {"liquidity": LiquidityGate},
+ "regime": {"btc_regime_4h","fused","density","verdict","btc_shock","name_alarm_symbols"},
+ "position": null | {"entry_price","unrealized_pct","bars_held","thesis": Thesis | null},
+ "hard_limits":…}
+bear 만 추가: "corr_to_open": {open_symbol: corr}, "hv_pct": float|null (= feature_pack.hv_pct_rank)
+```
+bull payload 에는 bear 키가 없고 bear payload 에는 bull 키가 없다(테스트).
+
+## 20.3a.5 risk_manager — `build_risk(...)`
+```
+{"role":"risk_manager",
+ "candidates":[{"symbol","candidate":Candidate,"technical","flow","bull","bear","planned_notional_usdt"}],   # G2 생존 후보
+ "positions":[{"symbol","entry_price","mark","unrealized_pct","bars_held","thesis":Thesis|null,
+               "prev_assumption_status":[…]|null,     # 지난 사이클 risk_manager 평가(없으면 null) — 코드 판정이 아님, 지금 다시 평가
+               "red_line_hits":[…],"health_history":[…],"technical":{"exit_flag","exit_reason"}|null}],
+ "risk_packs":{sym:RiskPack},      # RiskPack 에 exec_cost_pct 포함(§17 보완)
+ "regime":RegimePack,
+ "account_pack":ACCOUNT_PACK,
+ "news_risk_symbols":[…],
+ "flow_blocks":{sym:{"block_new_longs","stop_inside_cascade","cascade_risk"}},
+ "hard_limits":…}
+ACCOUNT_PACK = {"equity","daily_pnl_pct","drawdown_pct","drawdown_ladder_level"("normal"|"caution"|"block"|"stop_all"),"exposure_pct","position_count",
+                "consecutive_losses","cooldowns":{sym: cycles_left},"trades_today","decay_state","bias_severities":{"disposition","overtrading","chasing","anchoring"},
+                "noise_trade_share": float|null,   # 최근 20건 중 |pnl_pct| < 0.3 비율, 5건 미만이면 null
+                "llm_budget_remaining_usd"}
+```
+
+## 20.3a.6 head — `build_head(...)`
+```
+{"role":"head",
+ "approved":[{"symbol","candidate",
+              "technical": TechnicalOutput + {"labels":{"ichimoku_4h_price_vs_cloud","cgo_60","abnormal_volume_multiple","change_24h_pct"}} | null,
+              "flow","news":{"events":[…],"market_tone","risk_event_for_symbol"}|null,"bull","bear",
+              "risk": RiskCandidateVerdict + {"confidence_floor","entries_paused","exposure_cap_pct","risk_confidence"},
+              "gate":{"confidence_floor","size_multiplier","notes":[…]}}],     # G3 이후 실효 하한·배수 — head 확신도가 이 하한 미만이면 코드가 HOLD
+ "flagged_positions":[{"symbol","entry_price","mark","unrealized_pct","bars_held","thesis","red_line_hits","health_history",
+                       "risk":RiskPositionView|null,"technical":{"exit_flag","exit_reason"}|null,"flag_reason"}],
+ "regime":RegimePack,"account_pack":ACCOUNT_PACK,
+ "sentiment":{"composite":SentimentComposite,"event_signal":{sym:{"score","n_events","combined_score"}}},   # combined = 0.6·technical.score/5 + 0.4·event score(없으면 0), 참고용
+ "vetoed":[{"symbol","stage":"g1"|"bear_decline"|"risk_veto"|"g3","reason"}],
+ "hard_limits":…,"abstained_channels":[…]}
+```
+
+## 20.3a.7 journal — `build_journal_post_trade(trade, thesis, thesis_history, verdicts)`, `build_journal_daily(metrics_table, closed_count)`
+```
+post_trade: {"role":"journal","mode":"post_trade",
+  "trade": ClosedTrade 필드 + {"trade_id": f"{symbol}-{opened_ts}-{closed_ts}", "bars_held", "thesis": Thesis|null},   # thesis 는 JournalState.thesis[symbol] (구조화)
+  "thesis_history":[{"cycle","health","assumption_status","red_line_hits","action","exit_flag","unrealized_pct"}],
+  "verdicts": JournalState.entry_verdicts[symbol] | null + {"news_risk_after_entry":[…]},
+  "hard_limits":…}
+daily: {"role":"journal","mode":"daily","closed_count":int,"hard_limits":…,
+  "metrics_table":{"returns":{"day_pnl_pct","cum_pnl_pct","equity","max_drawdown_pct","btc_buy_hold_pct","excess_vs_btc_pct"},
+                   "trade_stats":{"closed_today","win_rate","avg_win_pct","avg_loss_pct","profit_factor","avg_bars_held","sharpe","sortino","calmar"},
+                   "by_exit_reason":{reason:{"count","pnl_pct_sum"}},"by_symbol":{sym:{"count","pnl_pct_sum"}},"by_setup":{setup_type:{"count","pnl_pct_sum"}},
+                   "attribution_buckets":{"noise_trades","stop_losses","take_profits","time_stops","head_sells"},
+                   "bias_severities":{…},"decay_state":str,
+                   "gate_stats":{"candidates_seen","g1_dropped","g2_bear_decline","g3_risk_veto","g3_other","g4_downgrade","head_calls","bear_decline_rate","risk_veto_rate"},
+                   "llm":{"calls","cost_usd","budget_usd","abstain_count"},"halts":[…]}}
+```
+`entry_verdicts[symbol]`(BUY 체결 시 저장) = `{"technical":{"setup_type","confidence"},"bull":{"case_strength","thesis_points","confidence"},"bear":{"verdict","strongest_point","death_paths"},"risk":{"verdict","conditions","required_monitoring","rr_net_estimate","risk_note"},"head":{"disagreement_class","decisive_factor","rationale","debias_chasing_spike"},"channel_agreement":{"technical":bool,"flow":bool,"news":bool}}`. channel_agreement: technical.direction=="long", flow.flow_bias=="long", event_signal.score>0.
+
+## 보완 사항 (v2 기존 절 수정)
+- **§17 FeaturePack** 에 `noise_floor_stop_pct: float|None`(= atr_pct_1h, 손절 최소거리)와 `noise_ok_2pct: bool|None`(= 1.5·atr_pct_1h < 2.0) 추가. **RiskPack** 에 `exec_cost_pct: float|None` = impact_bps_est/100 + spread_bps/200 + 0.20(왕복 수수료) 추가.
+- **technical 규칙**: `noise_check = feature_pack.noise_ok_2pct ∧ stop_pct ≥ feature_pack.noise_floor_stop_pct`; noise_check false 면 confidence ≤ 0.50. 목표: `tp_pct = min(4.0, max(2·stop_pct, 1.5·stop_pct + 0.75))` (왕복비용 0.30% 반영 순손익비 ≥ 1.5 보장).
+- **§19 G1** 노이즈 조건은 코드가 다시 계산한다: `fp.noise_ok_2pct is True ∧ tech.stop_pct ≥ fp.noise_floor_stop_pct` (LLM 의 noise_check 와 AND). **G3** 실행비용: `risk_pack.exec_cost_pct > 0.25·stop_pct` → 탈락. 손절은 기술분석 후보보다 넓히지 않는다.
+- **§20.4 runner**: `system_prompt` 는 `skills.render(role, max_tokens=24000)`(역할에 배정된 스킬이 잘리지 않게; 시스템 프롬프트는 1h 캐시라 비용 미미). 테스트: 모든 역할의 스킬 전체가 렌더에 포함.
+- **§21 JournalState** 에 `entry_verdicts: dict[str, dict]`, `thesis_history: dict[str, list[dict]]`, `prev_assumption_status: dict[str, list[str]]`, `news_risk_after_entry: dict[str, list[str]]`, `gate_stats_today: dict[str, int]`, `halts_today: list[str]` 추가(`health_history` 는 thesis_history 에서 파생 유지). 청산 시 해당 심볼 항목은 저널 호출 후 정리.
+- **cgo_60 임계값**(모든 프롬프트·스킬 공통, % 단위): ≥ +3 → 차익 실현 압력/탐욕 측, ≤ −3 → 손실 보유자 다수(투매 후 반등 가능성).
+- 프롬프트 길이: 700~1900 단어 허용(시스템 프롬프트는 캐시됨).

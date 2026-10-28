@@ -24,6 +24,15 @@
 - **Vibe-Trading** (HKUDS): MIT. Python 3.11+/FastAPI/React, PyPI `vibe-trading-ai`. SKILL.md 기반 스킬, 도구 계약(`schema/tool_contracts`), Alpha Zoo 478 팩터, Quant Library 306 함수. 스킬·도구 설계 채택 가능(출처 표기).
 - 상세: `docs/research/reference_projects.md`.
 
+### 04:50 세션 기록 접근 불가
+- 커서 9페이지(최신 1,000 이벤트 범위)를 수집한 직후 `list_events`/`get_session`이 "the requested resource was not found"를 반환. 세션 목록에서도 사라짐(삭제 또는 보관 추정). 재시도 2회 모두 실패.
+- 읽은 것: 최신 페이지 100 이벤트 + 세션 말미 저장 메모리 파일 → `docs/research/previous_session_summary.md`로 정리(비밀값 없음).
+- 첫 커밋/푸시 완료(`ba8dddf`). 원격에 이 브랜치 하나뿐이라 PR의 base 브랜치가 없음(사용자가 `main`을 올리면 그때 PR 생성).
+
+### 04:55 방향 변경 (사용자 요청)
+- LLM 호출을 `claude -p` 서브프로세스 → **Claude API(Anthropic SDK)** 로 변경하기로 함. 기존 "API 키 지출 없음" 전제가 바뀜 → 비용 상한·캐싱·모델 선택이 설계 항목이 됨.
+- Vibe-Trading 사본 확보(`/home/user/hkuds/vibe-trading`, MIT, SKILL.md 91개, `schema/tool_contracts/paper_trade_step-v1.1.json`, Alpha Zoo: qlib158/alpha101/gtja191/academic).
+
 ### 진행 원칙
 - 이전 세션 트랜스크립트 원문은 비밀(키) 포함 가능성 때문에 저장소에 올리지 않음. 비밀 검사(정규식)를 통과한 요약만 커밋.
 - 기존 봇의 하드 리밋(`risk.py`), paper 기본 모드, 실자금 매매 금지 원칙은 유지.

@@ -398,3 +398,266 @@ class Cycle:
 ## 16. 테스트 요구 (v1 범위)
 - `tests/test_config.py`, `test_risk.py`(적대적: 극단값·NaN·음수·경계), `test_indicators.py`(워밍업·결정성·알려진 값), `test_quality.py`, `test_news.py`, `test_exchange_paper.py`, `test_exchange_ccxt.py`(가짜 ccxt: 수수료 base 차감, fees 우선순위, 예외 스크럽, 재시도), `test_cost.py`(예산 초과·복원), `test_anthropic_backend.py`(가짜 client: parse 호출 인자 검증 — system cache_control·sort_keys·effort·output_format, refusal/max_tokens/예외 매핑, 로그에 키 없음), `test_skills.py`, `test_portfolio.py`(원자 저장·손상 정책·부분 체결·쿨다운·날짜 롤오버), `test_notify.py`(큐·재시도·실패 로그·토큰 비노출·포맷), `test_reports.py`, `test_backtest.py`(합성 캔들로 선행편향 없음·손절 우선·verdict), `test_dashboard.py`(TestClient: 각 엔드포인트, kill 토큰).
 - 목표: v1에서 300개 이상, 전부 오프라인, 1분 이내.
+
+---
+
+# SPEC v2 — 에이전트·피처팩·스캐너·게이트·사이클
+
+v1 모듈 위에 얹는다. 역할 구성의 근거는 `docs/research/agent_roster.md`, 개요는 `DESIGN.md`.
+
+## 17. `tradingbot/features.py` — 피처팩 (순수 함수, 코드가 숫자를 만든다)
+
+모든 팩 모델은 이 모듈에 둔다(`models.py`는 고정). `extra="forbid"`. 퍼센트는 **% 단위 숫자**(1.5 = 1.5%), 비율은 소수. 값은 4유효자리로 반올림해 LLM 입력을 줄인다(`_r(x)`).
+
+```python
+class TechnicalLabels(BaseModel):
+    timeframe: str
+    ema_state: Literal["bull_aligned","bear_aligned","mixed","unknown"]   # close>ema20>ema50(>ema200 있으면) → bull, 역순 bear, 그 외 mixed, 지표 없으면 unknown
+    price_vs_ema20_pct: float | None
+    adx_14: float | None; rsi_14: float | None; rsi_5: float | None
+    bb_position: float | None                     # (close-lower)/(upper-lower); 밴드 밖이면 <0 / >1
+    macd_hist_sign: Literal["pos","neg","flat","unknown"]   # |hist| < 1e-9*close → flat
+    obv_trend: Literal["up","down","flat","unknown"]         # OBV 20봉 회귀 기울기 부호(|slope|<평균OBV*1e-4 → flat)
+    volume_ratio_20: float | None; atr_pct: float | None
+    vote: Literal["trend_up","trend_down","mean_reversion_long","mean_reversion_short","none"]
+    # trend_up: bull_aligned ∧ adx>20 ∧ macd pos ; trend_down 대칭 ; mr_long: rsi_14<30 ∧ bb_position<0.05 ; mr_short: rsi_14>70 ∧ bb_position>0.95
+class IchimokuLabels(BaseModel):
+    tk_cross: Literal["bullish","bearish","none"]            # 최근 3봉 내 전환선/기준선 교차
+    price_vs_cloud: Literal["above","inside","below","unknown"]
+    cloud_bullish: bool | None                               # 현재 구름: senkouA > senkouB
+    cross_strength: Literal["strong","medium","weak","none"] # strong: 교차가 구름 위(아래)에서 ∧ 구름 방향 일치
+class CandleLabels(BaseModel):
+    patterns: list[Literal["bullish_engulfing","bearish_engulfing","hammer","shooting_star","doji","pin_bar_bull","pin_bar_bear","inside_bar","outside_bar"]]
+    score: int                                               # 강세 +1 / 약세 −1 합, −3..3로 클립. 마지막 2봉만 본다.
+class SmcLabels(BaseModel):
+    structure: Literal["bos_up","bos_down","choch_up","choch_down","range","unknown"]  # 스윙 고/저(좌우 5봉 프랙탈)
+    fvg_dir: Literal["bullish","bearish","none"]             # 최근 20봉 내 미충전 3봉 갭
+    nearest_demand_zone: list[float] | None                  # [low, high] 마지막 강세 BOS 직전 약세 봉 범위
+    nearest_supply_zone: list[float] | None
+    distance_to_demand_pct: float | None; distance_to_supply_pct: float | None
+class FeaturePack(BaseModel):
+    symbol: str; ts: int; price: float
+    per_tf: dict[str, TechnicalLabels]                       # "15m","1h","4h","1d" (있는 것만)
+    ichimoku_1h: IchimokuLabels | None; ichimoku_4h: IchimokuLabels | None
+    candles_15m: CandleLabels; candles_1h: CandleLabels
+    smc_1h: SmcLabels | None; smc_4h: SmcLabels | None
+    mtf_agreement: bool            # (4h ema_state==bull_aligned ∨ (4h mixed ∧ 1d bull_aligned)) ∧ 1h vote∈{trend_up, mean_reversion_long} ∧ 15m vote≠trend_down
+    hv_pct_rank: float | None      # 1h 로그수익률 24봉 실현변동성의 백분위(가용 창 ≥100개일 때, 아니면 None)
+    atr_pct_1h: float | None; vwap_distance_pct: float | None   # 15m 세션 VWAP 대비
+    volume_vs_hour_avg: float | None                           # 마지막 15m 거래량 / 직전 4봉 평균
+    cgo_60: float | None            # price / VWAP(1h 60봉) − 1 (%)
+    abnormal_volume_multiple: float | None                     # 마지막 15m 거래량 / 직전 96봉 중앙값
+    last_closes_1h: list[float]     # 최근 20개
+    change_24h_pct: float | None
+class FlowPack(BaseModel):
+    symbol: str; funding_now: float | None; funding_7d_mean: float | None; funding_annualized_pct: float | None   # funding_now*3*365*100
+    funding_regime: Literal["extreme_long","elevated_long","neutral","negative","squeeze","unknown"]   # 8h 기준 >0.05% / 0.02~0.05 / −0.01~0.02 / −0.02~−0.01 / <−0.02
+    oi_change_24h_pct: float | None
+    oi_funding_label: Literal["leveraged_long_buildup","short_buildup","deleveraging","neutral","unknown"]   # OI+5%∧펀딩>0.03%→LLB; OI+5%∧펀딩<0→SB; OI−5%→DL
+    perp_premium_pct: float | None                                     # (perp_mark − spot)/spot*100
+    ls_ratio: float | None; ls_label: Literal["crowded_long","crowded_short","balanced","unknown"]   # >2.0 / <0.8
+    divergence_flags: list[str]                                        # "price_up_oi_down","price_down_oi_up","funding_up_price_flat"
+    est_liq_clusters: list[dict]                                       # {"level":..,"side":"long","leverage":25|50|100,"estimated":True} level = vwap_24h*(1−1/lev+0.005)
+    nearest_long_liq_below_pct: float | None
+    cascade_risk: Literal["low","moderate","high","unknown"]           # high: nearest<2% ∧ LLB ; moderate: nearest<3% ∨ extreme_long
+    oir_1pct: float | None                                             # (bid_depth−ask_depth)/(bid+ask) 1% 깊이
+    spread_bps: float | None
+    data_confidence: Literal["high","low","none"]                      # 펀딩·OI 둘 다 있으면 high, 하나면 low, 없으면 none
+class RiskPack(BaseModel):
+    symbol: str; var95_1h_pct: float | None; var99_1h_pct: float | None; cvar95_1h_pct: float | None   # 1h 로그수익률 최근 200봉 히스토리컬
+    rv_20_pct: float | None; rv_60_pct: float | None                  # 연율화 %: std(ret)*sqrt(24*365)*100
+    daily_vol_pct: float | None                                        # std(1h ret, 96봉)*sqrt(24)*100
+    hv_pct_rank: float | None; kurtosis: float | None
+    corr_to_btc_1h: float | None; beta_btc: float | None; corr_to_open_positions: dict[str, float]
+    inverse_vol_size_pct: float | None                                 # min(10, 0.5/daily_vol_pct*100) ; daily_vol 없으면 None
+    cvar_size_pct: float | None                                        # min(10, 0.15/cvar95_1h_pct*100)
+    spread_bps: float | None; depth_taker_usdt: float | None           # ask 1% 깊이
+    impact_bps_est: float | None                                       # planned_notional / depth_taker_usdt * 100
+    order_notional_vs_15m_volume_share: float | None                   # planned_notional / (quote_volume_24h/96)
+    stop_vs_atr_noise_ok: bool | None                                  # atr_pct_1h*1.5 < 2.0
+class RegimePack(BaseModel):
+    avg_pairwise_corr_1h: float | None; density: float | None          # 48봉, 상관>0.7 쌍 비율
+    fused: bool                                                        # avg corr > 0.8
+    btc_regime_4h: Literal["bull","bear","range","unknown"]            # ema50>ema200∧adx>20 bull / adx<20 range / else bear
+    btc_shock: bool                                                    # |BTC 1h 수익률| > 2×ATR%(1h)
+    name_alarm_symbols: list[str]                                      # |ret_1h| > 3×ATR% 이면서 BTC |ret_1h| < 1×ATR%
+    verdict: Literal["normal","fused","macro_alarm"]                   # macro_alarm: btc_shock ∧ fused
+class SentimentComposite(BaseModel):
+    score_0_100: float | None; label: Literal["extreme_fear","fear","neutral","greed","extreme_greed","unknown"]
+    components: dict[str, float | None]                                # fear_greed(0.4), funding_z(0.2), ls_pctile(0.2), headline_polarity(0.2) — 없는 성분은 가중치 재정규화
+
+def build_feature_pack(symbol, candles_by_tf: dict[str, list[Candle]], indicators_by_tf: dict[str, IndicatorSet], ticker: Ticker) -> FeaturePack
+def build_flow_pack(symbol, futures: FuturesContext | None, funding_history: list[float], orderbook: OrderBookSummary | None, ticker: Ticker, perp_mark: float | None, candles_1h: list[Candle], prev_oi_usdt: float | None) -> FlowPack
+def build_risk_pack(symbol, candles_1h, btc_candles_1h, open_candles_1h: dict[str, list[Candle]], orderbook, ticker, planned_notional: float, atr_pct_1h: float | None) -> RiskPack
+def build_regime_pack(candles_1h_by_symbol: dict[str, list[Candle]], btc_symbol: str, btc_ind_4h: IndicatorSet | None, btc_ind_1h: IndicatorSet | None) -> RegimePack
+def composite_sentiment(fear_greed: int | None, funding_z: float | None, ls_pctile: float | None, headline_polarity: float | None) -> SentimentComposite
+def compact(obj: BaseModel) -> dict        # model_dump 후 float 4유효자리 반올림, None 유지, 결정적 키 순서
+```
+이 모듈의 각 라벨 함수(`ema_state`, `vote`, `ichimoku`, `candle_patterns`, `smc_structure`, `fvg`, `zones`, `obv_trend`, `historical_var`, `rolling_corr`)는 공개 함수로 노출해 단독 테스트한다.
+
+## 18. `tradingbot/scanner.py` — 코드 전용 스캐너
+
+```python
+class Thresholds:   # 설정으로 덮어쓸 수 있는 기본값(환경변수 SCANNER_*; 없으면 기본)
+    MIN_QUOTE_VOLUME_24H = 20_000_000.0; MAX_SPREAD_BPS = 10.0; MIN_DEPTH_1PCT_USDT = 200_000.0
+    MIN_VOL_RATIO_15M = 0.3; MAX_SPIKE_24H_PCT = 15.0; SPIKE_VOLUME_MULT = 2.0; FUNDING_WINDOW_S = 60
+class LiquidityGate(BaseModel): symbol: str; ok: bool; reasons: list[str]; spread_bps: float | None; quote_volume_24h: float | None; depth_1pct_usdt: float | None
+class Candidate(BaseModel): symbol: str; rank: int; composite_z: float; factor_table: dict[str, float | None]; reasons: list[str]
+class ScanResult(BaseModel):
+    ts: int; universe: list[str]; candidates: list[Candidate]; skipped: list[dict]      # {"symbol","reason"}
+    regime: RegimePack; sentiment: SentimentComposite; funding_window: bool
+    feature_packs: dict[str, FeaturePack]; flow_packs: dict[str, FlowPack]; risk_packs: dict[str, RiskPack]
+    liquidity: dict[str, LiquidityGate]; quality: dict[str, QualityReport]; news: list[NewsItem]; news_available: bool
+    marks: dict[str, float]                 # 심볼별 현재가(보유 포지션 마크에도 사용)
+    fetched: dict[str, int]                 # 심볼별 캔들 수 요약(디버그)
+
+FACTOR_WEIGHTS = {"momentum_4h": 0.25, "momentum_1d": 0.15, "reversal_1h": 0.10, "rv_24h": -0.10, "volume_ratio": 0.10, "rs_vs_btc": 0.15, "funding_z": -0.10, "oi_change_24h": 0.05}
+def in_funding_window(now_ms: int, window_s: int = 60) -> bool     # UTC 00:00/08:00/16:00 ± window
+def zscores(values: dict[str, float | None]) -> dict[str, float | None]   # 표본 ≥4이면 z, 아니면 순위 기반 (−1..1)
+def rank_candidates(features, flows, risks, btc_symbol, exclude: set[str], max_candidates: int) -> list[Candidate]
+    # momentum_4h: 마지막 봉을 뺀 직전 24개 4h 로그수익률 합 ; momentum_1d: 마지막 일봉 뺀 7일 ; reversal_1h: −(최근 4개 1h 수익률 합) ; rv_24h ; volume_ratio(15m) ; rs_vs_btc = momentum_4h − BTC momentum_4h ; funding_z: 펀딩 now 의 7d 대비 z ; oi_change_24h
+class Scanner:
+    def __init__(self, settings: Settings, market: MarketData, *, news_fetcher=None, fear_greed_fetcher: Callable[[], int | None] | None = None, cache_dir: Path | None = None, thresholds: Thresholds | None = None)
+    def scan(self, state: BotState, now_ms: int) -> ScanResult
+    # 1) 유니버스 = settings.symbols (+ BTC/USDT 는 레짐 계산용으로 항상 조회)
+    # 2) 캔들 15m 300 / 1h 200 / 4h 200 / 1d 120 ; 4h·1d 는 시각이 바뀌지 않았으면 메모리 캐시 재사용
+    # 3) quality.check 실패 종목은 skipped(reason) — 보유 종목이면 marks 만 갱신하고 LLM 입력에서 제외
+    # 4) 유동성 게이트 ; 보유/쿨다운/복수매매/급등 제외 ; 펀딩창이면 funding_window=True(후보는 남기되 cycle 이 신규 주문 금지)
+    # 5) 팩 생성(후보 전체 + 보유 종목), 레짐, 종합심리(뉴스 극성은 news_sentiment 결과가 없으면 None)
+    # 6) 레짐 게이트: macro_alarm → candidates=[] (skipped 에 사유) ; name_alarm 종목 제외
+    # 모든 네트워크 실패는 종목 단위로 격리(ExchangeError → skipped). BTC 데이터 실패 시 regime.verdict="normal" 에 unknown 라벨.
+```
+
+## 19. `tradingbot/gates.py` — G0~G4 (순수 함수)
+
+```python
+class GateDecision(BaseModel): gate: str; passed: bool; reasons: list[str]; size_multiplier: float = 1.0; confidence_floor: float = HardLimits.MIN_CONFIDENCE; notes: list[str] = []
+def g0_preflight(state: BotState, equity: float, now_ms: int, budget_ok: bool, funding_window: bool) -> GateDecision      # risk.global_gates + llm 일시정지 + 펀딩창(신규 주문 금지 사유만 추가)
+def g1_candidate(symbol: str, tech: TechnicalOutput | None, flow: FlowSymbolView | None, news_risk_symbols: set[str], sentiment: SentimentComposite, position_count: int, exposure_pct: float, corr_to_open: dict[str, float], tech_abstained: bool) -> GateDecision
+def g2_bear(bear: BearOutput | None) -> GateDecision            # None(기권) 은 통과시키되 notes 에 "bear_abstained"
+def g3_risk(symbol: str, verdict: RiskCandidateVerdict | None, regime: RegimePack, decay_state: str, bias: dict[str, str], risk_pack: RiskPack, liquidity: LiquidityGate, planned_notional: float, stop_pct: float) -> GateDecision
+    # verdict None(기권) → passed False ("risk_abstained": 리스크 기권이면 신규 진입 없음)
+def g4_final(decision: HeadDecision, verdict: RiskCandidateVerdict, floor: float, size_multiplier: float, equity: float, entry_price: float, atr_1h: float | None, free_quote: float) -> tuple[GateDecision, OrderPlan | None]
+class OrderPlan(BaseModel): symbol: str; quote_amount: float; stop_loss_price: float; take_profit_price: float; size_pct: float; notes: list[str]
+```
+G4 계산 순서: stop_pct = min(head.stop_pct, verdict.stop_pct, 2.0) → `risk.clamp_stops` → `risk.enforce_net_rr` → size_pct = min(head.size_pct, verdict.max_size_pct, 10) → `risk.size_position(... size_multiplier ...)`에서 quote 계산 후 size_pct 상한 적용 → MIN_ORDER_USDT 미만이면 HOLD.
+
+## 20. `tradingbot/agents/` — 역할·스키마·러너·파이프라인
+
+### 20.1 `schemas.py` (출력 모델; 전부 `extra="forbid"`, 각 모델에 `@classmethod conservative_example()`)
+```python
+Direction = Literal["long","flat","avoid"]
+class TechnicalOutput(BaseModel):
+    symbol: str; direction: Direction; setup_type: Literal["trend_continuation","mean_reversion","breakout","none"]
+    timing: Literal["now","wait_pullback","wait_confirmation"]; mtf_agreement: bool; score: int  # −5..5
+    confidence: float  # 0..1
+    stop_candidate_price: float | None; stop_pct: float | None; sl_reference: Literal["zone","kijun","atr","none"]
+    target_candidate_price: float | None; tp_pct: float | None
+    invalidation: str; noise_check: bool; exit_flag: bool = False; exit_reason: str | None = None
+    evidence: list[str]   # ≤3, 각 항목은 입력 필드명을 포함
+class FlowSymbolView(BaseModel):
+    symbol: str; posture: Literal["capitulation","fear","neutral","greed","euphoria"]; crowding_risk: Literal["low","moderate","high"]
+    squeeze_direction: Literal["up","down","none"]; cascade_risk: Literal["low","moderate","high"]; nearest_long_liq_cluster_pct_below: float | None
+    stop_inside_cascade: bool; washout_setup: bool; block_new_longs: bool; block_reason: str | None
+    flow_bias: Literal["long","neutral","avoid"]; confidence: float; evidence: list[str]
+class FlowOutput(BaseModel): per_symbol: list[FlowSymbolView]; market_wide_note: str; data_confidence: Literal["high","low"]
+class NewsEvent(BaseModel): headline_id: str; score: float; event_type: Literal["hack","regulatory","listing","delisting","macro","etf","exchange","protocol","sentiment","technical_break","other"]; symbols: list[str]; summary: str; stale: bool
+class NewsOutput(BaseModel): events: list[NewsEvent]; risk_event: bool; risk_event_symbols: list[str]; market_tone: float; market_note: str; feed_health_note: str
+class ThesisPoint(BaseModel): claim: str; evidence_field: str
+class BullOutput(BaseModel):
+    symbol: str; case_strength: int; thesis_points: list[ThesisPoint]; catalysts: list[str]; underreaction_evidence: str
+    entry_trigger: str; expected_horizon_bars: int; invalidation_level: float | None; disconfirming_evidence: list[str]  # ≥2
+    main_risk_to_bull_case: str; what_would_disprove: str; confidence: float
+class DeathPath(BaseModel): family: Literal["liquidation_cascade","news_shock","regime_flip","crowded_unwind","data_incident","other"]; description: str; observable_trigger: str; probability_band: Literal["low","mid","high","unknown"]; time_to_impact_bars: int | None
+class BearOutput(BaseModel):
+    symbol: str; death_paths: list[DeathPath]  # ≥3
+    greed_flags: list[str]; disconfirming_evidence: list[str]; strongest_point: str; what_would_disprove_bear: str
+    verdict: Literal["survivable","survivable_if_monitored","decline"]; monitoring_conditions: list[str]; confidence: float
+class BullPointReliability(BaseModel): point: str; score_1_5: int; pushback: str
+class RiskCandidateVerdict(BaseModel):
+    symbol: str; verdict: Literal["approve","conditional","veto"]; veto_reasons: list[str]; conditions: list[str]
+    max_size_pct: float; stop_pct: float; take_profit_pct: float; rr_net_estimate: float | None
+    bull_point_reliability: list[BullPointReliability]; required_monitoring: list[str]; correlation_note: str
+class RiskPositionView(BaseModel): symbol: str; assumption_status: list[Literal["holding","weakening","impaired","broken"]]; red_lines_triggered: list[str]; health: int; action: Literal["hold","trim","exit"]; reason: str
+class RiskGlobal(BaseModel): entries_paused: bool; pause_reason: str | None; confidence_floor: float; exposure_cap_pct: float; portfolio_note: str
+class RiskOutput(BaseModel): candidates: list[RiskCandidateVerdict]; positions: list[RiskPositionView]; global_: RiskGlobal = Field(alias="global"); risk_note: str; confidence: float   # model_config populate_by_name=True
+class RedLine(BaseModel): metric: Literal["price","unrealized_pct","funding_rate","btc_return_1h_pct","composite_sentiment","hours_held"]; op: Literal["<",">"]; value: float
+class Thesis(BaseModel): reasons: list[str]; assumptions: list[str]; red_lines: list[RedLine]; horizon_bars: int
+class HeadDecision(BaseModel):
+    symbol: str; action: Literal["BUY","SELL","HOLD"]; confidence: float; size_pct: float; stop_pct: float; tp_pct: float
+    thesis: Thesis; disagreement_class: Literal["horizon","caliber","risk_preference","information","none"]
+    losing_side_strongest_point: str; decisive_factor: str; rationale: str
+class Debias(BaseModel): anchored_to_entry: bool; ignored_bearish_news: bool; overtrading: bool; chasing_spike: bool; acting_on_sentiment_alone: bool
+class HeadOutput(BaseModel): decisions: list[HeadDecision]; debias: Debias; reevaluation_triggers: list[str]; hold_reasons: list[str]; cycle_note: str
+class JournalPostTrade(BaseModel): trade_id: str; summary_bullets: list[str]; assumptions_at_exit: list[dict]; broken_assumption: str | None; near_miss_rules: list[str]; lesson: str; lesson_tag: Literal["thesis_broken","stop_too_tight","chased_spike","news_ignored","good_exit","time_stop","regime_exit","risk_exit","other"]; telegram_text: str
+class JournalDaily(BaseModel): summary_bullets: list[str]; what_worked: list[str]; what_failed: list[str]; risks: list[str]; action_items: list[dict]; abstain_reason: str | None; do_not_change_yet: bool; telegram_text: str
+```
+`conservative_example()`는 "아무 것도 하지 않는" 안전값(technical: flat/confidence 0, bear: decline, risk: veto·entries_paused False, head: HOLD 전부)이어야 한다. 검증자(validator)는 `confidence`∈[0,1], `score`∈[−5,5], `stop_pct`∈(0,2], `tp_pct`∈(0,4], `size_pct`∈[0,10], `health`∈[1,10], `case_strength`∈[1,5]를 `field_validator`로 강제한다(위반은 파싱 실패 → 기권).
+
+### 20.2 `roles.py`
+```python
+@dataclass(frozen=True)
+class RoleSpec: role_id: str; tier: Tier; prompt_file: str; skills: tuple[str, ...]; output_model: type[BaseModel]; max_tokens: int; effort: Literal["low","medium","high"]; timeout_s: float; batched: bool
+ROLES: dict[str, RoleSpec] = {
+  "technical": (analysis, "prompts/technical.md", ("technical-basic","ichimoku","candlestick","smc","volatility","minute-analysis"), TechnicalOutput, 3000, "low", 30, False),
+  "derivatives_flow": (analysis, "prompts/derivatives_flow.md", ("perp-funding-basis","crypto-derivatives","liquidation-heatmap","investor-lenses","market-microstructure"), FlowOutput, 5000, "low", 35, True),
+  "news_sentiment": (analysis, "prompts/news_sentiment.md", ("event-driven","sentiment-analysis","research-discipline"), NewsOutput, 5000, "low", 35, True),
+  "bull": (research, "prompts/bull.md", ("behavioral-finance","research-discipline","event-driven"), BullOutput, 5000, "medium", 60, False),
+  "bear": (research, "prompts/bear.md", ("investor-lenses","behavioral-finance","research-discipline","correlation-regime","perp-funding-basis"), BearOutput, 5000, "medium", 60, False),
+  "risk_manager": (research, "prompts/risk_manager.md", ("risk-analysis","correlation-regime","correlation-analysis","asset-allocation","market-microstructure","execution-model","thesis-tracker","trade-journal","strategy-dev-manager","volatility","behavioral-finance"), RiskOutput, 7000, "medium", 75, True),
+  "head": (head, "prompts/head.md", ("investor-lenses","behavioral-finance","thesis-tracker","sentiment-analysis","event-driven","research-discipline"), HeadOutput, 9000, "high", 100, True),
+  "journal": (analysis, "prompts/journal.md", ("trade-journal","performance-attribution","report-generate","strategy-dev-manager"), JournalPostTrade|JournalDaily (호출 시 지정), 4000, "low", 60, False),
+}
+```
+
+### 20.3 `payloads.py` — 역할별 user payload 빌더(결정적, 컴팩트)
+`build_technical(symbol, fp: FeaturePack, position: Position | None, hard_limits: dict) -> dict`, `build_flow(flow_packs, symbols, thresholds) -> dict`, `build_news(headlines_new, aliases, now_ms, feed_health, prev_events) -> dict`, `build_bull(symbol, tech, flow_view, news_events, sentiment, scanner_row, regime, position) -> dict`, `build_bear(... + corr_to_open, hv_pct) -> dict`, `build_risk(candidates_ctx, positions_ctx, risk_packs, regime, account_pack, news_risk_symbols, flow_blocks) -> dict`, `build_head(approved_ctx, flagged_positions_ctx, regime, account_pack, sentiment, vetoed_ctx, hard_limits, abstained_channels) -> dict`, `build_journal_post_trade(trade, thesis_history, verdicts) -> dict`, `build_journal_daily(metrics_table, closed_count) -> dict`. 모든 빌더는 `features.compact` 로 반올림하고 `hard_limits` 는 항상 `{"max_position_pct":10,"max_positions":3,"max_stop_pct":2,"max_tp_pct":4,"min_confidence":0.65}` 를 포함한다. 캔들 원본은 넣지 않는다(1h 종가 20개만).
+
+### 20.4 `runner.py`
+```python
+class AgentRunner:
+    def __init__(self, settings: Settings, backend: AgentBackend, skills: SkillRegistry, prompts_dir: Path, *, max_workers: int = 6)
+    def system_prompt(self, role_id: str) -> str          # prompts/<role>.md + "\n\n# Skills\n" + skills.render(role) ; 메모리 캐시 ; 바이트 고정
+    def run(self, role_id: str, payload: dict, *, output_model: type[BaseModel] | None = None) -> AgentResult   # BudgetExceeded 는 전파
+    def run_many(self, calls: list[tuple[str, dict]]) -> list[AgentResult]   # 스레드풀 병렬, 순서 보존
+```
+
+### 20.5 `pipeline.py` — Step 2~4 + G1~G3
+```python
+class CandidateContext(BaseModel): symbol: str; candidate: Candidate; technical: TechnicalOutput | None; flow: FlowSymbolView | None; bull: BullOutput | None; bear: BearOutput | None; risk: RiskCandidateVerdict | None; gates: list[GateDecision]; dropped_at: str | None
+class PositionContext(BaseModel): symbol: str; technical: TechnicalOutput | None; risk: RiskPositionView | None; red_line_hits: list[str]; health_history: list[int]; flagged_for_head: bool; flag_reason: str | None
+class PipelineResult(BaseModel): candidates: list[CandidateContext]; positions: list[PositionContext]; news: NewsOutput | None; flow: FlowOutput | None; risk_global: RiskGlobal | None; head: HeadOutput | None; abstained: list[str]; llm_calls: int; llm_cost_usd: float; gate_log: list[GateDecision]; head_skipped_reason: str | None
+def run_pipeline(scan: ScanResult, state: BotState, equity: float, runner: AgentRunner, journal_state: JournalState, now_ms: int, *, news_store: NewsStore) -> PipelineResult
+```
+규칙: 분석가 3종은 `run_many` 로 동시에(technical 은 후보∪보유 각각, flow 1회, news 는 새 헤드라인 있을 때만); 모두 끝난 뒤 G1; 살아남은 후보에 bull·bear 를 **한 번의 run_many** 로; G2; risk_manager 1회(후보 생존 또는 보유 있음); G3; head 는 승인/조건부 후보 ≥1 또는 플래그 포지션 ≥1 일 때만 1회. `BudgetExceeded` 가 어느 단계에서든 나면 그 시점까지의 결과로 HOLD 처리하고 `abstained` 에 "budget" 기록(예외는 cycle 로 전파해 LLM 일시정지 처리). 어떤 역할 출력도 다른 분석가의 입력이 되지 않는다(bull/bear/risk/head 만 상위 출력을 본다).
+
+## 21. `tradingbot/journal.py`
+```python
+class JournalState(BaseModel): closed_count: int; decay_state: Literal["insufficient_sample","healthy","warning","decayed"]; bias: dict[str, Literal["none","mild","severe","insufficient_sample"]]; gate_stats: dict[str, int]; health_history: dict[str, list[int]]; thesis: dict[str, Thesis]; last_daily_review_date: str | None
+def evaluate_red_lines(thesis: Thesis, mark: float, position: Position, funding: float | None, btc_return_1h_pct: float | None, sentiment: float | None, now_ms: int) -> list[str]
+def bias_severities(trades: list[ClosedTrade], cycle_minutes: int) -> dict[str, str]    # disposition: 손실 보유시간/이익 보유시간 ≥1.2 mild ≥1.5 severe ; overtrading: 일 거래수 > 8 mild > 12 severe ; chasing: 진입 직전 1h +3% 이상 비율 >30% mild >50% severe ; anchoring: 진입가 ±0.3% 내 청산 비율 >30% ; 20건 미만 insufficient_sample
+def decay_state(trades: list[ClosedTrade]) -> str                 # 최근 20건 PF: ≥1.1 healthy, 0.9~1.1 warning, <0.9 decayed ; 20건 미만 insufficient_sample
+def post_trade_review(runner, trade: ClosedTrade, ctx: dict) -> JournalPostTrade | None   # 실패 시 None(코드 요약으로 대체)
+def daily_review(runner, state, trades, metrics) -> JournalDaily | None
+def code_metrics(trades: list[ClosedTrade], equity_curve: list[float], btc_curve: list[float] | None) -> dict   # 승률·PF·평균손익·샤프/소르티노/칼마·MDD·BTC 대비
+```
+
+## 22. `tradingbot/cycle.py` 확정 순서
+1. 잠금(`bot.lock`) 확인·갱신, `control/STOP`→kill, `control/CLEAR`→kill 해제(파일 삭제).
+2. 상태 로드, 날짜 롤오버(전일 `daily_summary` notify + 저널 일일 리뷰 호출은 00:05 UTC 이후 첫 사이클).
+3. `Scanner.scan` → marks 로 포지션 마크 갱신, equity·peak 갱신, 낙폭 사다리 레벨 계산(−6% 이면 `set_kill("drawdown_stop_all")` + notify).
+4. **코드 청산**: 보유마다 `risk.check_exits` → market_sell → `close_position` → `save` → notify(exit) → 저널 사후분석(실패 무시).
+5. G0. 실패면 결정 로그·보고서 쓰고 종료(LLM 0회).
+6. `run_pipeline`. `BudgetExceeded` → `pause_llm(다음 UTC 자정)` + notify(budget_exceeded); 인증 오류 기권 다수 → `pause_llm(60분)` + notify(llm_paused).
+7. head 결정 처리: SELL(보유) → 매도·저장·notify(exit, reason head_sell); BUY → G4 → OrderPlan → market_buy → `open_position`(논지·레드라인 저장) → `save` → notify(entry); 강등은 notify(order_rejected 종류 "gate_downgrade"). HOLD 는 로그만.
+8. 결정 로그(`decisions.jsonl`: 역할별 출력 요약·게이트·비용), 사이클 보고서, 상태 저장, `CycleSummary` 반환. 사이클 기한 5분 초과 시 남은 단계는 HOLD 처리 + notify(error "cycle_deadline").
+
+`main.py run`: 루프는 `cycle_minutes` 경계 + 5초에 실행. 하트비트(4h) notify. SIGINT 시 notify(shutdown)·flush.
+
+## 23. 프롬프트·스킬 규약
+- `prompts/<role>.md`: 영어 지시 + "모든 자유 텍스트 필드는 한국어" 규칙. 반드시 포함: 역할·입력 필드 설명·출력 스키마 요약·하드 리밋 재진술·근거는 입력 필드명 인용·숫자 날조 금지·기권 정책·현물 롱 전용(약세는 '진입 안 함/청산'으로만 표현)·"empty feed ≠ calm market". 사이클 번호·날짜·심볼을 프롬프트에 넣지 않는다(캐시).
+- `skills/<name>/SKILL.md`: frontmatter `name, description, roles: [...], version: 1, source: "adapted from HKUDS/Vibe-Trading agent/src/skills/<name>/SKILL.md (MIT)", license: MIT`. 본문 ≤ 900 단어, 우리 말로 다시 쓴 절차·임계값·체크리스트. 원문 문장 복사 금지(공식·숫자는 허용). 현물 봇에 맞지 않는 부분(옵션·A주·숏)은 뺀다.
+- `THIRD_PARTY_NOTICES.md`: Vibe-Trading MIT 전문 + 적용 범위.
+
+## 24. 테스트 요구 (v2)
+`test_features.py`(라벨 함수별 합성 캔들), `test_scanner.py`(가짜 MarketData: 게이트·랭킹·레짐·제외·펀딩창), `test_gates.py`(G1~G4 경계·기권), `test_schemas.py`(검증자·conservative_example), `test_runner.py`(시스템 프롬프트 바이트 고정·병렬 순서), `test_pipeline.py`(MockBackend 시나리오: 전원 기권→HOLD, 약세 decline→탈락, 리스크 veto→탈락, 승인→BUY, 예산 초과), `test_journal.py`, `test_cycle.py`(paper 1사이클 end-to-end: 진입·저장·텔레그램 가짜 전송 기록·결정 로그·청산 사이클), `test_main.py`(CLI 인자·live 확인 입력). 목표 v1+v2 합계 600개 이상.

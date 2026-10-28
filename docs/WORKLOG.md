@@ -63,6 +63,12 @@
 - 콘텐츠 커밋 후, 프롬프트가 기대하는 입력 구조를 바탕으로 **SPEC v2.1 §20.3a payload 필드 계약**을 확정(역할별 키 목록·경로). 결함 16건 해소 방침을 통일 결정(D1~D15)으로 정리: cgo_60 ±3%, tp=min(4,max(2s,1.5s+0.75)), 노이즈·실행비용·뉴스 경과시간은 코드가 계산, 기술분석가 payload에서 총괄 thesis 제외, 뉴스 7단계 척도, 손절 넓히기 금지 등.
 - 병렬 실행: ① 프롬프트 8 + 스킬 5묶음 정렬 → 교차검토 → 적용 → 기계 검증, ② v2 코드(features/runner/journal → scanner/payloads → gates/pipeline → cycle+main → 통합 + 오프라인 paper e2e). 오케스트레이션 스크립트는 `docs/workflows/`에 보관.
 
+### 13:10 콘텐츠 정렬·v2 코드 완료
+- 프롬프트·스킬 정렬 워크플로(에이전트 16): 입력 절을 §20.3a와 일치(경로 기계 검사), 교차검토 17건 적용. 추정 청산군집이 VWAP 기준 고정 거리라 '2% 이내'가 늘 성립 → 거리만으로는 경고로 변경. 역할별 스킬 전부 렌더(최대 risk_manager ~15k 토큰).
+- v2 코드 워크플로(에이전트 25, 오류 0): features·scanner·gates·agents(roles/runner/payloads/pipeline)·journal·cycle·main + `tradingbot/testing.py`(합성 시세·MOCK_SCENARIO). **전체 3,578 테스트 통과(37초)**.
+- 직접 확인한 오프라인 e2e: `MOCK_SCENARIO=approve run --once --offline-fixture` → BTC·ETH paper 진입(각 500 USDT=5%, 손절 −1.00%/익절 +2.25% → 비용 반영 순손익비 1.5), `status`·결정 로그·사이클 보고서 정상. conservative 시나리오는 HOLD(총괄 호출 생략).
+- 시스템 전체 반박 리뷰 시작(7관점: 돈·한도 / 저장·충돌 / 비밀 / Claude API / 계약 일치 / 텔레그램 / 운영 → 파일별 수정 → 통합).
+
 ### 진행 원칙
 - 이전 세션 트랜스크립트 원문은 비밀(키) 포함 가능성 때문에 저장소에 올리지 않음. 비밀 검사(정규식)를 통과한 요약만 커밋.
 - 기존 봇의 하드 리밋(`risk.py`), paper 기본 모드, 실자금 매매 금지 원칙은 유지.

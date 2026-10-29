@@ -1145,3 +1145,52 @@ def test_offline_fixture_log_file_goes_to_isolated_dir(tmp_path):
     absolute = load_settings(env_for(tmp_path, LOG_FILE=str(tmp_path / "elsewhere.log")))
     assert M.offline_fixture_settings(absolute).log_file == tmp_path / "elsewhere.log"
 
+
+
+# ======================================================================= 대시보드: 큰 로그 끝부분만 읽기
+def test_dashboard_tail_read_matches_full_read(tmp_path):
+    from tradingbot.dashboard import app as A
+
+    p = tmp_path / "decisions.jsonl"
+    rows = [json.dumps({"i": i, "note": "결정 " * (i % 7)}, ensure_ascii=False) for i in range(5000)]
+    rows.insert(4990, "{not json")                     # 끝부분의 깨진 줄
+    rows.insert(4995, json.dumps([1, 2]))              # dict 가 아닌 줄
+    p.write_bytes(("\n".join(rows) + "\n").encode("utf-8"))
+    full = A._parse_jsonl_lines(p.read_text(encoding="utf-8").splitlines())
+    for limit in (1, 10, 100, 4999, 5000, 6000):
+        assert A._read_jsonl(p, limit) == full[-limit:]
+    assert A._read_jsonl(p, 0) == [] and A._read_jsonl(p) == full
+
+
+def test_dashboard_tail_read_bounded_and_handles_partial_last_line(tmp_path):
+    from tradingbot.dashboard import app as A
+
+    p = tmp_path / "decisions.jsonl"
+    line = json.dumps({"x": "y" * 200}) + "\n"
+    with p.open("wb") as fh:
+        for _ in range(60_000):                         # 약 12 MB
+            fh.write(line.encode("utf-8"))
+        fh.write(b'{"ts": 2, "reason": "\xed\x95')     # 크래시로 잘린 마지막 줄(멀티바이트 중간)
+    reads: list[int] = []
+    real_open = Path.open
+
+    def counting_open(self, mode="r", *a, **k):
+        fh = real_open(self, mode, *a, **k)
+        if self == p and "b" in mode:
+            orig = fh.read
+            fh.read = lambda n=-1: (reads.append(n), orig(n))[1]     # type: ignore[method-assign]
+        return fh
+
+    import unittest.mock as um
+    with um.patch.object(Path, "open", counting_open):
+        out = A._read_jsonl(p, 100)
+    assert len(out) == 100 and all(r == {"x": "y" * 200} for r in out)
+    assert reads and sum(reads) <= 256 * 1024          # 12 MB 전체가 아니라 끝부분만
+
+
+def test_dashboard_polls_sequentially_and_bounds_shutdown():
+    html = (Path(__file__).resolve().parents[1] / "tradingbot" / "dashboard" / "static" / "index.html").read_text(
+        encoding="utf-8")
+    assert "setInterval(refresh" not in html and "setTimeout(loop, POLL_MS)" in html
+    src = (Path(__file__).resolve().parents[1] / "tradingbot" / "main.py").read_text(encoding="utf-8")
+    assert "timeout_graceful_shutdown=5" in src

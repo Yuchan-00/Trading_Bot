@@ -1408,8 +1408,10 @@ def _cmd_dashboard(settings: Settings, out: TextIO) -> int:  # pragma: no cover 
     from tradingbot.dashboard.app import create_app
 
     out.write(f"대시보드: http://{settings.dashboard_host}:{settings.dashboard_port}\n")
+    # timeout_graceful_shutdown: Windows Proactor 루프에서 리셋된 연결이 남으면 Ctrl+C 뒤 wait_closed() 가 끝나지
+    # 않는다(CPython _call_connection_lost 의 shutdown 이 WinError 10054) — 5초 뒤 남은 요청을 끊고 종료한다.
     uvicorn.run(create_app(settings, Path(settings.data_dir)), host=settings.dashboard_host,
-                port=settings.dashboard_port, log_level="warning")
+                port=settings.dashboard_port, log_level="warning", timeout_graceful_shutdown=5)
     return EXIT_OK
 
 

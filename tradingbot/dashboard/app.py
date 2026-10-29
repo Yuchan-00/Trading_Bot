@@ -115,16 +115,13 @@ def _read_json(path: Path) -> Any | None:
         return None
 
 
-def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
-    """jsonl의 마지막 ``limit``줄(파일 순서 유지). 깨진 줄·dict가 아닌 줄은 건너뛴다."""
-    try:
-        if not path.is_file():
-            return []
-        # 잘린 멀티바이트(크래시·디스크 풀)가 있어도 나머지 줄은 살린다.
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except _READ_ERRORS as e:
-        log.warning("jsonl 읽기 실패 %s: %s", path, e)
-        return []
+#: ``limit`` 이 있는 jsonl 읽기는 파일 끝에서 이만큼(바이트)까지만 읽는다 — 몇 달 쌓인 결정 로그(수십~수백 MB)를
+#: 폴링마다 통째로 읽고 파싱하면 CPU·메모리를 잡아먹고, Windows 에서는 그동안 봇의 파일 교체(state.json 등)를 막는다.
+_TAIL_MAX_BYTES = 8 * 1024 * 1024
+_TAIL_CHUNK_BYTES = 64 * 1024
+
+
+def _parse_jsonl_lines(lines: list[str]) -> list[dict]:
     out: list[dict] = []
     for line in lines:
         line = line.strip()
@@ -136,9 +133,51 @@ def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
             continue
         if isinstance(rec, dict):
             out.append(rec)
-    if limit is not None and limit >= 0:
-        out = out[-limit:] if limit > 0 else []
     return out
+
+
+def _tail_jsonl(path: Path, limit: int, max_bytes: int = _TAIL_MAX_BYTES) -> list[dict]:
+    """파일 끝에서부터 거꾸로 읽어 유효한 마지막 ``limit`` 줄을 모은다(최대 ``max_bytes``; 잘린 첫 줄은 버린다)."""
+    chunks: list[bytes] = []
+    with path.open("rb") as fh:
+        end = fh.seek(0, os.SEEK_END)
+        pos = end
+        newlines = 0
+        need = limit + 1                     # 잘렸을 수 있는 첫 줄 하나를 더 읽는다
+        while pos > 0 and end - pos < max_bytes:
+            step = min(_TAIL_CHUNK_BYTES, pos, max_bytes - (end - pos))
+            pos -= step
+            fh.seek(pos)
+            chunk = fh.read(step)
+            chunks.append(chunk)
+            newlines += chunk.count(b"\n")
+            if newlines >= need:
+                lines = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()
+                if len(_parse_jsonl_lines(lines[1:])) >= limit:      # 첫 줄은 중간에서 잘렸을 수 있다
+                    break
+                need = newlines * 2          # 깨진 줄이 많다 → 두 배 더 읽고 다시 센다
+    lines = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()
+    if pos > 0 and lines:
+        lines = lines[1:]
+    return _parse_jsonl_lines(lines)[-limit:]
+
+
+def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
+    """jsonl의 마지막 ``limit``줄(파일 순서 유지). 깨진 줄·dict가 아닌 줄은 건너뛴다.
+
+    ``limit`` 이 있으면 파일 끝에서 필요한 만큼만(최대 ``_TAIL_MAX_BYTES``) 읽는다. 없으면 전체(비용 합계용).
+    """
+    try:
+        if not path.is_file():
+            return []
+        if limit is not None and limit >= 0:
+            return _tail_jsonl(path, limit) if limit > 0 else []
+        # 잘린 멀티바이트(크래시·디스크 풀)가 있어도 나머지 줄은 살린다.
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except _READ_ERRORS as e:
+        log.warning("jsonl 읽기 실패 %s: %s", path, e)
+        return []
+    return _parse_jsonl_lines(lines)
 
 
 def _clamp_limit(limit: int) -> int:

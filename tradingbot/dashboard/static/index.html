@@ -351,14 +351,15 @@
       getJSON("/api/backtests").then(renderBacktests),
       getJSON("/api/journal?limit=50").then(renderJournal)
     ];
-    Promise.all(calls.map(function (p) { return p.then(function () { return null; }, function (e) { return e; }); })).then(function (errs) {
+    return Promise.all(calls.map(function (p) { return p.then(function () { return null; }, function (e) { return e; }); })).then(function (errs) {
       var bad = errs.filter(Boolean);
       $("err").textContent = bad.length ? ("오류: " + bad.map(String).join("; ")) : "";
       $("h-updated").textContent = new Date().toTimeString().slice(0, 8);
     });
   }
-  refresh();
-  setInterval(refresh, POLL_MS);
+  // 이전 갱신이 끝난 뒤에 다음 갱신을 예약한다(setInterval 은 응답이 느리면 요청이 쌓인다)
+  function loop() { refresh().then(function () { setTimeout(loop, POLL_MS); }, function () { setTimeout(loop, POLL_MS); }); }
+  loop();
 })();
 </script>
 </body>

@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Bot Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171d26; --border: #273040; --text: #e6edf3; --muted: #8b98a8;
+    --up: #3fb950; --down: #f85149; --warn: #d29922; --accent: #58a6ff; --bar: #223042;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; }
+  .stat { display: flex; flex-direction: column; min-width: 90px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: var(--bar); color: var(--text); }
+  .badge.on { background: var(--down); color: #fff; }
+  .badge.warn { background: var(--warn); color: #000; }
+  .badge.ok { background: var(--up); color: #000; }
+  main { padding: 16px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; min-width: 0; }
+  section.wide { grid-column: 1 / -1; }
+  section h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; display: flex; justify-content: space-between; align-items: center; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; }
+  .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 8px 0; }
+  canvas { width: 100%; height: 90px; display: block; }
+  .bar { height: 10px; background: var(--bar); border-radius: 5px; overflow: hidden; margin: 4px 0 8px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar > i.warn { background: var(--warn); } .bar > i.over { background: var(--down); }
+  details { border-bottom: 1px solid var(--border); padding: 6px 0; }
+  details summary { cursor: pointer; display: flex; gap: 10px; flex-wrap: wrap; }
+  details pre { margin: 6px 0 0; background: var(--bg); padding: 8px; border-radius: 6px; overflow: auto; max-height: 260px; font-size: 12px; }
+  .roles { display: grid; gap: 6px; margin-top: 6px; }
+  .role { background: var(--bg); border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+  .role b { color: var(--accent); }
+  .stop { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=password], input[type=text] { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; min-width: 180px; }
+  button { border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-weight: 600; }
+  button.danger { background: var(--down); color: #fff; }
+  button.secondary { background: var(--bar); color: var(--text); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #msg { font-size: 12px; color: var(--muted); }
+  .scroll { max-height: 360px; overflow: auto; }
+  #err { color: var(--down); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Trading Bot</h1>
+  <div class="stat"><span class="k">모드</span><span class="v" id="h-mode">-</span></div>
+  <div class="stat"><span class="k">사이클</span><span class="v" id="h-cycle">-</span></div>
+  <div class="stat"><span class="k">자본 (USDT)</span><span class="v" id="h-equity">-</span></div>
+  <div class="stat"><span class="k">당일 손익</span><span class="v" id="h-daily">-</span></div>
+  <div class="stat"><span class="k">낙폭</span><span class="v" id="h-dd">-</span></div>
+  <div class="stat"><span class="k">포지션</span><span class="v" id="h-pos">-</span></div>
+  <div class="stat"><span class="k">LLM</span><span class="v" id="h-llm"><span class="badge">-</span></span></div>
+  <div class="stat"><span class="k">킬스위치</span><span class="v" id="h-kill"><span class="badge">-</span></span></div>
+  <div class="stat"><span class="k">마지막 사이클</span><span class="v" id="h-last">-</span></div>
+  <div class="stat"><span class="k">갱신</span><span class="v muted" id="h-updated">-</span></div>
+  <span id="err"></span>
+</header>
+
+<main>
+  <section class="wide">
+    <h2>자본 추이 (사이클 보고서) <span class="muted" id="spark-info"></span></h2>
+    <canvas id="spark" width="1200" height="90"></canvas>
+  </section>
+
+  <section class="wide">
+    <h2>포지션</h2>
+    <div class="scroll"><table id="t-positions"></table></div>
+  </section>
+
+  <section class="wide">
+    <h2>최근 결정 <span class="muted" id="dec-count"></span></h2>
+    <div class="scroll" id="decisions"></div>
+  </section>
+
+  <section class="wide">
+    <h2>거래 내역</h2>
+    <div class="scroll"><table id="t-trades"></table></div>
+  </section>
+
+  <section>
+    <h2>LLM 비용</h2>
+    <div id="costs"></div>
+  </section>
+
+  <section>
+    <h2>백테스트 결과</h2>
+    <div class="scroll" id="backtests"></div>
+  </section>
+
+  <section>
+    <h2>저널 (사후 리뷰)</h2>
+    <div class="scroll" id="journal"></div>
+  </section>
+
+  <section>
+    <h2>긴급 정지</h2>
+    <div class="stop">
+      <input type="password" id="token" placeholder="X-Dashboard-Token (control/dashboard_token)" autocomplete="off">
+      <input type="text" id="reason" placeholder="사유" autocomplete="off">
+      <button class="danger" id="btn-stop">STOP</button>
+      <button class="secondary" id="btn-clear">해제 (CLEAR)</button>
+    </div>
+    <p id="msg">STOP은 control/STOP 파일을 만들고 봇이 다음 사이클에 kill_switch를 켭니다. 보유 포지션은 자동 청산하지 않습니다.</p>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var POLL_MS = 10000;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function num(v, d) { if (v == null || isNaN(v)) return "-"; return Number(v).toLocaleString("en-US", { minimumFractionDigits: d == null ? 2 : d, maximumFractionDigits: d == null ? 2 : d }); }
+  function pct(v, d) { if (v == null || isNaN(v)) return "-"; var s = (v * 100).toFixed(d == null ? 2 : d) + "%"; return (v > 0 ? "+" : "") + s; }
+  function signCls(v) { return v > 0 ? "up" : (v < 0 ? "down" : ""); }
+  function ts(ms) { if (!ms) return "-"; var d = new Date(Number(ms)); if (isNaN(d.getTime())) return String(ms); return d.toISOString().replace("T", " ").slice(0, 19) + "Z"; }
+  function ago(sec) { if (sec == null) return "-"; if (sec < 90) return sec + "초 전"; if (sec < 5400) return Math.round(sec / 60) + "분 전"; return (sec / 3600).toFixed(1) + "시간 전"; }
+  function badge(text, cls) { return '<span class="badge ' + (cls || "") + '">' + esc(text) + "</span>"; }
+
+  function getJSON(url) {
+    return fetch(url, { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error(url + " -> " + r.status); return r.json(); });
+  }
+
+  // ---------------------------------------------------------- 헤더
+  function renderHeader(st) {
+    var s = st && st.summary;
+    if (!s) {
+      $("h-mode").textContent = "-"; $("h-cycle").textContent = "-"; $("h-equity").textContent = "-";
+      $("h-daily").textContent = "-"; $("h-dd").textContent = "-"; $("h-pos").textContent = "-";
+      $("h-llm").innerHTML = badge("상태 없음"); $("h-kill").innerHTML = badge(st && st.stop_pending ? "STOP 대기" : "-", st && st.stop_pending ? "warn" : "");
+      $("h-last").textContent = "-";
+      return;
+    }
+    $("h-mode").innerHTML = badge(s.mode, s.mode === "live" ? "on" : (s.mode === "testnet" ? "warn" : ""));
+    $("h-cycle").textContent = s.cycle;
+    // testnet/live 에서 자본을 모르면(사이클 보고서 없음) equity/drawdown_pct 는 null -> "-" 로 표시
+    $("h-equity").textContent = s.equity == null ? "- (자본 미확인)" : num(s.equity);
+    $("h-daily").innerHTML = '<span class="' + signCls(s.daily_pnl) + '">' + num(s.daily_pnl) + " (" + pct(s.daily_pnl_pct) + ")</span>";
+    var ddCls = { none: "ok", caution: "warn", block: "on", stop_all: "on", unknown: "" }[s.drawdown_level] || "";
+    var ddTxt = s.drawdown_pct == null ? "-" : pct(-s.drawdown_pct);
+    $("h-dd").innerHTML = ddTxt + " " + badge(s.drawdown_level, ddCls);
+    $("h-pos").textContent = s.positions_count + " / " + s.max_positions;
+    $("h-llm").innerHTML = s.llm_paused ? badge("일시정지: " + (s.llm_pause_reason || ""), "warn") : badge("정상", "ok");
+    var killTxt = s.kill_switch ? "ON " + (s.kill_reason || "") : (st.stop_pending ? "STOP 대기" : "OFF");
+    $("h-kill").innerHTML = badge(killTxt, s.kill_switch ? "on" : (st.stop_pending ? "warn" : "ok"));
+    $("h-last").textContent = ago(s.last_cycle_age_s);
+  }
+
+  // ---------------------------------------------------------- 스파크라인 (canvas 직접 그림)
+  function drawSpark(points) {
+    var c = $("spark"), ctx = c.getContext("2d");
+    var w = c.width, h = c.height;
+    ctx.clearRect(0, 0, w, h);
+    var vals = points.map(function (p) { return Number(p.equity); }).filter(function (v) { return !isNaN(v); });
+    $("spark-info").textContent = vals.length ? (vals.length + "개 사이클, 최근 " + num(vals[vals.length - 1])) : "데이터 없음";
+    if (vals.length < 2) {
+      ctx.fillStyle = "#8b98a8"; ctx.font = "13px sans-serif"; ctx.fillText("사이클 보고서가 2개 이상 쌓이면 표시됩니다", 10, h / 2 + 4);
+      return;
+    }
+    var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+    if (max === min) { max += 1; min -= 1; }
+    var pad = 6, x0 = pad, x1 = w - pad, y0 = pad, y1 = h - pad;
+    var xs = function (i) { return x0 + (x1 - x0) * i / (vals.length - 1); };
+    var ys = function (v) { return y1 - (y1 - y0) * (v - min) / (max - min); };
+    // 기준선(첫 값)
+    ctx.strokeStyle = "#273040"; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(x0, ys(vals[0])); ctx.lineTo(x1, ys(vals[0])); ctx.stroke(); ctx.setLineDash([]);
+    // 면
+    var upTrend = vals[vals.length - 1] >= vals[0];
+    var color = upTrend ? "#3fb950" : "#f85149";
+    ctx.beginPath(); ctx.moveTo(xs(0), y1);
+    vals.forEach(function (v, i) { ctx.lineTo(xs(i), ys(v)); });
+    ctx.lineTo(xs(vals.length - 1), y1); ctx.closePath();
+    ctx.fillStyle = upTrend ? "rgba(63,185,80,0.12)" : "rgba(248,81,73,0.12)"; ctx.fill();
+    // 선
+    ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 2;
+    vals.forEach(function (v, i) { if (i === 0) ctx.moveTo(xs(i), ys(v)); else ctx.lineTo(xs(i), ys(v)); });
+    ctx.stroke();
+    // 최소/최대 라벨
+    ctx.fillStyle = "#8b98a8"; ctx.font = "11px sans-serif";
+    ctx.fillText(num(max), x0 + 2, y0 + 10); ctx.fillText(num(min), x0 + 2, y1 - 2);
+  }
+
+  // ---------------------------------------------------------- 표
+  function renderPositions(d) {
+    var rows = (d && d.positions) || [];
+    var t = $("t-positions");
+    if (!rows.length) { t.innerHTML = '<tr><td class="empty">보유 포지션 없음</td></tr>'; return; }
+    var h = "<tr><th>종목</th><th class=num>수량</th><th class=num>진입가</th><th class=num>마크</th><th class=num>평가액</th><th class=num>미실현</th><th class=num>손절</th><th class=num>익절</th><th class=num>확신도</th><th>진입 사이클</th><th>근거</th></tr>";
+    rows.forEach(function (p) {
+      h += "<tr><td>" + esc(p.symbol) + "</td><td class=num>" + num(p.base_amount, 6) + "</td><td class=num>" + num(p.entry_price, 4) + "</td><td class=num>" + num(p.mark, 4) +
+        "</td><td class=num>" + num(p.value_quote) + '</td><td class="num ' + signCls(p.unrealized_pnl) + '">' + num(p.unrealized_pnl) + " (" + pct(p.unrealized_pnl_pct) + ")" +
+        "</td><td class=num>" + num(p.stop_loss_price, 4) + "</td><td class=num>" + num(p.take_profit_price, 4) + "</td><td class=num>" + num(p.confidence) +
+        "</td><td>" + esc(p.opened_cycle) + '</td><td class="muted" title="' + esc(p.thesis) + '">' + esc(String(p.thesis || "").slice(0, 60)) + "</td></tr>";
+    });
+    t.innerHTML = h;
+  }
+
+  function renderTrades(d) {
+    var rows = (d && d.trades) || [];
+    var t = $("t-trades");
+    if (!rows.length) { t.innerHTML = '<tr><td class="empty">청산 거래 없음</td></tr>'; return; }
+    var h = "<tr><th>청산 시각</th><th>종목</th><th>사유</th><th class=num>수량</th><th class=num>진입</th><th class=num>청산</th><th class=num>손익</th><th class=num>수수료</th><th>사이클</th></tr>";
+    rows.forEach(function (x) {
+      h += "<tr><td>" + ts(x.closed_ts) + "</td><td>" + esc(x.symbol) + "</td><td>" + esc(x.reason) + "</td><td class=num>" + num(x.base_amount, 6) +
+        "</td><td class=num>" + num(x.entry_price, 4) + "</td><td class=num>" + num(x.exit_price, 4) + '</td><td class="num ' + signCls(x.pnl_quote) + '">' + num(x.pnl_quote) + " (" + pct(x.pnl_pct) + ")" +
+        "</td><td class=num>" + num(x.fee_quote_total, 4) + "</td><td>" + esc(x.opened_cycle) + "→" + esc(x.closed_cycle) + "</td></tr>";
+    });
+    t.innerHTML = h;
+  }
+
+  // 결정 레코드는 v2에서 확정. 알려진 키(roles/agents/decisions)가 있으면 역할별로, 없으면 JSON 그대로.
+  function roleEntries(rec) {
+    var src = rec.roles || rec.agents || rec.agent_outputs || null;
+    var out = [];
+    if (Array.isArray(src)) { src.forEach(function (r, i) { out.push({ role: (r && (r.role || r.name)) || ("#" + i), body: r }); }); }
+    else if (src && typeof src === "object") { Object.keys(src).sort().forEach(function (k) { out.push({ role: k, body: src[k] }); }); }
+    return out;
+  }
+  function roleSummary(body) {
+    if (body == null) return "";
+    if (typeof body !== "object") return String(body);
+    var keys = ["summary", "action", "decision", "signal", "verdict", "confidence", "reason", "reasons", "thesis", "error"];
+    var parts = [];
+    keys.forEach(function (k) { if (body[k] != null) parts.push(k + "=" + (typeof body[k] === "object" ? JSON.stringify(body[k]) : body[k])); });
+    return parts.length ? parts.join(" · ") : JSON.stringify(body);
+  }
+  function renderDecisions(d) {
+    var rows = (d && d.decisions) || [];
+    $("dec-count").textContent = rows.length ? rows.length + "건" : "";
+    var box = $("decisions");
+    if (!rows.length) { box.innerHTML = '<div class="empty">결정 기록 없음</div>'; return; }
+    var h = "";
+    rows.forEach(function (r) {
+      var action = r.action || r.decision || r.signal || r.final || "";
+      var line = "<b>" + esc(r.cycle != null ? "#" + r.cycle : "") + "</b> <span class=muted>" + ts(r.ts) + "</span> " + esc(r.symbol || "") +
+        (action ? " " + badge(typeof action === "object" ? JSON.stringify(action) : action, action === "BUY" || action === "buy" ? "ok" : (action === "SELL" || action === "sell" ? "on" : "")) : "") +
+        (r.confidence != null ? ' <span class=muted>확신도 ' + num(r.confidence) + "</span>" : "") +
+        (r.risk && r.risk.allowed === false ? " " + badge("리스크 차단", "warn") : "") +
+        (r.reason ? ' <span class=muted>' + esc(String(r.reason).slice(0, 80)) + "</span>" : "");
+      var roles = roleEntries(r);
+      var inner = "";
+      if (roles.length) {
+        inner += '<div class="roles">';
+        roles.forEach(function (e) { inner += '<div class="role"><b>' + esc(e.role) + "</b> " + esc(roleSummary(e.body).slice(0, 400)) + "</div>"; });
+        inner += "</div>";
+      }
+      inner += "<pre>" + esc(JSON.stringify(r, null, 2)) + "</pre>";
+      h += "<details><summary>" + line + "</summary>" + inner + "</details>";
+    });
+    box.innerHTML = h;
+  }
+
+  function renderJournal(d) {
+    var rows = (d && d.journal) || [];
+    var box = $("journal");
+    if (!rows.length) { box.innerHTML = '<div class="empty">저널 없음</div>'; return; }
+    var h = "";
+    rows.forEach(function (r) {
+      var t = r.trade || r;
+      var rv = r.review;
+      var line = esc(t.symbol || "") + " " + esc(t.reason || "") + ' <span class="' + signCls(t.pnl_quote) + '">' + num(t.pnl_quote) + "</span> <span class=muted>" + ts(t.closed_ts || r.ts) + "</span>";
+      var inner = rv ? "<pre>" + esc(typeof rv === "string" ? rv : JSON.stringify(rv, null, 2)) + "</pre>" : '<div class="muted">리뷰 없음</div>';
+      h += "<details><summary>" + line + "</summary>" + inner + "</details>";
+    });
+    box.innerHTML = h;
+  }
+
+  function bar(ratio) {
+    var p = Math.max(0, Math.min(1, ratio || 0)) * 100;
+    var cls = ratio >= 1 ? "over" : (ratio >= 0.8 ? "warn" : "");
+    return '<div class="bar"><i class="' + cls + '" style="width:' + p.toFixed(1) + '%"></i></div>';
+  }
+  function renderCosts(c) {
+    var box = $("costs");
+    if (!c) { box.innerHTML = '<div class="empty">비용 정보 없음</div>'; return; }
+    var h = "<div>오늘 <b>$" + num(c.today_usd, 4) + "</b> / $" + num(c.daily_budget_usd) + " (" + (c.today_budget_pct * 100).toFixed(1) + "%) · " + c.calls_today + "회</div>" + bar(c.today_budget_pct) +
+      "<div>이달 <b>$" + num(c.month_usd, 4) + "</b> / $" + num(c.monthly_budget_usd) + " (" + (c.month_budget_pct * 100).toFixed(1) + "%) · " + c.calls_month + "회</div>" + bar(c.month_budget_pct);
+    var models = Object.keys(c.by_model || {}).sort();
+    if (models.length) {
+      h += "<table><tr><th>모델 (이달)</th><th class=num>호출</th><th class=num>입력</th><th class=num>캐시</th><th class=num>출력</th><th class=num>비용</th></tr>";
+      models.forEach(function (m) { var b = c.by_model[m]; h += "<tr><td>" + esc(m) + "</td><td class=num>" + b.calls + "</td><td class=num>" + num(b.input_tokens, 0) + "</td><td class=num>" + num(b.cached_tokens, 0) + "</td><td class=num>" + num(b.output_tokens, 0) + "</td><td class=num>$" + num(b.cost_usd, 4) + "</td></tr>"; });
+      h += "</table>";
+    } else { h += '<div class="empty">기록된 호출 없음</div>'; }
+    box.innerHTML = h;
+  }
+
+  function renderBacktests(d) {
+    var rows = (d && d.backtests) || [];
+    var box = $("backtests");
+    if (!rows.length) { box.innerHTML = '<div class="empty">백테스트 결과 없음 (main.py backtest)</div>'; return; }
+    var h = "";
+    rows.forEach(function (b) {
+      var s = b.summary || {};
+      var verdict = s.verdict || "";
+      var line = esc(b.name) + " " + (verdict ? badge(verdict, verdict === "VALIDATED" ? "ok" : "warn") : "") +
+        (s.symbols ? ' <span class=muted>' + esc(Array.isArray(s.symbols) ? s.symbols.join(",") : s.symbols) + "</span>" : "");
+      var keys = Object.keys(s).filter(function (k) { return typeof s[k] !== "object"; }).sort();
+      var inner = "<table>";
+      keys.forEach(function (k) { inner += "<tr><td class=muted>" + esc(k) + "</td><td class=num>" + esc(typeof s[k] === "number" ? num(s[k], 4) : s[k]) + "</td></tr>"; });
+      inner += "</table>";
+      var nested = Object.keys(s).filter(function (k) { return typeof s[k] === "object" && s[k] !== null; });
+      if (nested.length) { inner += "<pre>" + esc(JSON.stringify(nested.reduce(function (o, k) { o[k] = s[k]; return o; }, {}), null, 2)) + "</pre>"; }
+      h += "<details><summary>" + line + "</summary>" + inner + "</details>";
+    });
+    box.innerHTML = h;
+  }
+
+  // ---------------------------------------------------------- STOP / CLEAR
+  function control(path) {
+    var token = $("token").value.trim();
+    if (!token) { $("msg").textContent = "토큰을 입력하세요 (control/dashboard_token 파일 내용)."; return; }
+    var reason = $("reason").value.trim() || "dashboard";
+    if (path === "/api/kill" && !window.confirm("정말 STOP 하시겠습니까? 봇이 다음 사이클에 신규 진입을 멈춥니다.")) return;
+    $("btn-stop").disabled = true; $("btn-clear").disabled = true;
+    fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Dashboard-Token": token }, body: JSON.stringify({ reason: reason }) })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, body: j }; }); })
+      .then(function (res) {
+        $("msg").textContent = res.ok ? ("완료: " + JSON.stringify(res.body)) : ("실패 (" + res.status + "): " + JSON.stringify(res.body));
+        try { sessionStorage.setItem("dashboard_token", token); } catch (e) { /* ignore */ }
+        refresh();
+      })
+      .catch(function (e) { $("msg").textContent = "요청 실패: " + e; })
+      .then(function () { $("btn-stop").disabled = false; $("btn-clear").disabled = false; });
+  }
+  $("btn-stop").addEventListener("click", function () { control("/api/kill"); });
+  $("btn-clear").addEventListener("click", function () { control("/api/kill/clear"); });
+  try { var saved = sessionStorage.getItem("dashboard_token"); if (saved) $("token").value = saved; } catch (e) { /* ignore */ }
+
+  // ---------------------------------------------------------- 폴링
+  function refresh() {
+    var calls = [
+      getJSON("/api/state").then(renderHeader),
+      getJSON("/api/positions").then(renderPositions),
+      getJSON("/api/trades?limit=100").then(renderTrades),
+      getJSON("/api/decisions?limit=100").then(renderDecisions),
+      getJSON("/api/cycles?limit=300").then(function (d) { var pts = (d.cycles || []).slice().reverse(); drawSpark(pts); }),
+      getJSON("/api/costs").then(renderCosts),
+      getJSON("/api/backtests").then(renderBacktests),
+      getJSON("/api/journal?limit=50").then(renderJournal)
+    ];
+    return Promise.all(calls.map(function (p) { return p.then(function () { return null; }, function (e) { return e; }); })).then(function (errs) {
+      var bad = errs.filter(Boolean);
+      $("err").textContent = bad.length ? ("오류: " + bad.map(String).join("; ")) : "";
+      $("h-updated").textContent = new Date().toTimeString().slice(0, 8);
+    });
+  }
+  // 이전 갱신이 끝난 뒤에 다음 갱신을 예약한다(setInterval 은 응답이 느리면 요청이 쌓인다)
+  function loop() { refresh().then(function () { setTimeout(loop, POLL_MS); }, function () { setTimeout(loop, POLL_MS); }); }
+  loop();
+})();
+</script>
+</body>
+</html>

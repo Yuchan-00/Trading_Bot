@@ -1,0 +1,35 @@
+# 비밀/환경
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# 봇 런타임 산출물
+state.json
+state.json.tmp
+state.json.corrupt.*
+bot.lock
+logs/
+backtest_cache/
+backtest_results/
+cost_ledger.jsonl
+
+# 참조 자료 원본(라이선스와 함께 로컬 보관, 저장소에는 올리지 않음)
+vendor/
+
+# 편집기/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

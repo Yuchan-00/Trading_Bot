@@ -56,12 +56,14 @@ def test_transient_sharing_error_classification(monkeypatch):
     assert not fsutil.is_transient_sharing_error(win_error(2))
     assert not fsutil.is_transient_sharing_error(FileNotFoundError(2, "x"))
     assert not fsutil.is_transient_sharing_error(OSError(28, "No space left on device"))
-    # winerror 없는 PermissionError: Windows 의 open() 은 errno 만 싣는다 → Windows 에서만 공유 위반
+    # winerror 없는 PermissionError: Windows 의 open() 은 errno 만 싣는다 → errno_only 판정 + Windows 에서만 공유 위반.
+    # os.replace/os.unlink 는 Windows 에서 항상 winerror 를 싣는다 → 기본 판정에서는 공유 위반이 아니다(테스트 대역 등).
     plain = PermissionError(13, "denied")
     monkeypatch.setattr(fsutil.os, "name", "posix")
-    assert not fsutil.is_transient_sharing_error(plain)
+    assert not fsutil.is_transient_sharing_error(plain, errno_only=True)
     monkeypatch.setattr(fsutil.os, "name", "nt")
-    assert fsutil.is_transient_sharing_error(plain)
+    assert fsutil.is_transient_sharing_error(plain, errno_only=True)
+    assert not fsutil.is_transient_sharing_error(plain)
 
 
 def test_retry_delays_respect_budget():

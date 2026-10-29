@@ -32,11 +32,12 @@ _FIRST_DELAY_S = 0.05
 _MAX_DELAY_S = 1.0
 
 
-def is_transient_sharing_error(exc: BaseException) -> bool:
+def is_transient_sharing_error(exc: BaseException, *, errno_only: bool = False) -> bool:
     """Windows 의 일시적 공유 위반인가(다른 프로세스가 파일을 열고 있음).
 
-    ``os.replace``/``os.unlink`` 는 Win32 오류 코드(``winerror``)를 싣는다. ``open()`` 은 C 런타임을 거쳐
-    ``errno`` 13 만 싣고 ``winerror`` 가 비어 있으므로, Windows 에서는 ``winerror`` 없는 ``PermissionError`` 도
+    ``os.replace``/``os.unlink`` 는 Windows 에서 항상 Win32 오류 코드(``winerror``)를 싣는다 — 그 코드가 5/32/33 일
+    때만 공유 위반이다. ``open()`` 은 C 런타임을 거쳐 ``errno`` 13 만 싣고 ``winerror`` 가 비므로, 추가 쓰기처럼
+    ``open()`` 실패를 판정할 때는 ``errno_only=True`` 로 Windows 의 ``winerror`` 없는 ``PermissionError`` 도
     공유 위반으로 본다. 다른 OS 의 ``PermissionError`` 는 진짜 권한 문제라 False.
     """
     if not isinstance(exc, PermissionError):
@@ -44,7 +45,7 @@ def is_transient_sharing_error(exc: BaseException) -> bool:
     win = getattr(exc, "winerror", None)
     if win is not None:
         return win in WINDOWS_SHARING_ERRORS
-    return os.name == "nt"
+    return errno_only and os.name == "nt"
 
 
 def retry_delays(budget_s: float) -> Iterator[float]:
@@ -59,8 +60,11 @@ def retry_delays(budget_s: float) -> Iterator[float]:
 
 
 def retry(op: Callable[[], None], *, what: str, path: object, budget_s: float = DEFAULT_BUDGET_S,
-          sleep: Callable[[float], None] = time.sleep) -> None:
-    """``op()`` 을 실행하고, Windows 공유 위반이면 최대 ``budget_s`` 초 동안 다시 시도한다(그 밖의 예외는 그대로)."""
+          sleep: Callable[[float], None] = time.sleep, errno_only: bool = False) -> None:
+    """``op()`` 을 실행하고, Windows 공유 위반이면 최대 ``budget_s`` 초 동안 다시 시도한다(그 밖의 예외는 그대로).
+
+    ``errno_only``: ``op`` 이 ``open()`` 으로 실패할 수 있으면 True(:func:`is_transient_sharing_error` 참고).
+    """
     delays = retry_delays(budget_s)
     tries = 0
     while True:
@@ -70,7 +74,7 @@ def retry(op: Callable[[], None], *, what: str, path: object, budget_s: float = 
                 log.info("%s 성공 (공유 위반 재시도 %d회 후): %s", what, tries, path)
             return
         except OSError as exc:
-            if not is_transient_sharing_error(exc):
+            if not is_transient_sharing_error(exc, errno_only=errno_only):
                 raise
             delay = next(delays, None)
             if delay is None:
@@ -106,4 +110,4 @@ def append_bytes(path: str | os.PathLike, data: bytes, *, budget_s: float = DEFA
         with p.open("ab") as fh:
             fh.write(data)
 
-    retry(_op, what="파일 추가 쓰기", path=p, budget_s=budget_s, sleep=sleep)
+    retry(_op, what="파일 추가 쓰기", path=p, budget_s=budget_s, sleep=sleep, errno_only=True)

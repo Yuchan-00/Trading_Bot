@@ -192,7 +192,7 @@ class CostLedger:
                         prefix = b"\n"
                 fh.write(prefix + (line + "\n").encode("utf-8"))
 
-        fsutil.retry(_op, what="비용 원장 추가 쓰기", path=path, budget_s=LEDGER_SHARING_BUDGET_S)
+        fsutil.retry(_op, what="비용 원장 추가 쓰기", path=path, budget_s=LEDGER_SHARING_BUDGET_S, errno_only=True)
 
     # ------------------------------------------------------------------ 단가
     def price_for(self, model: str) -> tuple[float, float, float]:
@@ -268,7 +268,7 @@ class CostLedger:
                 try:
                     self._append_line(self.path, line)
                 except OSError as e:
-                    if not fsutil.is_transient_sharing_error(e):
+                    if not fsutil.is_transient_sharing_error(e, errno_only=True):   # open() 실패: errno 만
                         raise
                     # 다른 프로그램이 원장을 잠갔다(Windows) → 보조 파일에 남긴다. 합계는 두 파일을 더해 복원한다.
                     pending = pending_ledger_path(self.path)

@@ -61,6 +61,7 @@ from tradingbot import journal as J
 from tradingbot import reports
 from tradingbot import risk
 from tradingbot import fsutil
+from tradingbot.control import file_state, mtime_key, read_control_file  # noqa: F401 - read_control_file 재노출
 from tradingbot.agents import payloads as P
 from tradingbot.agents.pipeline import (
     HEALTH_FLAG_MAX,
@@ -218,41 +219,6 @@ def _utc_date(ts_ms: int) -> str:
     return datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-def read_control_file(path: Path) -> dict | None:
-    """``control/STOP``·``control/CLEAR`` 내용({"reason","ts"}). 없으면 None. JSON 이 아니면 본문을 사유로."""
-    p = Path(path)
-    if not p.is_file():
-        return None
-    unreadable = False
-    try:
-        raw = p.read_text(encoding="utf-8").strip()
-    except OSError:
-        raw, unreadable = "", True       # 다른 프로그램이 읽기까지 막고 열고 있음(Windows) — ts 는 수정 시각뿐
-    except ValueError:
-        raw = ""
-    data: dict = {}
-    if raw:
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, Mapping):
-                data = dict(obj)
-            else:
-                data = {"reason": str(obj)}
-        except ValueError:
-            data = {"reason": raw[:500]}
-    ts = data.get("ts")
-    if not _finite(ts):
-        try:
-            ts = int(p.stat().st_mtime * 1000)
-        except OSError:
-            ts = 0
-    reason = data.get("reason")
-    out = {"reason": str(reason)[:500] if reason else None, "ts": int(ts)}
-    if unreadable:
-        out["unreadable"] = True
-    return out
-
-
 def _journal_has_trade(path: Path, trade: ClosedTrade, *, tail_bytes: int = 262_144) -> bool:
     """``journal.jsonl`` 끝부분에 이 거래(심볼·진입·청산 시각·주문 ID·수량)의 기록이 이미 있는가. 읽지 못하면 False."""
     try:
@@ -382,7 +348,6 @@ class Cycle:
         self._finished_day: Any = None            # 마지막 롤오버로 끝난 DailyStats(일일 리뷰용)
         self._active_halts: set[str] = set()      # 지금 걸려 있는(알림 보낸) G0 중단 코드
         self._lifted_halts: set[str] = set()      # 이 프로세스에서 해제 알림을 보낸 코드(다시 걸리면 다시 알림)
-        self._consumed_control: dict[str, int] = {}   # 처리했지만 삭제 실패한 control 파일 kind → ts
         self._reconcile_strikes: dict[str, int] = {}  # 거래소 잔고 < 장부 가 연속 관찰된 횟수(일시 오류 방지)
         self.series_path = self.data_dir / EQUITY_SERIES_FILENAME
         self._series: dict[str, Any] = self._load_series()
@@ -1244,33 +1209,38 @@ class Cycle:
             fn()        # LockLostError 는 전파
 
     def _process_control(self, run: _Run) -> None:
-        stop_p = self.control_dir / STOP_FILENAME
-        clear_p = self.control_dir / CLEAR_FILENAME
-        events: list[tuple[int, int, str, dict]] = []
-        paths = {"stop": stop_p, "clear": clear_p}
-        for order, kind in ((0, "stop"), (1, "clear")):
+        """control/STOP·CLEAR 처리. 규칙(SPEC WINRT 제어 파일):
+
+        - 처리한 파일의 ts·수정 시각을 ``state.control_applied_ts`` 에 같은 저장으로 남기고, 파일을 지우면(또는 없어진
+          것을 보면) 지운다. 남은 파일(지우지 못함)은 다시 적용하지 않고 삭제만 다시 시도한다.
+        - 읽지 못한 새 파일이 있으면 이번 사이클에는 둘 다 처리하지 않는다 — 내용의 ts 를 모르면 STOP·CLEAR 의 순서를
+          정할 수 없다(옛 CLEAR 가 더 새 STOP 을, 옛 STOP 이 더 새 CLEAR 를 뒤집지 않게). 단, 읽지 못한 STOP 하나뿐이고
+          CLEAR 가 없으면 바로 적용한다(안전한 쪽; 나중에 읽혀도 수정 시각으로 알아봐 다시 적용하지 않는다).
+        - CLEAR 보다 오래된(ts ≤) STOP 은 적용하지 않고 지운다(낙폭 정지 해제가 옛 STOP 에 덮이지 않게).
+        """
+        paths = {"stop": self.control_dir / STOP_FILENAME, "clear": self.control_dir / CLEAR_FILENAME}
+        applied = self.state.control_applied_ts
+        found: dict[str, dict] = {}
+        for kind in ("stop", "clear"):
             info = read_control_file(paths[kind])
-            if info is None:
-                # 파일이 없어졌으면 '처리함' 표시도 지운다 — 같은 ts 를 가진 새 파일(수정 시각이 유지되는 템플릿 복사,
-                # ts 를 고정한 JSON)은 다시 적용된다(다음 저장에 함께 남는다)
-                self._consumed_control.pop(kind, None)
-                self.state.control_applied_ts.pop(kind, None)
-                continue
-            if kind == "clear" and info.get("unreadable"):
-                # 읽지 못한 CLEAR 의 ts 는 수정 시각이라 '이미 처리함' 과 비교할 수 없다 — 지우지 못한 옛 CLEAR 를 새
-                # 요청으로 보고 킬스위치를 끄지 않게 이번 사이클은 건너뛴다(읽지 못한 STOP 은 안전한 쪽이라 적용)
-                log.warning("CLEAR 파일을 읽지 못했습니다(다른 프로그램이 열고 있음) — 다음 사이클에 다시 확인합니다")
-                continue
-            if info["ts"] in (self._consumed_control.get(kind), self.state.control_applied_ts.get(kind)):
-                # 이미 처리했지만 삭제에 실패한 파일(재시작 전에 처리한 것 포함) — 다시 적용하지 않고 삭제만 재시도한다
+            fstate = file_state(kind, info, applied)
+            if fstate is None:
+                self._forget_applied(kind)          # 밖에서 지웠거나 지난 사이클에 지움 — 같은 ts 의 새 파일은 새 요청
+            elif fstate == "handled":
                 log.warning("이미 처리한 %s 파일이 남아 있습니다(삭제 실패) — 다시 적용하지 않고 삭제를 다시 시도합니다",
                             paths[kind].name)
-                self._unlink_control(paths[kind], kind, info["ts"])
-                continue
-            events.append((info["ts"], order, kind, info))
-        events.sort()
-        # CLEAR 보다 오래된 STOP 은 적용하지 않는다(지우기만): clear-stop 이 STOP 을 지우지 못한 채 남았거나
-        # stop → clear-stop 이 한 사이클 안에 왔을 때, 옛 STOP 이 낙폭 정지 사유를 덮어써 해제를 망치지 않게.
+                self._unlink_control(paths[kind], kind)
+            else:
+                found[kind] = info
+        unreadable = [paths[k].name for k, i in found.items() if i.get("unreadable")]
+        if unreadable and set(found) != {"stop"}:
+            # 읽지 못한 STOP 하나뿐이면(처리할 CLEAR 없음 — 남은 처리한 CLEAR 는 상관없다) 순서 문제가 없어 바로
+            # 적용한다(안전한 쪽 — 사유는 모름)
+            log.warning("control 파일을 읽지 못했습니다(%s — 다른 프로그램이 열고 있음) — 다음 사이클에 다시 처리합니다",
+                        ", ".join(unreadable))
+            return
+        events = sorted((found[kind]["ts"], order, kind, found[kind])
+                        for order, kind in ((0, "stop"), (1, "clear")) if kind in found)
         latest_clear = max((ts for ts, _, kind, _ in events if kind == "clear"), default=None)
         pending: list[TradeEvent] = []
         for ts, _, kind, info in events:
@@ -1298,24 +1268,31 @@ class Cycle:
                         extra={"event": "kill_cleared"}))
         if not events:
             return
-        for ts, _, kind, _ in events:
-            self.state.control_applied_ts[kind] = int(ts)     # 적용·무시한 파일 모두 — 같은 저장에 담는다
+        for ts, _, kind, info in events:
+            # 적용·무시한 파일 모두 — 킬스위치 변경과 같은 저장에 담는다(삭제에 실패해도 재시작 뒤 다시 적용하지 않게)
+            applied[kind] = int(ts)
+            if info.get("mtime_ms") is not None:
+                applied[mtime_key(kind)] = int(info["mtime_ms"])
         # 상태 저장 → 알림 → control 파일 삭제 (저장 실패 시 파일은 남아 재시작 후 다시 처리된다;
         # 삭제 실패가 알림을 막지 않게 알림을 먼저 보낸다)
         self._save()
         for ev in pending:
             self._notify(ev)
-        for _, _, kind, info in events:
-            self._unlink_control(paths[kind], kind, info["ts"])
+        for _, _, kind, _ in events:
+            self._unlink_control(paths[kind], kind)
 
-    def _unlink_control(self, path: Path, kind: str, ts: int) -> None:
+    def _forget_applied(self, kind: str) -> None:
+        self.state.control_applied_ts.pop(kind, None)
+        self.state.control_applied_ts.pop(mtime_key(kind), None)
+
+    def _unlink_control(self, path: Path, kind: str) -> None:
         try:
             fsutil.unlink(path)
-            self._consumed_control.pop(kind, None)
         except OSError as exc:
-            self._consumed_control[kind] = int(ts)
             log.error("control 파일 삭제 실패 %s type=%s — 다음 사이클에 다시 적용하지 않음", path.name,
                       type(exc).__name__)
+            return
+        self._forget_applied(kind)      # 파일이 없어졌다 — 남길 것이 없다(state.json 에도 쓰지 않게, 다음 저장에 반영)
 
     def _reset_peak_from_last_marks(self) -> None:
         marks = {s: float(p.last_mark) for s, p in self.state.positions.items() if _pos(p.last_mark)}

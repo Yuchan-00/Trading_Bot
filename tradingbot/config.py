@@ -235,8 +235,12 @@ _DOTENV_ASSIGN = re.compile(r"((?i:export|set)\s+)?([A-Za-z_][A-Za-z0-9_]{0,63})
 _SHOWN_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,39}")
 # 복사·붙여넣기로 섞이는 보이지 않는 글자(유니코드 서식 문자 Cf — U+200B·U+FEFF·U+2060·U+200E 등 — 와 한글 채움 문자)
 _INVISIBLE_EXTRA = frozenset("\u115f\u1160\u3164\uffa0")
-# UTF-16 으로 푼 글에서 이 블록(구르무키·구자라트·말라얄람·싱할라)의 글자는 덧붙인 8비트 줄의 CR·LF 바이트가 만든 것
-_MIXED_UTF16 = re.compile(r"[\u0a00-\u0aff\u0d00-\u0dff]")
+# UTF-16 파일 끝에 8비트(ASCII·cp949)로 덧붙인 설정 줄(cmd·Git Bash 의 >>): 마지막 0x00 바이트 뒤에 ASCII 'NAME='
+# 바이트가 이어지고 LF 로 끝난다. 진짜 UTF-16 글의 ASCII 는 늘 0x00 과 짝을 이루므로 그 뒤에는 기껏해야 마지막 몇 글자(한글·한자·
+# 이모지)의 바이트만 남는다(한·중·일 글·이모지·인도 글자를 잘못 잡지 않게).
+_APPENDED_8BIT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*[ \t]*=")
+# 리틀엔디언 UTF-16 에서 덧붙인 8비트 CRLF 쌍이 만드는 글자(U+0A0D — 배정되지 않은 코드 포인트라 진짜 글에는 없다)
+_APPENDED_CRLF = "\u0a0d"
 _NEWLINES = re.compile(r"\r\n|\n|\r")
 _UTF8_FIX = "메모장에서 '다른 이름으로 저장' → 인코딩 'UTF-8' 로 다시 저장하세요"
 
@@ -281,14 +285,15 @@ def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str
             return data.decode("utf-16", errors="replace")
         msg = f"{path}: UTF-16 으로 저장돼 있습니다(PowerShell '>' 로 만든 파일) — {fix}"
         warnings.append(msg)
-        mixed = _MIXED_UTF16.search(text)
-        at = mixed.start() if mixed is not None else None
-        if at is None and data.startswith(codecs.BOM_UTF16_BE) and text and text[-1] != "\n" \
-                and (ord(text[-1]) & 0xFF) == 0x0A:
-            at = len(text) - 1           # 빅엔디언: 끝에 덧붙인 8비트 LF 는 마지막 글자의 아래 바이트가 된다
-        if at is not None:
-            # 짝수 길이로 풀린 덧붙인 줄이 앞 줄 값에 붙었다(그 설정은 읽히지 않는다) — 조용히 기본값으로 돌지 않게
-            line = len(_NEWLINES.findall(text, 0, at)) + 1
+        # cmd·Git Bash 의 echo 는 줄바꿈으로 끝난다 — 줄바꿈 없이 끝나는 진짜 UTF-16 글(마지막 글자가 한자·이모지)을 잡지 않게
+        hit = _APPENDED_8BIT.search(data, max(2, data.rfind(b"\x00") + 1)) if data.endswith(b"\n") else None
+        line = None
+        if hit is not None:
+            # 짝수 길이로 풀린 덧붙인 줄(앞 줄 값에 붙거나 따로 한 줄 — 그 설정은 읽히지 않는다): 조용히 기본값으로 돌지 않게
+            line = len(_NEWLINES.findall(data[:hit.start()].decode("utf-16", errors="replace"))) + 1
+        elif _APPENDED_CRLF in text:
+            line = len(_NEWLINES.findall(text, 0, text.index(_APPENDED_CRLF))) + 1
+        if line is not None:
             msg = (f"{path} {line}번째 줄에 다른 인코딩으로 덧붙인 글자가 섞였습니다(UTF-16 파일에 cmd·Git Bash 로 줄을 "
                    f"덧붙이면 그 설정이 읽히지 않습니다) — {fix}")
             if not lenient:
@@ -326,8 +331,7 @@ def _dotenv_line_problem(binding: object, s: str, before: str, path: Path) -> st
     """
     error = bool(getattr(binding, "error", False))
     key = getattr(binding, "key", None)
-    # 보이지 않는 글자만 있는 줄(빈 줄·주석 앞의 U+200B 등)은 python-dotenv 처럼 무시한다
-    garbled = (not error and isinstance(key, str) and not _visible(key).isascii()
+    garbled = (not error and isinstance(key, str) and not key.isascii()
                and getattr(binding, "value", "") is None)
     if not (error or garbled):
         return None
@@ -336,7 +340,7 @@ def _dotenv_line_problem(binding: object, s: str, before: str, path: Path) -> st
     if garbled:
         return (f"{path} {line}번째 줄에 '=' 없는 글자만 있습니다 — 메모라면 줄 앞에 # 를 붙이세요. 아니면 인코딩이 "
                 f"섞인 것입니다(UTF-16 파일에 cmd·Git Bash 로 줄을 덧붙이면 그 줄의 설정이 사라집니다) — {_UTF8_FIX}")
-    m = _DOTENV_ASSIGN.match(_visible(_NEWLINES.split(body, 1)[0]))
+    m = _DOTENV_ASSIGN.match(_NEWLINES.split(body, 1)[0])
     shown = m.group(2) if m and _SHOWN_NAME.fullmatch(m.group(2)) else None
     if m and m.group(1) and not m.group(1).startswith("export"):
         # python-dotenv 는 소문자 'export ' 만 받는다 — set·SET·EXPORT 같은 앞말 자체가 문제
@@ -369,6 +373,16 @@ def _dotenv_items(path: Path, *, lenient: bool, warnings: list[str]) -> dict[str
         warnings.append(msg)
         return {}
     text = _decode_dotenv(data, path, lenient=lenient, warnings=warnings)
+    visible = _visible(text)
+    if visible != text:
+        # 복사·붙여넣기로 섞인 보이지 않는 글자(U+200B·U+FEFF 등)는 읽기 전에 지운다 — 이름·값·${NAME} 참조가 모두
+        # 보이는 대로 읽히게(줄바꿈은 그대로라 줄 번호는 같다). 설정 줄에 있던 것만 알린다(주석·빈 줄은 조용히).
+        changed = [n for n, (a, b) in enumerate(zip(_NEWLINES.split(text), _NEWLINES.split(visible)), 1)
+                   if a != b and b.strip() and not b.lstrip().startswith("#")]
+        if changed:
+            shown = ", ".join(str(n) for n in changed[:5]) + (" …" if len(changed) > 5 else "")
+            warnings.append(f"{path} {shown}번째 줄에 보이지 않는 글자(복사·붙여넣기)가 있어 지우고 읽었습니다")
+        text = visible
     consumed = ""                   # 앞 줄들의 원문(바인딩 원문을 이어 붙이면 파일 전체 — 줄 번호를 여기서 센다)
     for binding in parse_stream(io.StringIO(text)):
         s = getattr(getattr(binding, "original", None), "string", "") or ""
@@ -385,21 +399,7 @@ def _dotenv_items(path: Path, *, lenient: bool, warnings: list[str]) -> dict[str
         values = dotenv_values(stream=io.StringIO(text))
     finally:
         dotenv_log.disabled = prev_disabled
-    out: dict[str, str] = {}
-    cleaned: list[str] = []
-    for k, v in values.items():
-        if v is None:
-            continue
-        name = _visible(k).strip()
-        if name != k:
-            # 이름에 섞인 보이지 않는 글자(복사·붙여넣기) 때문에 설정이 조용히 무시되지 않게 지우고 읽는다
-            cleaned.append(name if _SHOWN_NAME.fullmatch(name) else "?")
-            if not name:
-                continue
-        out[name] = v
-    if cleaned:
-        warnings.append(f"{path}: 이름에 보이지 않는 글자(복사·붙여넣기)가 섞여 지우고 읽었습니다: {', '.join(cleaned)}")
-    return out
+    return {k: v for k, v in values.items() if v is not None}
 
 
 def read_env(dotenv_path: Path | None = None, *, lenient: bool = False,

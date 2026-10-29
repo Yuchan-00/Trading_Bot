@@ -978,6 +978,147 @@ def test_journal_dedupe_tells_a_partial_and_a_full_exit_apart(tmp_path):
     assert not C._journal_has_trade(tmp_path / "missing.jsonl", full)
 
 
+def _deny_read(monkeypatch, name: str):
+    """그 이름의 control 파일 읽기만 막는다(다른 프로그램이 공유 없이 엶). 돌려준 함수로 다시 연다."""
+    real = Path.read_text
+    blocked = {"on": True}
+
+    def read_text(self, *a, **k):
+        if self.name == name and blocked["on"]:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    return lambda: blocked.update(on=False)
+
+
+def test_unreadable_older_clear_does_not_undo_a_newer_stop(tmp_path, monkeypatch):
+    """읽지 못한 옛 CLEAR 와 더 새 STOP: 그 사이클은 둘 다 미루고, 다음 사이클에 순서대로 — STOP 이 이긴다."""
+    from test_cycle import Rig
+
+    rig = Rig(tmp_path)
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    now = rig.clock.ms()
+    (ctl / "CLEAR").write_text(json.dumps({"reason": "해제", "ts": now - 60_000}), encoding="utf-8")
+    (ctl / "STOP").write_text(json.dumps({"reason": "다시 정지", "ts": now - 30_000}), encoding="utf-8")
+    unblock = _deny_read(monkeypatch, C.CLEAR_FILENAME)
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False and (ctl / "STOP").is_file()     # 미룸(STOP 도 아직)
+    unblock()
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and rig.state.kill_reason == "manual_stop: 다시 정지"
+    assert not (ctl / "STOP").exists() and not (ctl / "CLEAR").exists()
+
+
+def test_unreadable_newer_clear_still_releases_a_drawdown_stop(tmp_path, monkeypatch):
+    """낙폭 정지 중 옛 STOP 과 읽지 못한 더 새 CLEAR: 옛 STOP 이 사유를 덮지 않고 해제·최고자본 재설정이 된다."""
+    from test_cycle import Rig
+
+    rig = Rig(tmp_path)
+    rig.state.peak_equity = 11_200.0
+    rig.portfolio.set_kill("drawdown_stop_all")
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    now = rig.clock.ms()
+    (ctl / "STOP").write_text(json.dumps({"reason": "pause", "ts": now - 60_000}), encoding="utf-8")
+    (ctl / "CLEAR").write_text(json.dumps({"reason": "해제", "ts": now - 30_000}), encoding="utf-8")
+    unblock = _deny_read(monkeypatch, C.CLEAR_FILENAME)
+    rig.cycle.run_once()
+    assert rig.state.kill_reason == "drawdown_stop_all"                      # 옛 STOP 을 적용하지 않음
+    unblock()
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False and rig.state.peak_equity == pytest.approx(10_000.0, rel=1e-3)
+    assert not rig.sent_with("⛔")
+
+
+def test_applied_leftover_stop_is_not_reapplied_when_it_becomes_unreadable(tmp_path, monkeypatch):
+    """지우지 못한(처리함) STOP 이 나중에 읽기까지 막혀도 수정 시각으로 알아보고 다시 적용하지 않는다."""
+    from test_cycle import Rig
+
+    real_unlink = fsutil.unlink
+
+    def deny_stop(path, **kw):
+        if Path(path).name == C.STOP_FILENAME:
+            raise sharing_error(path)
+        return real_unlink(path, **kw)
+
+    monkeypatch.setattr(fsutil, "unlink", deny_stop)
+    rig = Rig(tmp_path)
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    now = rig.clock.ms()
+    (ctl / "STOP").write_text(json.dumps({"reason": "점검", "ts": now - 60_000}), encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and (ctl / "STOP").is_file()
+    (ctl / "CLEAR").write_text(json.dumps({"reason": "재개", "ts": now - 30_000}), encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False
+    unblock = _deny_read(monkeypatch, C.STOP_FILENAME)
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False                                   # 처리한 STOP — 다시 켜지 않음
+    unblock()
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False and len(rig.sent_with("⛔")) == 1
+
+
+def test_lone_unreadable_stop_is_applied_and_recognised_later(tmp_path, monkeypatch):
+    """CLEAR 가 없을 때 읽지 못한 STOP 은 바로 적용(안전한 쪽). 지우지 못한 채 나중에 읽혀도 다시 적용하지 않는다."""
+    from test_cycle import Rig
+
+    real_unlink = fsutil.unlink
+    monkeypatch.setattr(fsutil, "unlink", lambda path, **kw: (_ for _ in ()).throw(sharing_error(path))
+                        if Path(path).name == C.STOP_FILENAME else real_unlink(path, **kw))
+    rig = Rig(tmp_path)
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    (ctl / "STOP").write_text(json.dumps({"reason": "점검", "ts": rig.clock.ms() - 1000}), encoding="utf-8")
+    unblock = _deny_read(monkeypatch, C.STOP_FILENAME)
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and rig.state.kill_reason == "manual_stop: 사유 없음"
+    unblock()
+    rig.cycle.run_once()
+    assert rig.state.kill_reason == "manual_stop: 사유 없음" and len(rig.sent_with("⛔")) == 1
+
+
+def test_applied_record_is_dropped_when_the_file_is_deleted(tmp_path):
+    """지운 control 파일의 표시는 바로 지운다 — state.json 이 깨끗하고, 같은 ts 의 템플릿을 곧바로 다시 써도 적용된다."""
+    from test_cycle import Rig
+
+    rig = Rig(tmp_path)
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    M.write_stop(rig.data, "점검")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and not (ctl / "STOP").exists()
+    assert "control_applied_ts" not in json.loads((rig.data / "state.json").read_text(encoding="utf-8"))
+    clear = json.dumps({"reason": "템플릿", "ts": 6})
+    (ctl / "CLEAR").write_text(clear, encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False
+    rig.portfolio.set_kill("manual_stop: 다시")
+    (ctl / "CLEAR").write_text(clear, encoding="utf-8")        # 다음 사이클 전에 같은 템플릿을 다시
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False
+
+
+def test_status_and_dashboard_report_an_unreadable_control_file(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from tradingbot.dashboard import create_app
+
+    settings = load_settings(env_for(tmp_path))
+    ctl = Path(settings.data_dir) / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    (ctl / "CLEAR").write_text(json.dumps({"reason": "해제", "ts": "1700000000000"}), encoding="utf-8")
+    _deny_read(monkeypatch, C.CLEAR_FILENAME)
+    out, err = io.StringIO(), io.StringIO()
+    assert M.main(["status"], env=env_for(tmp_path), out=out, err=err) == M.EXIT_OK
+    assert "CLEAR: 읽지 못함" in out.getvalue() and "CLEAR 대기" not in out.getvalue()
+    health = TestClient(create_app(settings, Path(settings.data_dir))).get("/api/health").json()
+    assert health["clear_state"] == "unreadable" and health["clear_pending"] is True
+
+
 def test_control_file_reusing_an_applied_ts_is_applied_again_once_the_old_one_is_gone(tmp_path):
     """수정 시각이 유지되는 템플릿 복사·ts 를 고정한 JSON: 앞 파일이 지워진 뒤 같은 ts 의 새 STOP 도 적용된다."""
     from test_cycle import Rig
@@ -1136,8 +1277,13 @@ def test_dotenv_invisible_characters_from_copy_paste(clean_env):
     warnings: list[str] = []
     env = read_env(lenient=False, warnings=warnings)
     assert env["DATA_DIR"] == "botdata" and "\u200bDATA_DIR" not in env
-    assert len(warnings) == 1 and "보이지 않는 글자" in warnings[0] and "DATA_DIR" in warnings[0]
+    assert len(warnings) == 1 and "보이지 않는 글자" in warnings[0] and " 5번째 줄" in warnings[0]   # 설정 줄만 알린다
     assert load_settings().data_dir == Path("botdata")
+    # 지운 뒤에 읽으므로 ${NAME} 참조·'마지막 줄이 이긴다' 규칙도 보이는 이름 그대로
+    (clean_env / ".env").write_bytes("AGENT_BACKEND=mock\n\u200bBOT_HOME=B:/x\nDATA_DIR=${BOT_HOME}/data\n"
+                                     "MODE=paper\n\u200bMODE=testnet\nMODE=paper\n".encode("utf-8"))
+    env = read_env(lenient=True, warnings=[])
+    assert env["DATA_DIR"] == "B:/x/data" and env["MODE"] == "paper"
 
 
 def test_dotenv_utf16_with_an_8bit_tail_glued_to_the_last_line(clean_env):
@@ -1154,6 +1300,17 @@ def test_dotenv_utf16_with_an_8bit_tail_glued_to_the_last_line(clean_env):
     (clean_env / ".env").write_bytes(be + b"X=1\n")
     with pytest.raises(ConfigError, match="2번째 줄에 다른 인코딩"):
         load_settings()
+
+
+@pytest.mark.parametrize("enc", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("ending", ["# 화이팅 😊", "# 以上", "# 끝 ✊", "# નમસ્તે ਸਤਿ ਸ੍ਰੀ", "# 손절·익절 — 통화쌍 젊은 …"])
+def test_dotenv_genuine_utf16_files_are_not_taken_for_appended_lines(clean_env, enc, ending):
+    """한자·이모지로 끝나는(줄바꿈 없음) 빅엔디언 파일, 인도 글자가 든 파일도 진짜 UTF-16 — 경고 하나로 읽는다."""
+    for nl in ("", "\r\n"):
+        (clean_env / ".env").write_bytes(("\ufeffAGENT_BACKEND=mock\r\nDATA_DIR=botdata\r\n" + ending + nl).encode(enc))
+        warnings: list[str] = []
+        env = read_env(lenient=False, warnings=warnings)
+        assert env["DATA_DIR"] == "botdata" and len(warnings) == 1 and "UTF-16" in warnings[0]
 
 
 def test_dotenv_quote_errors_on_export_and_lowercase_lines_get_quote_advice(clean_env):

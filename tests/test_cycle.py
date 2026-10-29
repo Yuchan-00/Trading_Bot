@@ -907,7 +907,11 @@ def test_read_control_file_variants(tmp_path):
     info = C.read_control_file(p)
     assert info["reason"] == "plain reason" and info["ts"] > 0
     p.write_text(json.dumps({"reason": "r", "ts": 5}), encoding="utf-8")
-    assert C.read_control_file(p) == {"reason": "r", "ts": 5}
+    info = C.read_control_file(p)
+    assert {k: info[k] for k in ("reason", "ts")} == {"reason": "r", "ts": 5}
+    assert info["mtime_ms"] == p.stat().st_mtime_ns // 1_000_000 and "unreadable" not in info
+    p.write_text(json.dumps({"reason": "r", "ts": "5.5"}), encoding="utf-8")      # 숫자 문자열도 ts
+    assert C.read_control_file(p)["ts"] == 5
     p.write_text("", encoding="utf-8")
     assert C.read_control_file(p)["reason"] is None
 

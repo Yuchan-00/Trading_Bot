@@ -36,6 +36,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from tradingbot import risk
 from tradingbot import fsutil
+from tradingbot.control import file_state as control_file_state, read_control_file
 from tradingbot.config import HardLimits, Settings, mask_secret
 from tradingbot.models import BotState
 
@@ -605,32 +606,24 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             log.warning("잘못된 대시보드 토큰 (받은 값 %s)", mask_secret(header_value))
             raise HTTPException(status_code=401, detail="X-Dashboard-Token 불일치")
 
-    def _control_ts(path: Path, data: Any) -> int | None:
-        # cycle.read_control_file 과 같은 규칙: JSON 의 ts, 없으면 파일 수정 시각(ms)
-        ts = data.get("ts") if isinstance(data, dict) else None
-        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
-            return int(ts)
-        try:
-            return int(path.stat().st_mtime * 1000)
-        except OSError:
-            return None
-
-    def _already_applied(path: Path, kind: str, data: Any, state: BotState | None = None) -> bool:
-        """봇이 이미 처리했지만 지우지 못한 control 파일인가(state.control_applied_ts 와 ts 가 같음)."""
+    def _control_state(kind: str, path: Path, state: BotState | None = None) -> tuple[str | None, dict | None]:
+        """(상태, 내용): None·pending·unreadable·handled — 사이클·status 와 같은 규칙(tradingbot.control)."""
+        info = read_control_file(path)
+        if info is None:
+            return None, None
         st = state if state is not None else _load_state()
-        applied = (st.control_applied_ts or {}).get(kind) if st is not None else None
-        return applied is not None and _control_ts(path, data) == applied
+        applied = (st.control_applied_ts or {}) if st is not None else {}
+        return control_file_state(kind, info, applied), info
 
     def _stop_info(state: BotState | None = None) -> dict | None:
-        if not stop_path.is_file():
+        """처리할 STOP 이 있으면 그 내용(읽지 못한 새 요청 포함), 없거나 이미 처리했으면 None."""
+        cstate, info = _control_state("stop", stop_path, state)
+        if cstate not in ("pending", "unreadable") or info is None:
             return None
-        data = _read_json(stop_path)
-        if _already_applied(stop_path, "stop", data, state):
-            return None
-        return data if isinstance(data, dict) else {"reason": None, "ts": None}
+        return {"reason": info.get("reason"), "ts": info.get("ts")}
 
     def _clear_pending(state: BotState | None = None) -> bool:
-        return clear_path.is_file() and not _already_applied(clear_path, "clear", _read_json(clear_path), state)
+        return _control_state("clear", clear_path, state)[0] in ("pending", "unreadable")
 
     def _list_cycle_files() -> list[tuple[str, int, Path]]:
         """(날짜, n, 경로) 최신순."""
@@ -678,6 +671,8 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             "cycle_minutes": settings.cycle_minutes,
             "stop_pending": stop is not None,
             "clear_pending": _clear_pending(state),
+            "stop_state": _control_state("stop", stop_path, state)[0],
+            "clear_state": _control_state("clear", clear_path, state)[0],
             "kill_switch": state.kill_switch if state is not None else None,
             "token_configured": _read_token() is not None,
         }

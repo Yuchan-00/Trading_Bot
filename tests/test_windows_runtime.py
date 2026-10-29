@@ -1081,6 +1081,25 @@ def test_lone_unreadable_stop_is_applied_and_recognised_later(tmp_path, monkeypa
     assert rig.state.kill_reason == "manual_stop: 사유 없음" and len(rig.sent_with("⛔")) == 1
 
 
+def test_control_identity_rules(tmp_path):
+    """남은 파일 판정: 읽히면 내용 ts, 수정 시각은 ts 를 비교할 수 없을 때만(거친 수정 시각의 새 파일을 옛 것으로 보지 않게)."""
+    from tradingbot import control as CT
+
+    p = tmp_path / "STOP"
+    p.write_text(json.dumps({"reason": "새 요청", "ts": 200}), encoding="utf-8")
+    info = CT.read_control_file(p)
+    same_mtime = {"stop": 100, "stop_mtime": info["mtime_ms"]}           # 수정 시각만 같은 옛 기록(FAT32 2초 단위)
+    assert CT.file_state("stop", info, same_mtime) == "pending"
+    assert CT.file_state("stop", info, {"stop": 200, "stop_mtime": 1}) == "handled"
+    was_unreadable = {"stop": info["mtime_ms"], "stop_mtime": info["mtime_ms"]}   # 처리 때 읽지 못해 ts=수정 시각
+    assert CT.file_state("stop", info, was_unreadable) == "handled"
+    locked = dict(info, unreadable=True)
+    assert CT.file_state("stop", locked, same_mtime) == "handled"
+    assert CT.file_state("stop", locked, {"stop": 200}) == "unreadable"
+    p.write_text('{"reason": "x", "ts": ' + "9" * 400 + "}", encoding="utf-8")   # 아주 큰 정수 ts → 수정 시각
+    assert CT.read_control_file(p)["ts"] == CT.read_control_file(p)["mtime_ms"]
+
+
 def test_applied_record_is_dropped_when_the_file_is_deleted(tmp_path):
     """지운 control 파일의 표시는 바로 지운다 — state.json 이 깨끗하고, 같은 ts 의 템플릿을 곧바로 다시 써도 적용된다."""
     from test_cycle import Rig

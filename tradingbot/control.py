@@ -20,7 +20,7 @@ ControlState = Literal["pending", "handled", "unreadable"]
 def _finite(x: Any) -> bool:
     try:
         return x is not None and not isinstance(x, bool) and math.isfinite(float(x))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):     # 아주 큰 JSON 정수(10**400)는 float 변환에서 OverflowError
         return False
 
 
@@ -64,13 +64,19 @@ def read_control_file(path: Path | str) -> dict | None:
 
 
 def is_handled(kind: str, info: Mapping[str, Any] | None, applied: Mapping[str, int] | None) -> bool:
-    """이미 처리했지만 지우지 못하고 남은 파일인가(읽혔으면 내용 ts, 아니면 수정 시각으로 비교)."""
+    """이미 처리했지만 지우지 못하고 남은 파일인가.
+
+    읽히면 내용 ts 로 비교한다. 수정 시각으로는 ts 를 비교할 수 없을 때만 — 지금 읽지 못하거나, 처리할 때 ts 가 수정
+    시각이었을 때(그때 읽지 못함) — 비교한다(FAT32·SMB 의 거친 수정 시각 때문에 새 파일을 옛 것으로 보지 않게).
+    """
     if not info or not applied:
         return False
-    if not info.get("unreadable") and applied.get(kind) is not None and info.get("ts") == applied.get(kind):
-        return True
-    m = applied.get(mtime_key(kind))
-    return m is not None and info.get("mtime_ms") == m
+    ts_done, m_done = applied.get(kind), applied.get(mtime_key(kind))
+    if not info.get("unreadable"):
+        if ts_done is not None and info.get("ts") == ts_done:
+            return True
+        return m_done is not None and ts_done == m_done and info.get("mtime_ms") == m_done
+    return m_done is not None and info.get("mtime_ms") == m_done
 
 
 def file_state(kind: str, info: Mapping[str, Any] | None, applied: Mapping[str, int] | None) -> ControlState | None:

@@ -85,6 +85,14 @@
 - CI 추가(`.github/workflows/tests.yml`): ubuntu·windows × Python 3.11·3.13. 사용자 PC가 Windows 라서 Windows 러너 포함. 로컬에서 Python 3.11 venv 로도 3,872 통과 확인.
 - PR 활동 구독: CI 실패·리뷰가 오면 수정하고 푸시.
 
+### 10-29 03:35 Windows CI 통과
+- 첫 CI 에서 Windows 잡만 실패(리눅스는 통과). 원인과 수정:
+  - **실제 운영 결함**: 잠금 파일의 PID 생존 확인 `os.kill(pid, 0)` 이 Windows 에서는 신호 0 = `CTRL_C_EVENT` 라서 콘솔 그룹에 Ctrl+C 를 보낸다 → 봇이 스스로 KeyboardInterrupt 로 멈춤(테스트 1,270번째에서 CI 가 멈춘 원인). `OpenProcess`+`GetExitCodeProcess`(ctypes)로 교체, 판단 불가면 잠금을 빼앗지 않음(3410efa).
+  - 리다이렉트된 stdout/stderr 가 cp949 라 이모지·한글 출력이 깨지던 문제 → `prepare_stdio()` 가 TTY 가 아닌 출력만 UTF-8 로 재설정. POSIX 권한(0600) 검사는 Windows 에서 건너뜀(사용자 프로필 ACL 로 보호).
+  - CRLF 체크아웃으로 시스템 프롬프트 바이트가 OS 마다 달라지던 문제(캐시 키 변동) → 읽을 때 LF 정규화 + `.gitattributes`. 대소문자 무시 파일시스템에서 `skill.md` 가 `SKILL.md` 로 읽히던 문제 → 실제 파일명 비교. 테스트의 경로 구분자·`<>` 파일명 기대값 수정(64b0706).
+- 결과: ubuntu·windows × Python 3.11·3.13 4개 잡 모두 통과(3,877 테스트, Windows 는 POSIX 권한 테스트 2개 건너뜀).
+- 다음: 테스트가 재현하지 못하는 Windows 운영 위험(봇·대시보드 두 프로세스의 동시 파일 접근 시 `os.replace` 거부, 콘솔 종료 신호, 작업 디렉터리 등) 점검.
+
 ### 진행 원칙
 - 이전 세션 트랜스크립트 원문은 비밀(키) 포함 가능성 때문에 저장소에 올리지 않음. 비밀 검사(정규식)를 통과한 요약만 커밋.
 - 기존 봇의 하드 리밋(`risk.py`), paper 기본 모드, 실자금 매매 금지 원칙은 유지.

@@ -583,11 +583,16 @@ def offline_fixture_settings(settings: Settings) -> Settings:
     합성 시세로 연 포지션·사이클 카운터·OI/펀딩 이력이 실제 paper ``state.json``/``cache`` 에 섞이지 않게 하고,
     "키·네트워크 없음" 약속대로 유료 LLM 호출과 텔레그램 전송을 막는다. 이미 격리된 설정이면 그대로 둔다.
     """
-    data_dir = Path(settings.data_dir)
-    if data_dir.name != OFFLINE_FIXTURE_DIRNAME:
-        data_dir = data_dir / OFFLINE_FIXTURE_DIRNAME
+    src_dir = Path(settings.data_dir)
+    data_dir = src_dir if src_dir.name == OFFLINE_FIXTURE_DIRNAME else src_dir / OFFLINE_FIXTURE_DIRNAME
+    log_file = getattr(settings, "log_file", None)
+    if log_file is not None and data_dir != src_dir:
+        try:   # DATA_DIR 아래 로그(LOG_FILE 상대 경로)는 격리 폴더로 옮긴다 — 합성 실행 로그가 실제 로그에 섞이지 않게
+            log_file = data_dir / Path(log_file).relative_to(src_dir)
+        except ValueError:
+            pass
     return dataclasses.replace(settings, data_dir=data_dir, agent_backend="mock",
-                               telegram_bot_token=None, telegram_chat_id=None)
+                               telegram_bot_token=None, telegram_chat_id=None, log_file=log_file)
 
 
 def next_run_ts(now_s: float, cycle_minutes: int, offset_s: float = RUN_OFFSET_S) -> float:

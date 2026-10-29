@@ -69,8 +69,9 @@ cd Trading_Bot
 python -m venv .venv
 ```
 
+macOS·Linux:
+
 ```bash
-# Windows PowerShell: .venv\Scripts\Activate.ps1   /  macOS·Linux:
 source .venv/bin/activate
 ```
 
@@ -79,9 +80,20 @@ pip install -r requirements.txt
 ```
 
 ```bash
-# Windows: copy .env.example .env
 cp .env.example .env
 ```
+
+Windows(cmd·PowerShell 공통) — venv 를 활성화하지 않고 venv 의 python 을 직접 씁니다. PowerShell 의 `Activate.ps1` 은 기본 실행 정책에서 막히므로("이 시스템에서 스크립트를 실행할 수 없으므로…") 이 방법이 가장 간단합니다. 활성화하려면 cmd 에서 `.venv\Scripts\activate.bat`, 또는 PowerShell 에서 한 번 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` 뒤 `.venv\Scripts\Activate.ps1`. 아래 명령의 `python` 은 활성화하지 않았다면 `.venv\Scripts\python.exe` 로 바꿔 쓰세요.
+
+```bash
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+```bash
+copy .env.example .env
+```
+
+`.env` 는 메모장으로 열어 고친 뒤 **UTF-8** 로 저장합니다(Windows 10 1903 이후 메모장 기본값). PowerShell 의 `>`·`>>` 로 만들거나 덧붙이지 마세요 — UTF-16 으로 저장되어 봇이 읽지 못합니다(봇은 어떤 줄이 문제인지 알려 주고 시작하지 않습니다). 메모장이 이름을 `.env.txt` 로 저장하는 경우가 있으니 확장자를 확인하세요.
 
 ## 4. `.env` 설정
 
@@ -99,19 +111,22 @@ cp .env.example .env
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 텔레그램 알림(아래 §6) |
 | `SYMBOLS` | 기본 `BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT` (USDT 페어만) |
 | `CYCLE_MINUTES` / `MAX_CANDIDATES_PER_CYCLE` / `PAPER_START_BALANCE_USDT` | 기본 15 / 2 / 10000 |
-| `DATA_DIR` | 상태·로그 저장 폴더(기본 현재 폴더) |
+| `DATA_DIR` | 상태·로그 저장 폴더(기본: 봇을 실행한 폴더). Windows 경로는 따옴표 없이(`DATA_DIR=B:\TradingBot\data`) 또는 `/` 로(`B:/TradingBot/data`). 큰따옴표 안의 `\t \b \n` 은 특수문자로 바뀌고 `%USERPROFILE%` 은 펼쳐지지 않아 봇이 거부합니다 |
+| `LOG_FILE` | 로그 파일(예: `logs/bot.log` — `DATA_DIR` 기준, UTF-8, `.env.example` 기본값). 비우거나 `none` 이면 콘솔만 |
 | `NEWS_FEEDS` | RSS URL 쉼표 목록(기본 CoinDesk·CoinTelegraph·Decrypt·Bitcoin Magazine) |
 | `DASHBOARD_HOST` / `DASHBOARD_PORT` | 기본 `127.0.0.1` / `8787` |
 | `SCANNER_MIN_QUOTE_VOLUME_24H` 등 | 후보 선별 임계값 덮어쓰기(`SCANNER_MAX_SPREAD_BPS`, `SCANNER_MIN_DEPTH_1PCT_USDT`, `SCANNER_MIN_VOL_RATIO_15M`, `SCANNER_MAX_SPIKE_24H_PCT`, `SCANNER_SPIKE_VOLUME_MULT`, `SCANNER_FUNDING_WINDOW_S`) |
 
 비밀값은 로그·텔레그램·대시보드·LLM 입력·예외 메시지에 들어가지 않습니다(마스킹 테스트 포함).
 
+같은 이름의 **환경변수가 `.env` 보다 우선**합니다. 콘솔 창에서 `set`·`$env:` 로 넣은 값은 그 창을 닫을 때까지 남고, `setx` 로 넣은 값은 영구적입니다. 봇은 환경변수가 `.env` 값을 덮어쓰면 그 이름을 경고합니다(값은 쓰지 않음). 확인·삭제: PowerShell `Get-ChildItem Env:AGENT_BACKEND` / `Remove-Item Env:AGENT_BACKEND`, cmd `set AGENT_BACKEND=`.
+
 ## 5. 처음 실행하는 순서 (권장)
 
-**① 키 없이 체험** — 합성 시세 + mock 백엔드, 네트워크 없음, paper 전용. 데이터는 `<DATA_DIR>/offline_fixture/`에 따로 저장됩니다.
+**① 키 없이 체험** — 합성 시세 + mock 백엔드(자동), 네트워크·API 키 없음, paper 전용. 데이터는 `<DATA_DIR>/offline_fixture/`에 따로 저장됩니다. cmd·PowerShell·bash 어디서나 같은 명령입니다.
 
 ```bash
-MODE=paper AGENT_BACKEND=mock MOCK_SCENARIO=approve python -m tradingbot.main run --once --offline-fixture
+python -m tradingbot.main run --once --offline-fixture --mock-scenario approve
 ```
 
 **② 텔레그램 연결 확인** — Claude 키 없이 동작합니다. 채팅에 테스트 메시지가 오면 정상입니다.
@@ -140,17 +155,26 @@ python -m tradingbot.main dashboard
 
 **⑥ live** — `MODE=live` + `CONFIRM_LIVE=YES` + 실계정 키, 그리고 시작할 때 **콘솔(TTY)에서 `LIVE`를 직접 입력**해야 합니다. 파이프·리다이렉트(`echo LIVE | ...`)로는 시작되지 않습니다.
 
-로그는 표준출력/표준에러로 나옵니다. 파일로 남기려면 PowerShell 에서 `python -m tradingbot.main run *>> bot.out`, macOS·Linux 에서 `python -m tradingbot.main run >> bot.out 2>&1`.
+로그는 콘솔(표준에러)에 나오고, `.env` 에 `LOG_FILE=logs/bot.log` 를 두면 `<DATA_DIR>/logs/bot.log` 에도 UTF-8 로 남습니다(`.env.example` 기본값). PowerShell 에서 실시간으로 보려면 `Get-Content <DATA_DIR>\logs\bot.log -Wait -Tail 50`. **PowerShell 에서 `>`·`>>`·`*>>`·`| Tee-Object` 로 봇 출력을 돌리지 마세요** — 그러면 Ctrl+C 가 봇을 즉시 강제 종료하고(종료 알림·잠금 해제 없음), live 의 `LIVE` 입력 안내가 보이지 않으며, Windows PowerShell 5.1 에서는 한글이 깨집니다.
+
+**Windows 에서 오래 돌릴 때**
+
+- **종료는 Ctrl+C**(또는 Ctrl+Break). 1초 안에 "종료 신호 수신" 로그가 나오고, 진행 중인 사이클을 마친 뒤 ⏹ 알림을 보내고 잠금을 풉니다. 창 닫기(X)·작업 관리자 "작업 끝내기"·로그오프·재부팅은 즉시 강제 종료입니다(⏹ 없음). 다음 실행이 남은 잠금을 넘겨받고 ▶️ 시작 알림에 "이전 실행이 정상 종료되지 않았습니다"를 붙입니다.
+- **절전**: `run` 이 도는 동안 자동 절전(유휴 타이머)은 봇이 막습니다(화면 꺼짐은 허용). 덮개 닫기·전원 버튼·시작 > 절전, 배터리 사용 중 모던 스탠바이는 막을 수 없습니다. **PC 가 잠든 동안에는 손절·익절이 집행되지 않으므로** 전원을 연결하고 "덮개를 닫을 때: 아무것도 안 함"으로 두세요(설정 > 시스템 > 전원). 깨어나면 바로 사이클을 돌리고, 공백이 길었으면 🔔 사이클 공백 경보를 보냅니다.
+- **콘솔 창 클릭**: 기본 콘솔(conhost)에서 창 안을 클릭·드래그하면 "선택" 모드가 되어 화면 출력이 멈춥니다. 봇은 로그를 별도 스레드로 내보내므로 거래(손절·익절)는 계속되지만, **Esc** 를 눌러 선택을 풀어야 화면이 다시 갱신됩니다. Windows Terminal 에는 이 문제가 없습니다.
+- **시계**: Binance 는 서명 요청의 시각이 서버보다 1초 이상 빠르면 거부합니다(-1021). 봇이 자동으로 시계 차이를 다시 재지만 "설정 > 시간 및 언어 > 자동으로 시간 설정"을 켜 두세요.
+- **실행 폴더**: `.env` 와 상대 경로 `DATA_DIR` 은 **현재 작업 폴더** 기준입니다. 바로가기·`.bat`·작업 스케줄러는 시작 위치를 봇 폴더로 두세요(`.bat` 이면 `cd /d B:\TradingBot`). 시작 로그에 실제로 읽은 `.env` 와 데이터 폴더의 절대 경로가 나오고, `.env` 를 못 찾으면 경고합니다. `stop`/`clear-stop` 은 쓴 파일의 절대 경로와 대상 봇 PID 를 보여 주고, 그 폴더에서 실행 중인 봇이 없으면 경고합니다.
+- **다른 프로그램이 봇 파일을 열고 있을 때**(백신 검사·동기화 프로그램·Excel 로 연 `cost_ledger.jsonl` 등): Windows 는 그동안 파일 교체·삭제를 거부합니다. 봇은 잠시 기다렸다가 다시 시도하고(`state.json` 은 최대 10초), 비용 원장이 잠겨 있으면 `cost_ledger.pending.jsonl` 에 따로 기록합니다(합계는 두 파일을 더함). 봇 폴더는 OneDrive 같은 동기화 폴더 밖에 두는 것을 권합니다.
 
 ## 6. 명령어
 
 | 명령 | 설명 |
 |---|---|
-| `run` | 사이클 경계 + 5초마다 실행(기본 15분). `--once` 1사이클만, `--cycle-minutes N` 주기 변경, `--offline-fixture` 합성 시세 체험 |
+| `run` | 사이클 경계 + 5초마다 실행(기본 15분). `--once` 1사이클만, `--cycle-minutes N` 주기 변경, `--offline-fixture` 합성 시세 체험(API 키 불필요), `--mock-scenario conservative\|approve` mock 응답 선택 |
 | `dashboard` | 로컬 대시보드(읽기 전용 + STOP/해제) |
 | `backtest --days 90 [--symbols BTC/USDT ETH/USDT]` | 규칙 전용 기준선 백테스트(LLM 없음, Binance 공개 시세 필요) |
 | `status` | 상태 요약(파일만 읽음, API 키 없어도 동작) |
-| `stop --reason "..."` | `control/STOP` 작성 → 다음 사이클에 킬스위치 |
+| `stop --reason "..."` | `control/STOP` 작성 → 다음 사이클에 킬스위치(절대 경로·대상 봇 PID 표시, 실행 중인 봇이 없으면 경고) |
 | `clear-stop` | `control/STOP` 삭제 + `control/CLEAR` 작성 → 다음 사이클에 해제 |
 | `notify-test` | 텔레그램 테스트 메시지 1통(성공 0 / 실패 1 / 설정 없음 2) |
 
@@ -179,7 +203,7 @@ python -m tradingbot.main dashboard
 
 ## 8. 대시보드
 
-`dashboard` 실행 후 http://127.0.0.1:8787. 외부 CDN 없이 동작하고 파일만 읽습니다(상태·포지션·결정·거래·비용·백테스트·자본 스파크라인). **STOP/해제** 버튼은 `<DATA_DIR>/control/dashboard_token`(권한 0600)의 토큰을 입력해야 동작하며, `control/STOP`·`control/CLEAR` 파일만 씁니다. Host 헤더를 검사해 외부 사이트가 대시보드를 읽지 못하게 합니다.
+`dashboard` 실행 후 http://127.0.0.1:8787. 외부 CDN 없이 동작하고 파일만 읽습니다(상태·포지션·결정·거래·비용·백테스트·자본 스파크라인). **STOP/해제** 버튼은 `<DATA_DIR>/control/dashboard_token`(macOS·Linux 는 권한 0600, Windows 는 사용자 폴더 권한으로 보호)의 토큰을 입력해야 동작하며, `control/STOP`·`control/CLEAR` 파일만 씁니다. Host 헤더를 검사해 외부 사이트가 대시보드를 읽지 못하게 합니다.
 
 ## 9. 비용
 
@@ -202,7 +226,8 @@ python -m tradingbot.main dashboard
 | `logs/cycles/<날짜>/cycle_<n>.json/.md` | 사이클 보고서 전문 |
 | `logs/journal.jsonl` | 청산 거래와 사후분석 |
 | `logs/failed_notifications.jsonl` | 전송 실패한 알림 |
-| `cost_ledger.jsonl` | LLM 호출별 토큰·비용 |
+| `logs/bot.log` | 실행 로그(`LOG_FILE` 설정 시, UTF-8) |
+| `cost_ledger.jsonl` | LLM 호출별 토큰·비용(원장이 다른 프로그램에 잠겼을 때는 `cost_ledger.pending.jsonl`) |
 | `journal_state.json` | 논지·레드라인·진입 판정 스냅샷·게이트 통계 |
 | `news_store.json` / `alert_state.json` / `equity_daily.json` | 뉴스 이벤트 / 알림 중복 방지 / 일별 자본 곡선 |
 | `cache/` | 스캐너 이력, 공포탐욕 지수 |

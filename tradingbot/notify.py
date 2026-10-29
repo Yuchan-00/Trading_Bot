@@ -906,6 +906,9 @@ def _format_startup(e: TradeEvent) -> str:
     cm = ex.get("cycle_minutes")
     if isinstance(cm, (int, float)):
         lines.append(f"사이클 {int(cm)}분")
+    if ex.get("backend") == "mock":
+        sc = ex.get("mock_scenario")
+        lines.append(f"판단: mock(가짜 응답{', 시나리오 ' + str(sc) if sc else ''}) — 실제 Claude 판단이 아닙니다")
     if e.reason:
         lines.append(_truncate(e.reason))
     lines.append(_fmt_ts(e.ts))
@@ -1134,10 +1137,23 @@ def _format_position_health_alert(e: TradeEvent) -> str:
     return "\n".join(lines)
 
 
+def _format_cycle_gap_alert(e: TradeEvent) -> str:
+    """사이클 공백(PC 절전·콘솔 일시정지 등으로 한동안 사이클이 돌지 않음 — 그동안 손절·익절 미집행)."""
+    ex = e.extra or {}
+    lines = [_header(EMOJI["alert"], "사이클 공백", e, with_symbol=False)]
+    lines.append(_truncate(e.reason) or "한동안 사이클이 돌지 않았습니다")
+    n = ex.get("positions")
+    if isinstance(n, int) and not isinstance(n, bool):
+        lines.append(f"보유 {n}개" + (" — 이번 사이클부터 손절·익절 점검을 다시 합니다" if n else ""))
+    lines.append(_fmt_ts(e.ts))
+    return "\n".join(lines)
+
+
 _ALERT_FORMATTERS: dict[str, Callable[[TradeEvent], str]] = {
     "regime": _format_regime_alert,
     "news_risk": _format_news_risk_alert,
     "position_health": _format_position_health_alert,
+    "cycle_gap": _format_cycle_gap_alert,
 }
 
 

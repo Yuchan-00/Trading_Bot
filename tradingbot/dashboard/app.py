@@ -25,6 +25,7 @@ import secrets
 import stat
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,62 @@ def _tail_jsonl(path: Path, limit: int, max_bytes: int = _TAIL_MAX_BYTES) -> lis
     if pos > 0 and lines:
         lines = lines[1:]
     return _parse_jsonl_lines(lines)[-limit:]
+
+
+class _JsonlFollower:
+    """추가 쓰기만 되는 jsonl 을 이어 읽는다(새로 붙은 줄만 파싱). 파일이 줄었거나 다시 쓰였으면 처음부터.
+
+    비용 원장은 LLM 호출마다 한 줄씩 늘어난다 — 폴링(10초)마다 파일 전체를 다시 파싱하면 CPU 를 잡아먹고,
+    Windows 에서는 그동안 봇의 파일 교체를 막는다. 다시 쓰였는지는 마지막으로 읽은 끝 ``_SIG_BYTES`` 가 그대로인지로 본다.
+    아직 줄바꿈이 없는 마지막 조각은 소비하지 않고 이번 결과에만 넣는다(예전 전체 읽기와 같은 결과).
+    """
+
+    _SIG_BYTES = 64
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._offset = 0
+        self._sig = b""
+        self._records: list[dict] = []
+
+    def _reset(self) -> None:
+        self._offset, self._sig, self._records = 0, b"", []
+
+    def read(self, keep: Callable[[dict], bool] | None = None) -> list[dict]:
+        """지금까지의 레코드(``keep`` 이 False 인 것은 캐시에서 버린다 — 예: 이번 달이 아닌 비용)."""
+        with self._lock:
+            tail: list[dict] = []
+            try:
+                if not self.path.is_file():
+                    self._reset()
+                    return []
+                with self.path.open("rb") as fh:
+                    size = fh.seek(0, os.SEEK_END)
+                    if size < self._offset:
+                        self._reset()
+                    elif self._offset:
+                        n = min(self._SIG_BYTES, self._offset)
+                        fh.seek(self._offset - n)
+                        if fh.read(n) != self._sig[-n:]:
+                            self._reset()
+                    fh.seek(self._offset)
+                    data = fh.read(size - self._offset)
+                cut = data.rfind(b"\n")
+                if cut >= 0:
+                    done = data[:cut + 1]
+                    self._records.extend(_parse_jsonl_lines(done.decode("utf-8", errors="replace").splitlines()))
+                    self._offset += cut + 1
+                    self._sig = (self._sig + done)[-self._SIG_BYTES:]
+                    data = data[cut + 1:]
+                if data.strip():
+                    tail = _parse_jsonl_lines([data.decode("utf-8", errors="replace")])
+            except _READ_ERRORS as e:
+                log.warning("jsonl 읽기 실패 %s: %s", self.path, e)
+            if keep is not None:
+                self._records = [r for r in self._records if keep(r)]
+                tail = [r for r in tail if keep(r)]
+            return self._records + tail
 
 
 def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
@@ -683,12 +740,21 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             raise HTTPException(status_code=404, detail="사이클 보고서 없음")
         return {"date": date, "cycle": n, "payload": payload}
 
+    # 원장과, 원장이 다른 프로그램에 잠겼을 때 봇이 쓰는 보조 파일(llm/cost.py)을 이어 읽는다(새 줄만 파싱)
+    ledger_followers = (_JsonlFollower(data_dir / COST_LEDGER_FILENAME),
+                        _JsonlFollower(data_dir / COST_LEDGER_PENDING_FILENAME))
+
     @app.get("/api/costs")
     def get_costs() -> dict:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        records = _read_jsonl(data_dir / COST_LEDGER_FILENAME)
-        # 원장이 다른 프로그램에 잠겼을 때 봇이 쓰는 보조 파일(llm/cost.py)도 더한다
-        records += _read_jsonl(data_dir / COST_LEDGER_PENDING_FILENAME)
+        month = today[:7]
+
+        def this_month(rec: dict) -> bool:      # 집계는 이번 달·오늘만 쓴다 — 지난달 레코드는 캐시에서 버린다
+            return str(rec.get("date") or "").startswith(month)
+
+        records: list[dict] = []
+        for follower in ledger_followers:
+            records += follower.read(this_month)
         return summarize_costs(records, today, settings)
 
     @app.get("/api/backtests")

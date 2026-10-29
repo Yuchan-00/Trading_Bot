@@ -1194,3 +1194,58 @@ def test_dashboard_polls_sequentially_and_bounds_shutdown():
     assert "setInterval(refresh" not in html and "setTimeout(loop, POLL_MS)" in html
     src = (Path(__file__).resolve().parents[1] / "tradingbot" / "main.py").read_text(encoding="utf-8")
     assert "timeout_graceful_shutdown=5" in src
+
+
+def test_requirements_txt_is_ascii():
+    """pip < 25(Python 3.11 전부·3.12.0~3.12.9·3.13.0~3.13.2 에 딸린 pip)는 requirements 파일을 로캘 인코딩으로 읽는다 —
+    한국어 Windows(cp949)에서 UTF-8 한글 주석이 있으면 ``pip install -r requirements.txt`` 가 UnicodeDecodeError 로 멈춘다."""
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "requirements.txt").read_bytes().isascii()
+
+
+def test_ledger_follower_reads_only_appended_lines(tmp_path, monkeypatch):
+    from tradingbot.dashboard import app as A
+
+    p = tmp_path / "cost_ledger.jsonl"
+    p.write_text("".join(json.dumps({"date": "2026-10-29", "cost_usd": 0.1, "i": i}) + "\n" for i in range(3)),
+                 encoding="utf-8")
+    f = A._JsonlFollower(p)
+    assert [r["i"] for r in f.read()] == [0, 1, 2]
+    parsed: list[int] = []
+    real = A._parse_jsonl_lines
+    monkeypatch.setattr(A, "_parse_jsonl_lines", lambda lines: (parsed.append(len(lines)), real(lines))[1])
+    with p.open("ab") as fh:
+        fh.write((json.dumps({"date": "2026-10-29", "cost_usd": 0.1, "i": 3}) + "\n").encode())
+        fh.write(json.dumps({"date": "2026-10-29", "cost_usd": 0.1, "i": 4}).encode())      # 아직 줄바꿈 없음
+    assert [r["i"] for r in f.read()] == [0, 1, 2, 3, 4]
+    assert parsed == [1, 1]                                   # 새 줄 1개 + 끝 조각 1개만 파싱
+    with p.open("ab") as fh:
+        fh.write(b"\n")
+    assert [r["i"] for r in f.read()] == [0, 1, 2, 3, 4]
+    # 다시 쓰인 파일(크기는 더 커도 내용이 다름) → 처음부터
+    p.write_text("".join(json.dumps({"date": "2026-10-29", "cost_usd": 1.0, "j": j}) + "\n" for j in range(9)),
+                 encoding="utf-8")
+    assert [r["j"] for r in f.read()] == list(range(9))
+    # 지난달 레코드는 keep 으로 버린다
+    with p.open("ab") as fh:
+        fh.write((json.dumps({"date": "2026-09-30", "cost_usd": 5.0}) + "\n").encode())
+    assert all(r["date"].startswith("2026-10") for r in f.read(lambda r: r["date"].startswith("2026-10")))
+    p.unlink()
+    assert f.read() == []
+
+
+def test_dashboard_costs_follow_appends(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from tradingbot.dashboard import create_app
+
+    data = tmp_path / "data"
+    settings = load_settings({"AGENT_BACKEND": "mock", "DATA_DIR": str(data)})
+    client = TestClient(create_app(settings, data))
+    assert client.get("/api/costs").json()["today_usd"] == 0
+    led = CostLedger(data / "cost_ledger.jsonl", 10, 200)
+    c1 = led.record(role="head", model="claude-opus-5-5", input_tokens=1000, cached_tokens=0, output_tokens=100)
+    assert client.get("/api/costs").json()["today_usd"] == pytest.approx(c1)
+    c2 = led.record(role="head", model="claude-opus-5-5", input_tokens=500, cached_tokens=0, output_tokens=50)
+    assert client.get("/api/costs").json()["today_usd"] == pytest.approx(c1 + c2)
+

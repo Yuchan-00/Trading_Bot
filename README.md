@@ -86,6 +86,10 @@ cp .env.example .env
 Windows(cmd·PowerShell 공통) — venv 를 활성화하지 않고 venv 의 python 을 직접 씁니다. PowerShell 의 `Activate.ps1` 은 기본 실행 정책에서 막히므로("이 시스템에서 스크립트를 실행할 수 없으므로…") 이 방법이 가장 간단합니다. 활성화하려면 cmd 에서 `.venv\Scripts\activate.bat`, 또는 PowerShell 에서 한 번 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` 뒤 `.venv\Scripts\Activate.ps1`. 아래 명령의 `python` 은 활성화하지 않았다면 `.venv\Scripts\python.exe` 로 바꿔 쓰세요.
 
 ```bash
+.venv\Scripts\python.exe -m pip install --upgrade pip
+```
+
+```bash
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -161,7 +165,7 @@ python -m tradingbot.main dashboard
 
 - **종료는 Ctrl+C**(또는 Ctrl+Break). 1초 안에 "종료 신호 수신" 로그가 나오고, 진행 중인 사이클을 마친 뒤 ⏹ 알림을 보내고 잠금을 풉니다. 창 닫기(X)·작업 관리자 "작업 끝내기"·로그오프·재부팅은 즉시 강제 종료입니다(⏹ 없음). 다음 실행이 남은 잠금을 넘겨받고 ▶️ 시작 알림에 "이전 실행이 정상 종료되지 않았습니다"를 붙입니다.
 - **절전**: `run` 이 도는 동안 자동 절전(유휴 타이머)은 봇이 막습니다(화면 꺼짐은 허용). 덮개 닫기·전원 버튼·시작 > 절전, 배터리 사용 중 모던 스탠바이는 막을 수 없습니다. **PC 가 잠든 동안에는 손절·익절이 집행되지 않으므로** 전원을 연결하고 "덮개를 닫을 때: 아무것도 안 함"으로 두세요(설정 > 시스템 > 전원). 깨어나면 바로 사이클을 돌리고, 공백이 길었으면 🔔 사이클 공백 경보를 보냅니다.
-- **콘솔 창 클릭**: 기본 콘솔(conhost)에서 창 안을 클릭·드래그하면 "선택" 모드가 되어 화면 출력이 멈춥니다. 봇은 로그를 별도 스레드로 내보내므로 거래(손절·익절)는 계속되지만, **Esc** 를 눌러 선택을 풀어야 화면이 다시 갱신됩니다. Windows Terminal 에는 이 문제가 없습니다.
+- **콘솔 창 클릭·Pause 키**: 기본 콘솔(conhost)에서 창 안을 클릭·드래그하면 "선택" 모드가 되고, **Pause** 키(Windows Terminal 은 Ctrl+S 도)를 누르면 출력이 일시정지되어 화면이 멈춥니다. 봇은 로그를 별도 스레드로 내보내므로 거래(손절·익절)는 계속되지만, 화면을 다시 갱신하려면 선택은 **Esc**, 일시정지는 아무 글자·Space·Enter 로 푸세요.
 - **시계**: Binance 는 서명 요청의 시각이 서버보다 1초 이상 빠르면 거부합니다(-1021). 봇이 자동으로 시계 차이를 다시 재지만 "설정 > 시간 및 언어 > 자동으로 시간 설정"을 켜 두세요.
 - **실행 폴더**: `.env` 와 상대 경로 `DATA_DIR` 은 **현재 작업 폴더** 기준입니다. 바로가기·`.bat`·작업 스케줄러는 시작 위치를 봇 폴더로 두세요(`.bat` 이면 `cd /d B:\TradingBot`). 시작 로그에 실제로 읽은 `.env` 와 데이터 폴더의 절대 경로가 나오고, `.env` 를 못 찾으면 경고합니다. `stop`/`clear-stop` 은 쓴 파일의 절대 경로와 대상 봇 PID 를 보여 주고, 그 폴더에서 실행 중인 봇이 없으면 경고합니다.
 - **다른 프로그램이 봇 파일을 열고 있을 때**(백신 검사·동기화 프로그램·Excel 로 연 `cost_ledger.jsonl` 등): Windows 는 그동안 파일 교체·삭제를 거부합니다. 봇은 잠시 기다렸다가 다시 시도하고(`state.json` 은 최대 10초), 비용 원장이 잠겨 있으면 `cost_ledger.pending.jsonl` 에 따로 기록합니다(합계는 두 파일을 더함). 봇 폴더는 OneDrive 같은 동기화 폴더 밖에 두는 것을 권합니다.

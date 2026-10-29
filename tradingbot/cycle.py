@@ -223,9 +223,12 @@ def read_control_file(path: Path) -> dict | None:
     p = Path(path)
     if not p.is_file():
         return None
+    unreadable = False
     try:
         raw = p.read_text(encoding="utf-8").strip()
-    except (OSError, ValueError):
+    except OSError:
+        raw, unreadable = "", True       # 다른 프로그램이 읽기까지 막고 열고 있음(Windows) — ts 는 수정 시각뿐
+    except ValueError:
         raw = ""
     data: dict = {}
     if raw:
@@ -244,11 +247,14 @@ def read_control_file(path: Path) -> dict | None:
         except OSError:
             ts = 0
     reason = data.get("reason")
-    return {"reason": str(reason)[:500] if reason else None, "ts": int(ts)}
+    out = {"reason": str(reason)[:500] if reason else None, "ts": int(ts)}
+    if unreadable:
+        out["unreadable"] = True
+    return out
 
 
 def _journal_has_trade(path: Path, trade: ClosedTrade, *, tail_bytes: int = 262_144) -> bool:
-    """``journal.jsonl`` 끝부분에 이 거래(심볼·진입·청산 시각)의 기록이 이미 있는가. 읽지 못하면 False."""
+    """``journal.jsonl`` 끝부분에 이 거래(심볼·진입·청산 시각·주문 ID·수량)의 기록이 이미 있는가. 읽지 못하면 False."""
     try:
         with open(path, "rb") as fh:
             end = fh.seek(0, os.SEEK_END)
@@ -263,7 +269,8 @@ def _journal_has_trade(path: Path, trade: ClosedTrade, *, tail_bytes: int = 262_
             continue
         t = rec.get("trade") if isinstance(rec, dict) else None
         if (isinstance(t, dict) and t.get("symbol") == trade.symbol and t.get("opened_ts") == trade.opened_ts
-                and t.get("closed_ts") == trade.closed_ts):
+                and t.get("closed_ts") == trade.closed_ts and t.get("exit_order_id") == trade.exit_order_id
+                and t.get("base_amount") == trade.base_amount):      # 같은 사이클의 부분·전량 청산을 구분
             return True
     return False
 
@@ -1248,6 +1255,11 @@ class Cycle:
                 # ts 를 고정한 JSON)은 다시 적용된다(다음 저장에 함께 남는다)
                 self._consumed_control.pop(kind, None)
                 self.state.control_applied_ts.pop(kind, None)
+                continue
+            if kind == "clear" and info.get("unreadable"):
+                # 읽지 못한 CLEAR 의 ts 는 수정 시각이라 '이미 처리함' 과 비교할 수 없다 — 지우지 못한 옛 CLEAR 를 새
+                # 요청으로 보고 킬스위치를 끄지 않게 이번 사이클은 건너뛴다(읽지 못한 STOP 은 안전한 쪽이라 적용)
+                log.warning("CLEAR 파일을 읽지 못했습니다(다른 프로그램이 열고 있음) — 다음 사이클에 다시 확인합니다")
                 continue
             if info["ts"] in (self._consumed_control.get(kind), self.state.control_applied_ts.get(kind)):
                 # 이미 처리했지만 삭제에 실패한 파일(재시작 전에 처리한 것 포함) — 다시 적용하지 않고 삭제만 재시도한다

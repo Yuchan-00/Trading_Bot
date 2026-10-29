@@ -915,6 +915,69 @@ def test_undeletable_clear_is_not_reapplied_after_restart(tmp_path, monkeypatch)
     assert health["clear_pending"] is False and health["kill_switch"] is True
 
 
+def test_unreadable_clear_is_not_taken_for_a_new_request(tmp_path, monkeypatch):
+    """읽기까지 막힌 CLEAR(다른 프로그램이 공유 없이 엶)의 ts 는 수정 시각뿐 — 새 요청으로 보고 킬스위치를 끄지 않는다."""
+    from test_cycle import Rig
+
+    rig = Rig(tmp_path)
+    rig.portfolio.set_kill("manual_stop: 점검")
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    clear = ctl / "CLEAR"
+    clear.write_text(json.dumps({"reason": "해제", "ts": rig.clock.ms() - 1000}), encoding="utf-8")
+    real = Path.read_text
+
+    def read_text(self, *a, **k):
+        if self.name == C.CLEAR_FILENAME:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and clear.is_file()        # 이번 사이클은 건너뜀
+    monkeypatch.undo()
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False and not clear.exists()   # 읽히면 적용
+
+
+def test_status_and_dashboard_treat_an_applied_undeletable_stop_as_handled(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from tradingbot import portfolio as PF
+    from tradingbot.dashboard import create_app
+
+    settings = load_settings(env_for(tmp_path))
+    pf = PF.Portfolio.load(settings, Path(settings.data_dir) / "state.json")
+    pf.state.control_applied_ts["stop"] = 777
+    pf.save()
+    ctl = Path(settings.data_dir) / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    (ctl / "STOP").write_text(json.dumps({"reason": "점검", "ts": 777}), encoding="utf-8")
+    out, err = io.StringIO(), io.StringIO()
+    assert M.main(["status"], env=env_for(tmp_path), out=out, err=err) == M.EXIT_OK
+    assert "STOP 대기" not in out.getvalue() and "STOP: 이미 처리함" in out.getvalue()
+    client = TestClient(create_app(settings, Path(settings.data_dir)))
+    assert client.get("/api/state").json()["stop_pending"] is False
+    assert client.get("/api/health").json()["stop_pending"] is False
+    (ctl / "STOP").write_text(json.dumps({"reason": "새 요청", "ts": 778}), encoding="utf-8")
+    assert client.get("/api/state").json()["stop_pending"] is True
+
+
+def test_journal_dedupe_tells_a_partial_and_a_full_exit_apart(tmp_path):
+    from tradingbot import reports
+    from tradingbot.models import ClosedTrade
+
+    base = dict(symbol="ETH/USDT", entry_price=100.0, exit_price=95.0, quote_spent=500.0, quote_received=237.5,
+                pnl_quote=-12.5, pnl_pct=-0.05, reason="stop_loss", opened_cycle=1, closed_cycle=2,
+                opened_ts=1_000, closed_ts=2_000)
+    partial = ClosedTrade(base_amount=2.5, exit_order_id="o-1", **base)
+    full = ClosedTrade(base_amount=2.5, exit_order_id="o-2", **base)
+    path = tmp_path / "journal.jsonl"
+    reports.append_journal(path, partial, None)
+    assert C._journal_has_trade(path, partial) and not C._journal_has_trade(path, full)
+    assert not C._journal_has_trade(tmp_path / "missing.jsonl", full)
+
+
 def test_control_file_reusing_an_applied_ts_is_applied_again_once_the_old_one_is_gone(tmp_path):
     """수정 시각이 유지되는 템플릿 복사·ts 를 고정한 JSON: 앞 파일이 지워진 뒤 같은 ts 의 새 STOP 도 적용된다."""
     from test_cycle import Rig
@@ -1040,7 +1103,7 @@ def test_dotenv_utf16_with_appended_8bit_lines(clean_env):
     head = "\ufeffAGENT_BACKEND=mock\r\nDATA_DIR=botdata\r\n".encode("utf-16-le")
     for tail in (b"MODE=paper\n", "# 텔레그램\r\n".encode("cp949")):         # 홀수 길이 / 잘못된 서로게이트
         (clean_env / ".env").write_bytes(head + tail)
-        with pytest.raises(ConfigError, match="UTF-16"):
+        with pytest.raises(ConfigError, match="3번째 줄부터 UTF-16"):      # 덧붙인 첫 줄 번호
             load_settings()
         warnings: list[str] = []
         assert read_env(lenient=True, warnings=warnings)["DATA_DIR"] == "botdata" and warnings
@@ -1086,6 +1149,11 @@ def test_dotenv_utf16_with_an_8bit_tail_glued_to_the_last_line(clean_env):
     warnings: list[str] = []
     read_env(lenient=True, warnings=warnings)
     assert any("다른 인코딩" in w for w in warnings)
+    # 빅엔디언 UTF-16 + Git Bash 의 LF 하나: LF 가 마지막 글자의 아래 바이트가 된다
+    be = "\ufeffAGENT_BACKEND=mock\nTELEGRAM_CHAT_ID=12345".encode("utf-16-be")
+    (clean_env / ".env").write_bytes(be + b"X=1\n")
+    with pytest.raises(ConfigError, match="2번째 줄에 다른 인코딩"):
+        load_settings()
 
 
 def test_dotenv_quote_errors_on_export_and_lowercase_lines_get_quote_advice(clean_env):
@@ -1095,6 +1163,13 @@ def test_dotenv_quote_errors_on_export_and_lowercase_lines_get_quote_advice(clea
     assert "set" not in str(ei.value)
     (clean_env / ".env").write_bytes(b'data_dir="B:\\data\\"\nAGENT_BACKEND=mock\n')
     with pytest.raises(ConfigError, match="1번째 줄을 해석하지 못했습니다 — 닫히지 않은 따옴표"):
+        load_settings()
+    # python-dotenv 는 소문자 'export ' 만 받는다 — 다른 앞말은 앞말 자체가 문제
+    (clean_env / ".env").write_bytes(b"EXPORT DATA_DIR=d\nAGENT_BACKEND=mock\n")
+    with pytest.raises(ConfigError, match=r"1번째 줄\(DATA_DIR\).*줄 앞의 'EXPORT'"):
+        load_settings()
+    (clean_env / ".env").write_bytes(b"set DATA_DIR=d\nAGENT_BACKEND=mock\n")
+    with pytest.raises(ConfigError, match="cmd 의 set"):
         load_settings()
 
 

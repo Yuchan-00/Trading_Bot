@@ -234,7 +234,7 @@ _WARNED_OVERRIDES: set[tuple[str, ...]] = set()
 _DOTENV_ASSIGN = re.compile(r"((?i:export|set)\s+)?([A-Za-z_][A-Za-z0-9_]{0,63})\s*=")
 _SHOWN_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,39}")
 # 복사·붙여넣기로 섞이는 보이지 않는 글자(유니코드 서식 문자 Cf — U+200B·U+FEFF·U+2060·U+200E 등 — 와 한글 채움 문자)
-_INVISIBLE_EXTRA = frozenset("\u3164\uffa0")
+_INVISIBLE_EXTRA = frozenset("\u115f\u1160\u3164\uffa0")
 # UTF-16 으로 푼 글에서 이 블록(구르무키·구자라트·말라얄람·싱할라)의 글자는 덧붙인 8비트 줄의 CR·LF 바이트가 만든 것
 _MIXED_UTF16 = re.compile(r"[\u0a00-\u0aff\u0d00-\u0dff]")
 _NEWLINES = re.compile(r"\r\n|\n|\r")
@@ -272,7 +272,9 @@ def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str
         try:
             text = data.decode("utf-16")
         except UnicodeDecodeError as e:
-            msg = f"{path}: UTF-16 으로 저장됐지만 읽을 수 없습니다(다른 인코딩 줄이 덧붙은 듯) — {fix}"
+            # 덧붙인 8비트 바이트에는 0x00 이 없어 줄바꿈으로 풀리지 않는다 → 앞부분의 줄 수가 곧 덧붙인 첫 줄
+            line = len(_NEWLINES.findall(data[:e.start].decode("utf-16", errors="replace"))) + 1
+            msg = f"{path} {line}번째 줄부터 UTF-16 으로 읽을 수 없습니다(다른 인코딩 줄이 덧붙은 듯) — {fix}"
             if not lenient:
                 raise ConfigError(msg) from e
             warnings.append(msg)
@@ -280,9 +282,13 @@ def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str
         msg = f"{path}: UTF-16 으로 저장돼 있습니다(PowerShell '>' 로 만든 파일) — {fix}"
         warnings.append(msg)
         mixed = _MIXED_UTF16.search(text)
-        if mixed is not None:
+        at = mixed.start() if mixed is not None else None
+        if at is None and data.startswith(codecs.BOM_UTF16_BE) and text and text[-1] != "\n" \
+                and (ord(text[-1]) & 0xFF) == 0x0A:
+            at = len(text) - 1           # 빅엔디언: 끝에 덧붙인 8비트 LF 는 마지막 글자의 아래 바이트가 된다
+        if at is not None:
             # 짝수 길이로 풀린 덧붙인 줄이 앞 줄 값에 붙었다(그 설정은 읽히지 않는다) — 조용히 기본값으로 돌지 않게
-            line = len(_NEWLINES.findall(text, 0, mixed.start())) + 1
+            line = len(_NEWLINES.findall(text, 0, at)) + 1
             msg = (f"{path} {line}번째 줄에 다른 인코딩으로 덧붙인 글자가 섞였습니다(UTF-16 파일에 cmd·Git Bash 로 줄을 "
                    f"덧붙이면 그 설정이 읽히지 않습니다) — {fix}")
             if not lenient:
@@ -332,9 +338,12 @@ def _dotenv_line_problem(binding: object, s: str, before: str, path: Path) -> st
                 f"섞인 것입니다(UTF-16 파일에 cmd·Git Bash 로 줄을 덧붙이면 그 줄의 설정이 사라집니다) — {_UTF8_FIX}")
     m = _DOTENV_ASSIGN.match(_visible(_NEWLINES.split(body, 1)[0]))
     shown = m.group(2) if m and _SHOWN_NAME.fullmatch(m.group(2)) else None
-    if m and m.group(1) and m.group(1).split()[0].lower() == "set":
-        return (f"{path} {line}번째 줄{f'({shown})' if shown else ''}을 해석하지 못했습니다 — cmd 의 set 은 .env 에 "
-                f"쓰지 않습니다. {shown or 'NAME'}=값 처럼 쓰세요")
+    if m and m.group(1) and not m.group(1).startswith("export"):
+        # python-dotenv 는 소문자 'export ' 만 받는다 — set·SET·EXPORT 같은 앞말 자체가 문제
+        word = m.group(1).split()[0]
+        hint = "cmd 의 set 은 .env 에 쓰지 않습니다" if word.lower() == "set" else f"줄 앞의 '{word}' 는 쓰지 않습니다"
+        return (f"{path} {line}번째 줄{f'({shown})' if shown else ''}을 해석하지 못했습니다 — {hint}. "
+                f"{shown or 'NAME'}=값 처럼 쓰세요")
     if m:
         return (f"{path} {line}번째 줄{f'({shown}=…)' if shown else ''}을 해석하지 못했습니다 — 닫히지 않은 따옴표이거나 "
                 "따옴표 안의 값이 역슬래시(\\)로 끝납니다(닫는 따옴표 뒤에 다른 글자가 있어도 그렇습니다). 경로는 "

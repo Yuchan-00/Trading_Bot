@@ -384,8 +384,8 @@ def read_env(dotenv_path: Path | None = None, *, lenient: bool = False,
             key = tuple(sorted(overridden))
             if key not in _WARNED_OVERRIDES:
                 _WARNED_OVERRIDES.add(key)
-                msg = (f"환경변수가 .env 값을 덮어씁니다: {', '.join(key)} — 콘솔 창에 남은 set/$env: 값일 수 있습니다"
-                       "(.env 를 쓰려면 그 환경변수를 지우세요)")
+                msg = (f"환경변수가 .env 값을 덮어씁니다: {', '.join(key)} — 콘솔 창에 남은 set/$env: 값이거나 setx 로 "
+                       "넣은 영구 값일 수 있습니다(.env 를 쓰려면 그 환경변수를 지우세요 — README §4)")
                 if warnings is not None:
                     warnings.append(msg)
                 else:

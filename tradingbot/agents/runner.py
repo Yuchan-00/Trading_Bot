@@ -20,7 +20,7 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -41,6 +41,7 @@ SKILLS_MAX_TOKENS = 24000  # SPEC v2.1: 역할 배정 스킬이 잘리지 않게
 # 예약 시 예상 비용에 곱하는 안전 배수. 예상치(문자수/4 + max_tokens)는 실제 입력 토큰을 과소평가할 수 있어,
 # 예약 합계가 예산에 가까워지면 진행 중 호출이 실제 비용을 기록할 때까지 기다린 뒤 실제 합계로 다시 검사한다.
 RESERVATION_SAFETY = 2.0
+WAIT_SLICE_S = 1.0  # run_many 가 결과를 기다리는 조각(호출 스레드가 이 간격으로 신호 처리기를 돌릴 수 있게)
 
 _COST_MODULE_FILE = Path(__import__("tradingbot.llm.cost", fromlist=["_"]).__file__).resolve()
 
@@ -309,6 +310,11 @@ class AgentRunner:
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agent") as pool:
             futures = [pool.submit(_task, i, r, p, m) for i, (r, p, m) in enumerate(items)]
+            pending = set(futures)
+            while pending:
+                # 1초마다 호출 스레드로 돌아온다: Windows(Python ≤3.13)는 시간 제한 없는 대기 중에는 Ctrl+C 처리기를
+                # 돌리지 못해 '종료 신호 수신' 이 총괄 호출(최대 120초)이 끝날 때까지 늦어진다
+                _, pending = wait(pending, timeout=WAIT_SLICE_S)
             results = [fut.result() for fut in futures]
         if first_exc:
             raise first_exc[0]

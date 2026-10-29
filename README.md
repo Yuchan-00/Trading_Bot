@@ -123,7 +123,7 @@ copy .env.example .env
 
 비밀값은 로그·텔레그램·대시보드·LLM 입력·예외 메시지에 들어가지 않습니다(마스킹 테스트 포함).
 
-같은 이름의 **환경변수가 `.env` 보다 우선**합니다. 콘솔 창에서 `set`·`$env:` 로 넣은 값은 그 창을 닫을 때까지 남고, `setx` 로 넣은 값은 영구적입니다. 봇은 환경변수가 `.env` 값을 덮어쓰면 그 이름을 경고합니다(값은 쓰지 않음, `.env` 의 빈 값은 제외). 확인: PowerShell `Get-ChildItem Env:AGENT_BACKEND`. 지금 창에서만 지우기: PowerShell `Remove-Item Env:AGENT_BACKEND`, cmd `set AGENT_BACKEND=`. `setx` 로 넣은 값까지 지우기: cmd `reg delete HKCU\Environment /v AGENT_BACKEND /f`(또는 PowerShell `[Environment]::SetEnvironmentVariable('AGENT_BACKEND', $null, 'User')`) 뒤 새 콘솔 창을 여세요.
+같은 이름의 **환경변수가 `.env` 보다 우선**합니다. 콘솔 창에서 `set`·`$env:` 로 넣은 값은 그 창을 닫을 때까지 남고, `setx` 로 넣은 값은 영구적입니다. 봇은 환경변수가 `.env` 값을 덮어쓰면 그 이름을 경고합니다(값은 쓰지 않음, `.env` 의 빈 값은 제외). 확인: PowerShell `Get-ChildItem Env:AGENT_BACKEND`(지금 창), `[Environment]::GetEnvironmentVariable('AGENT_BACKEND','User')`(`setx` 로 넣은 영구 값). 지금 창에서만 지우기: PowerShell `Remove-Item Env:AGENT_BACKEND`, cmd `set AGENT_BACKEND=`. `setx` 로 넣은 값까지 지우기: PowerShell `[Environment]::SetEnvironmentVariable('AGENT_BACKEND', $null, 'User')`(관리자로 `setx /M` 했다면 관리자 PowerShell 에서 `'Machine'`) 또는 시작 > '시스템 환경 변수 편집' > 환경 변수 > 사용자 변수에서 삭제한 뒤, **시작 메뉴에서 새 창**을 여세요. `reg delete HKCU\Environment /v AGENT_BACKEND /f` 로 지웠다면 로그아웃 후 다시 로그인해야 새 창에 반영됩니다.
 
 ## 5. 처음 실행하는 순서 (권장)
 
@@ -163,12 +163,13 @@ python -m tradingbot.main dashboard
 
 **Windows 에서 오래 돌릴 때**
 
-- **종료는 Ctrl+C**(또는 Ctrl+Break) **한 번 누르고 기다리세요**. 사이클 사이 대기 중이면 1초 안에 "종료 신호 수신" 로그가 나옵니다. 사이클이 도는 중(Claude 호출 등)이면 진행 중인 호출이 끝난 뒤(수십 초까지) 나오고, 그 사이클을 마친 뒤 ⏹ 알림을 보내고 잠금을 풉니다. 창 닫기(X)·작업 관리자 "작업 끝내기"·로그오프·재부팅은 즉시 강제 종료입니다(⏹ 없음). 다음 실행이 남은 잠금을 넘겨받고 ▶️ 시작 알림에 "이전 실행이 정상 종료되지 않았습니다"를 붙입니다.
+- **종료는 Ctrl+C**(또는 Ctrl+Break) **한 번 누르고 기다리세요**. 사이클 사이 대기 중이거나 Claude 판단 단계(분석가·변론·리스크·총괄)면 1초 안에 "종료 신호 수신" 로그가 나옵니다. 사후분석·일일 리뷰 호출이나 거래소 호출 중이면 그 호출이 끝난 뒤(최대 1분쯤) 나옵니다 — 다시 눌러도 괜찮지만 창은 닫지 마세요. 그 사이클을 마친 뒤 ⏹ 알림을 보내고 잠금을 풉니다. 창 닫기(X)·작업 관리자 "작업 끝내기"·로그오프·재부팅은 즉시 강제 종료입니다(⏹ 없음). 다음 실행이 남은 잠금을 넘겨받고 ▶️ 시작 알림에 "이전 실행이 정상 종료되지 않았습니다"를 붙입니다.
 - **절전**: `run` 이 도는 동안 자동 절전(유휴 타이머)은 봇이 막습니다(화면 꺼짐은 허용). 덮개 닫기·전원 버튼·시작 > 절전, 배터리 사용 중 모던 스탠바이는 막을 수 없습니다. **PC 가 잠든 동안에는 손절·익절이 집행되지 않으므로** 전원을 연결하고 "덮개를 닫을 때: 아무것도 안 함"으로 두세요(설정 > 시스템 > 전원). 깨어나면 바로 사이클을 돌리고, 공백이 길었으면 🔔 사이클 공백 경보를 보냅니다.
 - **콘솔 창 클릭·Pause 키**: 기본 콘솔(conhost)에서 창 안을 클릭·드래그하면 "선택" 모드가 되고, **Pause** 키(Windows Terminal 은 Ctrl+S 도)를 누르면 출력이 일시정지되어 화면이 멈춥니다. 봇은 로그를 별도 스레드로 내보내므로 거래(손절·익절)와 `LOG_FILE` 기록은 계속되지만, 화면을 다시 갱신하려면 선택은 **Esc**, 일시정지는 아무 글자·Space·Enter 로 푸세요.
 - **시계**: Binance 는 서명 요청의 시각이 서버보다 1초 이상 빠르면 거부합니다(-1021). 봇이 자동으로 시계 차이를 다시 재지만 "설정 > 시간 및 언어 > 자동으로 시간 설정"을 켜 두세요.
 - **실행 폴더**: `.env` 와 상대 경로 `DATA_DIR` 은 **현재 작업 폴더** 기준입니다. 바로가기·`.bat`·작업 스케줄러는 시작 위치를 봇 폴더로 두세요(`.bat` 이면 `cd /d B:\TradingBot`). 시작 로그에 실제로 읽은 `.env` 와 데이터 폴더의 절대 경로가 나오고, `.env` 를 못 찾으면 경고합니다. `stop`/`clear-stop` 은 쓴 파일의 절대 경로와 대상 봇 PID 를 보여 주고, 그 폴더에서 실행 중인 봇이 없으면 경고합니다.
 - **다른 프로그램이 봇 파일을 열고 있을 때**(백신 검사·동기화 프로그램·Excel 로 연 `cost_ledger.jsonl` 등): Windows 는 그동안 파일 교체·삭제를 거부합니다. 봇은 잠시 기다렸다가 다시 시도하고(`state.json` 은 최대 10초), 비용 원장이 잠겨 있으면 `cost_ledger.pending.jsonl` 에 따로 기록합니다(합계는 두 파일을 더함). 봇 폴더는 OneDrive 같은 동기화 폴더 밖에 두는 것을 권합니다.
+- **이 PC 에 다른 사용자 계정이 있으면**: Windows 는 봇 파일의 권한을 따로 좁히지 않고 봇 폴더의 권한을 물려받습니다. `C:\Users\<이름>` 아래면 본인만 읽을 수 있지만, `B:\TradingBot` 처럼 드라이브 바로 아래 만든 폴더는 다른 계정도 `.env`(API 키)·대시보드 토큰을 읽고 `control` 파일(STOP·CLEAR)을 쓸 수 있습니다. 봇 폴더를 사용자 폴더 아래로 옮기거나, cmd 에서 한 번 `icacls B:\TradingBot /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"` 로 본인·SYSTEM·관리자만 남기세요(FAT/exFAT 드라이브는 권한 기능이 없어 옮기는 수밖에 없습니다).
 
 ## 6. 명령어
 
@@ -207,7 +208,7 @@ python -m tradingbot.main dashboard
 
 ## 8. 대시보드
 
-`dashboard` 실행 후 http://127.0.0.1:8787. 외부 CDN 없이 동작하고 파일만 읽습니다(상태·포지션·결정·거래·비용·백테스트·자본 스파크라인). **STOP/해제** 버튼은 `<DATA_DIR>/control/dashboard_token`(macOS·Linux 는 권한 0600. Windows 는 따로 좁히지 않고 `DATA_DIR` 폴더의 권한을 따릅니다 — PC 에 다른 사용자 계정이 있으면 봇 폴더를 사용자 폴더 아래에 두거나 cmd 에서 `icacls B:\TradingBot\data\control /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"` 로 좁히세요)의 토큰을 입력해야 동작하며, `control/STOP`·`control/CLEAR` 파일만 씁니다. Host 헤더를 검사해 외부 사이트가 대시보드를 읽지 못하게 합니다.
+`dashboard` 실행 후 http://127.0.0.1:8787. 외부 CDN 없이 동작하고 파일만 읽습니다(상태·포지션·결정·거래·비용·백테스트·자본 스파크라인). **STOP/해제** 버튼은 `<DATA_DIR>/control/dashboard_token`(macOS·Linux 는 권한 0600. Windows 는 따로 좁히지 않고 봇 폴더의 권한을 물려받습니다 — §5 'Windows 에서 오래 돌릴 때'의 '다른 사용자 계정' 참고)의 토큰을 입력해야 동작하며, `control/STOP`·`control/CLEAR` 파일만 씁니다. Host 헤더를 검사해 외부 사이트가 대시보드를 읽지 못하게 합니다.
 
 ## 9. 비용
 
@@ -243,7 +244,7 @@ python -m tradingbot.main dashboard
 
 ## 12. 알려진 한계 (정직하게)
 
-- 이 저장소의 테스트(3,984개)는 전부 오프라인입니다: 가짜 거래소·mock 백엔드·가짜 텔레그램. **실제 Claude API 호출, 실제 텔레그램 전송, Binance testnet 주문은 개발 환경에서 키·네트워크가 없어 실행해 보지 못했습니다.** §5의 ②③⑤ 순서로 직접 확인하세요.
+- 이 저장소의 테스트(3,985개)는 전부 오프라인입니다: 가짜 거래소·mock 백엔드·가짜 텔레그램. **실제 Claude API 호출, 실제 텔레그램 전송, Binance testnet 주문은 개발 환경에서 키·네트워크가 없어 실행해 보지 못했습니다.** §5의 ②③⑤ 순서로 직접 확인하세요.
 - Windows 동작(파일 공유 위반 재시도, Ctrl+C·Ctrl+Break, 절전 막기, 콘솔 선택 모드, 시계 보정)은 CI 의 windows-latest 와 리눅스에서의 흉내로 확인했습니다. 실제 PC 의 콘솔 클릭·절전 복귀·백신/동기화 프로그램의 파일 잠금은 직접 겪어 보며 로그(`LOG_FILE`)로 확인해 주세요.
 - 백테스트는 LLM 결정을 재현하지 못합니다. 이전 버전의 90일 규칙 기준선은 NOT VALIDATED(순 −1.87%, PF 0.71)였습니다.
 - 청산 군집 등 일부 파생 지표는 **추정값**이며 경고·차단에만 쓰고 진입 근거로 쓰지 않습니다. 공포탐욕 지수는 외부 API(alternative.me)가 실패하면 빠진 채로 계산합니다.

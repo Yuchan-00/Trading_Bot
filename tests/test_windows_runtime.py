@@ -512,6 +512,42 @@ def test_ctrl_c_during_idle_wait_is_acted_on_within_a_second():
     assert elapsed < 3.0, elapsed
 
 
+def test_ctrl_c_during_an_llm_stage_is_handled_within_a_second(tmp_path):
+    """분석가·변론·리스크·총괄 호출(스레드 풀) 중에도 메인 스레드가 1초마다 돌아와 Ctrl+C 처리기가 돈다
+    (예전: 시간 제한 없는 fut.result() — Windows Python ≤3.13 은 총괄 호출이 끝날 때까지 '종료 신호 수신' 이 늦었다)."""
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("신호 핸들러는 메인 스레드에서만 설치된다")
+    from tradingbot.agents import schemas
+    from tradingbot.agents.roles import ROLES
+    from tradingbot.agents.runner import AgentRunner
+    from tradingbot.llm.backend import MockBackend
+    from tradingbot.skills import SkillRegistry
+
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    for role_id in ROLES:
+        (prompts / f"{role_id}.md").write_text(f"# Role: {role_id}\n", encoding="utf-8")
+    (tmp_path / "skills").mkdir()
+    stop = threading.Event()
+
+    def slow_call(payload):
+        stop.wait(6.0)                     # 처리기가 stop 을 세우면 곧 끝난다
+        return schemas.BullOutput.conservative_example()
+
+    runner = AgentRunner(load_settings(env_for(tmp_path)), MockBackend({"bull": slow_call}),
+                         SkillRegistry(tmp_path / "skills"), prompts)
+    prev = M.install_signal_handlers(stop)
+    try:
+        threading.Timer(0.3, lambda: signal.raise_signal(signal.SIGINT)).start()
+        t0 = time.monotonic()
+        results = runner.run_many([("bull", {})])
+        elapsed = time.monotonic() - t0
+    finally:
+        M._restore_signals(prev)
+    assert stop.is_set() and results[0].ok
+    assert elapsed < 3.0, elapsed
+
+
 def test_sigbreak_is_handled_when_available(monkeypatch):
     if threading.current_thread() is not threading.main_thread():
         pytest.skip("신호 핸들러는 메인 스레드에서만 설치된다")

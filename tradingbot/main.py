@@ -508,7 +508,7 @@ def build_components(settings: Settings, *, lock: BotLock | None = None, offline
     if settings.mode == "live" and settings.agent_backend == "mock":
         # 창에 남은 AGENT_BACKEND=mock(set/$env:)이 .env 를 덮으면 가짜 판단으로 실제 주문이 나간다
         raise ConfigError("MODE=live 에서는 AGENT_BACKEND=mock 을 쓸 수 없습니다(가짜 판단으로 실제 주문) — "
-                          "환경변수 AGENT_BACKEND 를 지우거나 anthropic 으로 두세요")
+                          "환경변수 AGENT_BACKEND 를 지우거나 anthropic 으로 두세요(setx 로 넣었다면 README §4)")
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     if offline_fixture:

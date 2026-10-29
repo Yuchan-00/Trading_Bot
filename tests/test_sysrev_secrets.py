@@ -26,7 +26,7 @@ def _settings(data_dir: Path, **over):
 
 
 # ======================================================================= S1 토큰 파일이 쓰이는 순간 다른 사용자에게 읽힘
-@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 비트(0600)는 Windows 에 없음 — Windows 는 사용자 프로필 ACL 로 보호")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 비트(0600)는 Windows 에 없음 — Windows 는 봇 폴더의 ACL 을 물려받음")
 def test_s1_dashboard_token_never_group_or_world_readable_while_on_disk(tmp_path: Path, monkeypatch):
     """``create_app`` 은 토큰을 ``write_text``(umask 기본 0644)로 먼저 쓰고 나서 ``chmod(0o600)`` 한다.
 
@@ -54,7 +54,7 @@ def test_s1_dashboard_token_never_group_or_world_readable_while_on_disk(tmp_path
     assert all(m & 0o077 == 0 for m in observed), f"토큰이 디스크에 있는 동안 권한 {oct(observed[0])}"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 비트(0600)는 Windows 에 없음 — Windows 는 사용자 프로필 ACL 로 보호")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 비트(0600)는 Windows 에 없음 — Windows 는 봇 폴더의 ACL 을 물려받음")
 def test_s1b_dashboard_token_left_readable_when_chmod_fails(tmp_path: Path, monkeypatch):
     """chmod 실패를 조용히 삼켜 토큰이 0644 로 남는다(경고도 없음)."""
     real_chmod = Path.chmod

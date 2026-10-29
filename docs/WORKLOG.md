@@ -80,6 +80,11 @@
 - README 전면 정리: 역할·모델·스킬 표, 하드 리밋, `.env` 전체 변수, 권장 실행 순서(오프라인 체험 → notify-test → paper+Claude → 대시보드 → testnet → live TTY 확인), 명령표, 텔레그램 이벤트 표, 생성 파일, 비용 재추정, 한계(실제 Claude API·텔레그램·testnet 미실행 명시).
 - 남은 사용자 결정: PR 기준 브랜치(`main`) 생성 여부.
 
+### 10-29 03:15 PR 생성 (사용자: "알아서 진행해줘")
+- `main` 브랜치를 이 브랜치의 첫 커밋(`ba8dddf`)으로 생성(빈 커밋으로 만들면 공통 조상이 없어 GitHub PR 불가). 드래프트 PR: https://github.com/Yuchan-00/Trading_Bot/pull/1
+- CI 추가(`.github/workflows/tests.yml`): ubuntu·windows × Python 3.11·3.13. 사용자 PC가 Windows 라서 Windows 러너 포함. 로컬에서 Python 3.11 venv 로도 3,872 통과 확인.
+- PR 활동 구독: CI 실패·리뷰가 오면 수정하고 푸시.
+
 ### 진행 원칙
 - 이전 세션 트랜스크립트 원문은 비밀(키) 포함 가능성 때문에 저장소에 올리지 않음. 비밀 검사(정규식)를 통과한 요약만 커밋.
 - 기존 봇의 하드 리밋(`risk.py`), paper 기본 모드, 실자금 매매 금지 원칙은 유지.

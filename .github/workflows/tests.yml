@@ -2,8 +2,9 @@ name: tests
 
 on:
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

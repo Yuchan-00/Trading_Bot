@@ -664,6 +664,28 @@ def test_deadline_caps_request_timeout(ledger):
     assert 0 < client.messages.calls[0]["timeout"] <= 20.0
 
 
+def test_deadline_cap_is_exact_when_the_clock_has_not_moved(ledger, monkeypatch):
+    """Windows(Python ≤3.12)의 monotonic 은 15.6ms 단위라 같은 값이 연달아 나온다 — 그때도 기한을 넘지 않는다.
+
+    부팅 2분쯤 된 PC 의 108.002 초에서는 (108.002 + 20) − 108.002 = 20.00000000000003(부동소수 반올림).
+    """
+    import time as _time
+
+    class FrozenTime:
+        def __getattr__(self, name):
+            return getattr(_time, name)
+
+        @staticmethod
+        def monotonic() -> float:
+            return 108.002
+
+    monkeypatch.setattr(_AB, "time", FrozenTime())
+    backend, client = make_backend(fake_response(Decision(action="HOLD", confidence=0.1)), ledger)
+    backend.set_deadline(20.0)
+    assert run(backend, timeout_s=100.0).ok
+    assert client.messages.calls[0]["timeout"] == 20.0
+
+
 def test_budget_projection_prices_system_as_cache_write(tmp_path):
     # head(opus) 1h: system 4000자 -> 1000토큰 x1.3 = 1300 x 2(캐시 쓰기) = 2600 input 토큰 상당
     led = CostLedger(tmp_path / "l.jsonl", 10.0, 200.0)

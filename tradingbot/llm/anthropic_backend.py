@@ -112,7 +112,10 @@ class AnthropicBackend:
             )
         self.client = client
         self._deadline_lock = threading.Lock()
-        self._deadline_at: float | None = None  # time.monotonic() 기준 사이클 기한(없으면 None)
+        # 사이클 기한: (설정한 시각의 time.monotonic(), 그때 남은 초). 없으면 None.
+        # 절대 시각(설정 시각 + 남은 초)으로 두면 Windows(Python ≤3.12, monotonic 이 15.6ms 단위)에서 같은 값을 두 번
+        # 읽을 때 (m + r) − m 이 r 보다 커질 수 있다(부동소수 반올림) — 지난 시간을 빼서 r 을 넘지 않게 한다.
+        self._deadline: tuple[float, float] | None = None
         ledger_ttl = getattr(ledger, "cache_ttl", None)
         if ledger_ttl is not None and ledger_ttl != cache_ttl:
             logger.warning("ledger.cache_ttl=%s 와 backend cache_ttl=%s 가 다름: 캐시 쓰기 비용이 어긋날 수 있음", ledger_ttl, cache_ttl)
@@ -125,15 +128,18 @@ class AnthropicBackend:
         """
         with self._deadline_lock:
             if remaining_s is None:
-                self._deadline_at = None
+                self._deadline = None
             else:
                 r = float(remaining_s)
-                self._deadline_at = time.monotonic() + (r if math.isfinite(r) else 0.0)
+                self._deadline = (time.monotonic(), r if math.isfinite(r) else 0.0)
 
     def _deadline_remaining(self) -> float | None:
         with self._deadline_lock:
-            at = self._deadline_at
-        return None if at is None else at - time.monotonic()
+            d = self._deadline
+        if d is None:
+            return None
+        since, remaining = d
+        return remaining - max(0.0, time.monotonic() - since)
 
     # ------------------------------------------------------------------ 재시도
     @staticmethod
@@ -178,7 +184,8 @@ class AnthropicBackend:
         end = started + budget_s
         retry = 0
         while True:
-            attempt_timeout = timeout_s if retry == 0 and budget_s >= timeout_s else max(0.0, end - time.monotonic())
+            attempt_timeout = timeout_s if retry == 0 and budget_s >= timeout_s \
+                else max(0.0, budget_s - max(0.0, time.monotonic() - started))     # 예산을 넘지 않게(기한 참고)
             try:
                 return self.client.messages.create(**kwargs, timeout=attempt_timeout)
             except Exception as e:  # noqa: BLE001 - 판정 후 다시 던진다

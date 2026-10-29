@@ -247,6 +247,27 @@ def read_control_file(path: Path) -> dict | None:
     return {"reason": str(reason)[:500] if reason else None, "ts": int(ts)}
 
 
+def _journal_has_trade(path: Path, trade: ClosedTrade, *, tail_bytes: int = 262_144) -> bool:
+    """``journal.jsonl`` 끝부분에 이 거래(심볼·진입·청산 시각)의 기록이 이미 있는가. 읽지 못하면 False."""
+    try:
+        with open(path, "rb") as fh:
+            end = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, end - tail_bytes))
+            data = fh.read()
+    except OSError:
+        return False
+    for raw in data.splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        t = rec.get("trade") if isinstance(rec, dict) else None
+        if (isinstance(t, dict) and t.get("symbol") == trade.symbol and t.get("opened_ts") == trade.opened_ts
+                and t.get("closed_ts") == trade.closed_ts):
+            return True
+    return False
+
+
 def _dump(obj: Any) -> Any:
     if obj is None:
         return None
@@ -684,7 +705,10 @@ class Cycle:
             orphans |= {k for k in d if k not in held}
         for sym in sorted(orphans):
             trade = next((t for t in reversed(self.state.closed_trades) if t.symbol == sym), None)
-            if trade is not None:
+            if trade is not None and _journal_has_trade(self.journal_path, trade):
+                # 저널 기록은 남았지만 저널 상태 저장 전에 멈춘 경우(중단 처리·디스크 가득) — 같은 거래를 두 번 쓰지 않는다
+                log.info("%s 청산 기록은 이미 저널에 있습니다 — 저널 상태만 정리", sym)
+            elif trade is not None:
                 try:
                     reports.append_journal(self.journal_path, trade,
                                            {"code_summary": J.code_post_trade_summary(trade), "llm": False,
@@ -1220,10 +1244,15 @@ class Cycle:
         for order, kind in ((0, "stop"), (1, "clear")):
             info = read_control_file(paths[kind])
             if info is None:
+                # 파일이 없어졌으면 '처리함' 표시도 지운다 — 같은 ts 를 가진 새 파일(수정 시각이 유지되는 템플릿 복사,
+                # ts 를 고정한 JSON)은 다시 적용된다(다음 저장에 함께 남는다)
                 self._consumed_control.pop(kind, None)
+                self.state.control_applied_ts.pop(kind, None)
                 continue
             if info["ts"] in (self._consumed_control.get(kind), self.state.control_applied_ts.get(kind)):
                 # 이미 처리했지만 삭제에 실패한 파일(재시작 전에 처리한 것 포함) — 다시 적용하지 않고 삭제만 재시도한다
+                log.warning("이미 처리한 %s 파일이 남아 있습니다(삭제 실패) — 다시 적용하지 않고 삭제를 다시 시도합니다",
+                            paths[kind].name)
                 self._unlink_control(paths[kind], kind, info["ts"])
                 continue
             events.append((info["ts"], order, kind, info))

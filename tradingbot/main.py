@@ -1042,10 +1042,16 @@ def _status_text(data_dir: Path, *, mode: str, symbols: str, daily_budget: float
         lines.append(f"청산 거래 누적: {len(state.closed_trades)}건")
     stop = C.read_control_file(data_dir / C.CONTROL_DIRNAME / C.STOP_FILENAME)
     clear = C.read_control_file(data_dir / C.CONTROL_DIRNAME / C.CLEAR_FILENAME)
-    if stop is not None:
+    applied = dict(getattr(state, "control_applied_ts", None) or {}) if state is not None else {}
+    left = [name for kind, name, info in (("stop", C.STOP_FILENAME, stop), ("clear", C.CLEAR_FILENAME, clear))
+            if info is not None and info["ts"] == applied.get(kind)]
+    if stop is not None and C.STOP_FILENAME not in left:
         lines.append(f"STOP 대기: {stop.get('reason') or '-'}")
-    if clear is not None:
+    if clear is not None and C.CLEAR_FILENAME not in left:
         lines.append("CLEAR 대기: 다음 사이클에 킬스위치 해제")
+    for name in left:
+        lines.append(f"{name}: 이미 처리함 — 파일을 지우지 못했습니다(다른 프로그램이 열고 있음). "
+                     f"{data_dir / C.CONTROL_DIRNAME / name} 을 직접 지우세요")
     lock, label, _running = _describe_lock(data_dir, cycle_minutes)
     if lock is None:
         lines.append("실행 중 인스턴스: 없음")

@@ -83,11 +83,13 @@ def _dump_state(state: BotState) -> str:
     """결정적 JSON(sort_keys, ensure_ascii=False). 같은 상태면 같은 바이트.
 
     ``allow_nan=False``: NaN/Infinity 토큰은 RFC 8259 JSON이 아니므로 절대 쓰지 않는다(ValueError).
+    빈 ``control_applied_ts`` 는 쓰지 않는다 — 이 필드를 모르는 이전 버전(``extra="forbid"``)도 state.json 을 읽게
+    (지우지 못한 control 파일이 남아 있을 때만 값이 있다).
     """
-    return (
-        json.dumps(state.model_dump(mode="json"), sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False)
-        + "\n"
-    )
+    data = state.model_dump(mode="json")
+    if not data.get("control_applied_ts"):
+        data.pop("control_applied_ts", None)
+    return json.dumps(data, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
 
 
 def _cash_fee(fill: Fill, price: float) -> float:

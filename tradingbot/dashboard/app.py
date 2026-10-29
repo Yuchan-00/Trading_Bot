@@ -605,11 +605,32 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             log.warning("잘못된 대시보드 토큰 (받은 값 %s)", mask_secret(header_value))
             raise HTTPException(status_code=401, detail="X-Dashboard-Token 불일치")
 
-    def _stop_info() -> dict | None:
+    def _control_ts(path: Path, data: Any) -> int | None:
+        # cycle.read_control_file 과 같은 규칙: JSON 의 ts, 없으면 파일 수정 시각(ms)
+        ts = data.get("ts") if isinstance(data, dict) else None
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
+            return int(ts)
+        try:
+            return int(path.stat().st_mtime * 1000)
+        except OSError:
+            return None
+
+    def _already_applied(path: Path, kind: str, data: Any, state: BotState | None = None) -> bool:
+        """봇이 이미 처리했지만 지우지 못한 control 파일인가(state.control_applied_ts 와 ts 가 같음)."""
+        st = state if state is not None else _load_state()
+        applied = (st.control_applied_ts or {}).get(kind) if st is not None else None
+        return applied is not None and _control_ts(path, data) == applied
+
+    def _stop_info(state: BotState | None = None) -> dict | None:
         if not stop_path.is_file():
             return None
         data = _read_json(stop_path)
+        if _already_applied(stop_path, "stop", data, state):
+            return None
         return data if isinstance(data, dict) else {"reason": None, "ts": None}
+
+    def _clear_pending(state: BotState | None = None) -> bool:
+        return clear_path.is_file() and not _already_applied(clear_path, "clear", _read_json(clear_path), state)
 
     def _list_cycle_files() -> list[tuple[str, int, Path]]:
         """(날짜, n, 경로) 최신순."""
@@ -643,7 +664,7 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
     def health() -> dict:
         now = _now_ms()
         state = _load_state()
-        stop = _stop_info()
+        stop = _stop_info(state)
         last = state.last_cycle_ts if state is not None else None
         return {
             "ok": True,
@@ -656,7 +677,7 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             "last_cycle_age_s": (max(0, (now - last) // 1000) if last is not None else None),
             "cycle_minutes": settings.cycle_minutes,
             "stop_pending": stop is not None,
-            "clear_pending": clear_path.is_file(),
+            "clear_pending": _clear_pending(state),
             "kill_switch": state.kill_switch if state is not None else None,
             "token_configured": _read_token() is not None,
         }
@@ -672,7 +693,7 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             "exists": True,
             "state": dumped,
             "summary": summarize_state(state, equity=equity),
-            "stop_pending": _stop_info() is not None,
+            "stop_pending": _stop_info(state) is not None,
         }
 
     @app.get("/api/positions")

@@ -11,6 +11,7 @@ import locale
 import logging
 import os
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -228,11 +229,20 @@ def _feeds(raw: str) -> tuple[str, ...]:
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
 _PERCENT_VAR = re.compile(r"%[A-Za-z_][A-Za-z0-9_()]*%")
 _WARNED_OVERRIDES: set[tuple[str, ...]] = set()
-# 해석 실패 줄에서 보여줄 이름: ``NAME=`` 꼴의 대문자 설정 이름만(최대 40자). ``KEY: 값``·``KEY 값``·비밀값으로
-# 시작하는 줄은 이름 없이 줄 번호만 — 오류 메시지에 비밀값 일부가 나오지 않게.
-_DOTENV_NAME = re.compile(r"((?i:export|set)\s+)?([A-Z_][A-Z0-9_]{0,39})\s*=")
+# 해석 실패 줄의 안내: ``NAME=`` 꼴이면(대소문자 무관) 따옴표 문제, ``set NAME=`` 이면 cmd 문법. 메시지에 보여 주는
+# 이름은 대문자 설정 이름(최대 40자)뿐 — ``KEY: 값``·``KEY 값``·비밀값으로 시작하는 줄은 줄 번호만(비밀값이 안 나오게).
+_DOTENV_ASSIGN = re.compile(r"((?i:export|set)\s+)?([A-Za-z_][A-Za-z0-9_]{0,63})\s*=")
+_SHOWN_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,39}")
+# 복사·붙여넣기로 섞이는 보이지 않는 글자(유니코드 서식 문자 Cf — U+200B·U+FEFF·U+2060·U+200E 등 — 와 한글 채움 문자)
+_INVISIBLE_EXTRA = frozenset("\u3164\uffa0")
+# UTF-16 으로 푼 글에서 이 블록(구르무키·구자라트·말라얄람·싱할라)의 글자는 덧붙인 8비트 줄의 CR·LF 바이트가 만든 것
+_MIXED_UTF16 = re.compile(r"[\u0a00-\u0aff\u0d00-\u0dff]")
 _NEWLINES = re.compile(r"\r\n|\n|\r")
 _UTF8_FIX = "메모장에서 '다른 이름으로 저장' → 인코딩 'UTF-8' 로 다시 저장하세요"
+
+
+def _visible(text: str) -> str:
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf" and ch not in _INVISIBLE_EXTRA)
 
 
 def _dotenv_present(path: Path) -> bool:
@@ -269,6 +279,15 @@ def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str
             return data.decode("utf-16", errors="replace")
         msg = f"{path}: UTF-16 으로 저장돼 있습니다(PowerShell '>' 로 만든 파일) — {fix}"
         warnings.append(msg)
+        mixed = _MIXED_UTF16.search(text)
+        if mixed is not None:
+            # 짝수 길이로 풀린 덧붙인 줄이 앞 줄 값에 붙었다(그 설정은 읽히지 않는다) — 조용히 기본값으로 돌지 않게
+            line = len(_NEWLINES.findall(text, 0, mixed.start())) + 1
+            msg = (f"{path} {line}번째 줄에 다른 인코딩으로 덧붙인 글자가 섞였습니다(UTF-16 파일에 cmd·Git Bash 로 줄을 "
+                   f"덧붙이면 그 설정이 읽히지 않습니다) — {fix}")
+            if not lenient:
+                raise ConfigError(msg)
+            warnings.append(msg)
         return text
     if b"\x00" in data:
         line = data[:data.index(b"\x00")].count(b"\n") + 1
@@ -301,7 +320,8 @@ def _dotenv_line_problem(binding: object, s: str, before: str, path: Path) -> st
     """
     error = bool(getattr(binding, "error", False))
     key = getattr(binding, "key", None)
-    garbled = (not error and isinstance(key, str) and not key.isascii()
+    # 보이지 않는 글자만 있는 줄(빈 줄·주석 앞의 U+200B 등)은 python-dotenv 처럼 무시한다
+    garbled = (not error and isinstance(key, str) and not _visible(key).isascii()
                and getattr(binding, "value", "") is None)
     if not (error or garbled):
         return None
@@ -310,14 +330,15 @@ def _dotenv_line_problem(binding: object, s: str, before: str, path: Path) -> st
     if garbled:
         return (f"{path} {line}번째 줄에 '=' 없는 글자만 있습니다 — 메모라면 줄 앞에 # 를 붙이세요. 아니면 인코딩이 "
                 f"섞인 것입니다(UTF-16 파일에 cmd·Git Bash 로 줄을 덧붙이면 그 줄의 설정이 사라집니다) — {_UTF8_FIX}")
-    m = _DOTENV_NAME.match(_NEWLINES.split(body, 1)[0])
-    if m and m.group(1):
-        return (f"{path} {line}번째 줄({m.group(2)})을 해석하지 못했습니다 — cmd 의 set 은 .env 에 쓰지 않습니다. "
-                f"{m.group(2)}=값 처럼 쓰세요")
+    m = _DOTENV_ASSIGN.match(_visible(_NEWLINES.split(body, 1)[0]))
+    shown = m.group(2) if m and _SHOWN_NAME.fullmatch(m.group(2)) else None
+    if m and m.group(1) and m.group(1).split()[0].lower() == "set":
+        return (f"{path} {line}번째 줄{f'({shown})' if shown else ''}을 해석하지 못했습니다 — cmd 의 set 은 .env 에 "
+                f"쓰지 않습니다. {shown or 'NAME'}=값 처럼 쓰세요")
     if m:
-        return (f"{path} {line}번째 줄({m.group(2)}=…)을 해석하지 못했습니다 — 닫히지 않은 따옴표이거나 따옴표 안의 "
-                "값이 역슬래시(\\)로 끝납니다(닫는 따옴표 뒤에 다른 글자가 있어도 그렇습니다). 경로는 따옴표 없이 "
-                "쓰거나 B:/TradingBot/data 처럼 / 를 쓰세요(그 줄 뒤의 설정이 함께 무시될 수 있습니다)")
+        return (f"{path} {line}번째 줄{f'({shown}=…)' if shown else ''}을 해석하지 못했습니다 — 닫히지 않은 따옴표이거나 "
+                "따옴표 안의 값이 역슬래시(\\)로 끝납니다(닫는 따옴표 뒤에 다른 글자가 있어도 그렇습니다). 경로는 "
+                "따옴표 없이 쓰거나 B:/TradingBot/data 처럼 / 를 쓰세요(그 줄 뒤의 설정이 함께 무시될 수 있습니다)")
     return (f"{path} {line}번째 줄을 해석하지 못했습니다 — KEY=value 형식이 아닙니다(':' 나 공백 대신 '=' 를 "
             "쓰세요)")
 
@@ -355,7 +376,21 @@ def _dotenv_items(path: Path, *, lenient: bool, warnings: list[str]) -> dict[str
         values = dotenv_values(stream=io.StringIO(text))
     finally:
         dotenv_log.disabled = prev_disabled
-    return {k: v for k, v in values.items() if v is not None}
+    out: dict[str, str] = {}
+    cleaned: list[str] = []
+    for k, v in values.items():
+        if v is None:
+            continue
+        name = _visible(k).strip()
+        if name != k:
+            # 이름에 섞인 보이지 않는 글자(복사·붙여넣기) 때문에 설정이 조용히 무시되지 않게 지우고 읽는다
+            cleaned.append(name if _SHOWN_NAME.fullmatch(name) else "?")
+            if not name:
+                continue
+        out[name] = v
+    if cleaned:
+        warnings.append(f"{path}: 이름에 보이지 않는 글자(복사·붙여넣기)가 섞여 지우고 읽었습니다: {', '.join(cleaned)}")
+    return out
 
 
 def read_env(dotenv_path: Path | None = None, *, lenient: bool = False,

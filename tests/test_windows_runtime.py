@@ -296,8 +296,12 @@ def test_log_file_keeps_writing_while_console_is_blocked(tmp_path):
         for i in range(5):
             lg.warning("손절 매도 %d", i)
         assert _eventually(lambda: "손절 매도 4" in p.read_text(encoding="utf-8-sig"))
+        feed = h._tb_pump[1]
         M.detach_log_file(h)
-    assert not any(isinstance(x, logging.handlers.QueueHandler) for x in logging.getLogger().handlers)
+        root_handlers = logging.getLogger().handlers
+        assert feed not in root_handlers and h not in root_handlers                # 파일 큐 핸들러를 뗐다
+        assert sum(isinstance(x, logging.handlers.QueueHandler) for x in root_handlers) == 1   # 콘솔 것만 남음
+        assert h.stream is None                                                   # 파일을 닫았다
 
 
 def test_detach_log_file_writes_queued_records_before_closing(tmp_path):
@@ -899,6 +903,53 @@ def test_undeletable_clear_is_not_reapplied_after_restart(tmp_path, monkeypatch)
     assert restarted.state.kill_switch is True and (ctl / "CLEAR").is_file()
     assert not restarted.sent_with("킬스위치 해제")
 
+    # status·대시보드는 그 CLEAR 를 '대기'가 아니라 '이미 처리함(삭제 실패)'으로 보여 준다
+    out, err = io.StringIO(), io.StringIO()
+    assert M.main(["status"], env=env_for(tmp_path, DATA_DIR=str(rig.data)), out=out, err=err) == M.EXIT_OK
+    assert "CLEAR 대기" not in out.getvalue() and "CLEAR: 이미 처리함" in out.getvalue()
+    from fastapi.testclient import TestClient
+
+    from tradingbot.dashboard import create_app
+
+    health = TestClient(create_app(restarted.settings, rig.data)).get("/api/health").json()
+    assert health["clear_pending"] is False and health["kill_switch"] is True
+
+
+def test_control_file_reusing_an_applied_ts_is_applied_again_once_the_old_one_is_gone(tmp_path):
+    """수정 시각이 유지되는 템플릿 복사·ts 를 고정한 JSON: 앞 파일이 지워진 뒤 같은 ts 의 새 STOP 도 적용된다."""
+    from test_cycle import Rig
+
+    rig = Rig(tmp_path)
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    stop = json.dumps({"reason": "주말 정지", "ts": 5})
+    (ctl / "STOP").write_text(stop, encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and not (ctl / "STOP").exists()
+    rig.cycle.run_once()                                   # 파일이 없어진 사이클 — '처리함' 표시도 지운다
+    assert "stop" not in rig.state.control_applied_ts
+    (ctl / "CLEAR").write_text(json.dumps({"reason": "재개", "ts": 6}), encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False
+    rig.cycle.run_once()
+    (ctl / "STOP").write_text(stop, encoding="utf-8")       # 같은 템플릿을 다시
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and rig.state.kill_reason == "manual_stop: 주말 정지"
+
+
+def test_state_json_leaves_out_empty_control_applied_ts(tmp_path):
+    """이 필드를 모르는 이전 버전(extra=forbid)도 state.json 을 읽게, 비었으면 쓰지 않는다."""
+    from tradingbot import portfolio as PF
+
+    pf = PF.Portfolio.load(load_settings(env_for(tmp_path)), tmp_path / "state.json")
+    pf.save()
+    assert "control_applied_ts" not in json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    pf.state.control_applied_ts["clear"] = 123
+    pf.save()
+    assert json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["control_applied_ts"] == {"clear": 123}
+    assert PF.Portfolio.load(load_settings(env_for(tmp_path)), tmp_path / "state.json").state.control_applied_ts == {
+        "clear": 123}
+
 
 # ======================================================================= .env·설정
 @pytest.fixture
@@ -1013,6 +1064,38 @@ def test_dotenv_utf16_copy_of_env_example_still_loads(clean_env):
     warnings: list[str] = []
     env = read_env(lenient=True, warnings=warnings)
     assert len(warnings) == 1 and "UTF-16" in warnings[0] and env["MODE"] == "paper"
+
+
+def test_dotenv_invisible_characters_from_copy_paste(clean_env):
+    """복사·붙여넣기로 섞인 보이지 않는 글자(U+200B·U+FEFF·U+3164 등): 빈 줄·주석이면 무시, 이름에 붙었으면 지우고 읽는다."""
+    (clean_env / ".env").write_bytes("AGENT_BACKEND=mock\n\u200b# 텔레그램 설정\n\ufeff\n\u3164\n"
+                                     "\u200bDATA_DIR=botdata\n".encode("utf-8"))
+    warnings: list[str] = []
+    env = read_env(lenient=False, warnings=warnings)
+    assert env["DATA_DIR"] == "botdata" and "\u200bDATA_DIR" not in env
+    assert len(warnings) == 1 and "보이지 않는 글자" in warnings[0] and "DATA_DIR" in warnings[0]
+    assert load_settings().data_dir == Path("botdata")
+
+
+def test_dotenv_utf16_with_an_8bit_tail_glued_to_the_last_line(clean_env):
+    """UTF-16 의 마지막 줄에 줄바꿈이 없으면 덧붙인 8비트 줄이 그 값에 붙어 사라진다 — 그 줄 번호로 알린다."""
+    head = "\ufeffAGENT_BACKEND=mock\r\nTELEGRAM_CHAT_ID=12345".encode("utf-16-le")
+    (clean_env / ".env").write_bytes(head + b"DATA_DIR=D:/bots\r\n")
+    with pytest.raises(ConfigError, match="2번째 줄에 다른 인코딩"):
+        load_settings()
+    warnings: list[str] = []
+    read_env(lenient=True, warnings=warnings)
+    assert any("다른 인코딩" in w for w in warnings)
+
+
+def test_dotenv_quote_errors_on_export_and_lowercase_lines_get_quote_advice(clean_env):
+    (clean_env / ".env").write_bytes(b'export DATA_DIR="B:\\TradingBot\\data\\"\nAGENT_BACKEND=mock\n')
+    with pytest.raises(ConfigError, match=r"1번째 줄\(DATA_DIR=…\).*따옴표") as ei:
+        load_settings()
+    assert "set" not in str(ei.value)
+    (clean_env / ".env").write_bytes(b'data_dir="B:\\data\\"\nAGENT_BACKEND=mock\n')
+    with pytest.raises(ConfigError, match="1번째 줄을 해석하지 못했습니다 — 닫히지 않은 따옴표"):
+        load_settings()
 
 
 def test_env_override_warning_ignores_empty_placeholders(clean_env, monkeypatch, caplog):
@@ -1499,6 +1582,44 @@ def test_earlier_exit_is_journaled_when_a_later_exit_save_fails(tmp_path, monkey
         rig.cycle.run_once()
     lines = rig.journal_lines()
     assert len(sold) == 2 and [ln.get("symbol") for ln in lines] == [sold[0]], lines
+
+
+def test_restart_does_not_duplicate_a_trade_journaled_before_the_journal_state_save_failed(tmp_path, monkeypatch):
+    """중단 처리가 저널 줄은 썼지만 저널 상태 저장은 실패(디스크 가득)한 채 멈춰도, 재시작 대사가 같은 거래를 또 쓰지 않는다."""
+    from test_cycle import Rig
+
+    from tradingbot import journal as J
+
+    rig = Rig(tmp_path)
+    for sym in ("ETH/USDT", "SOL/USDT"):
+        rig.hold_position(sym, sl=99.0, tp=110.0)
+        rig.cycle.journal_state.entry_verdicts[sym] = J.normalize_entry_verdicts(None)   # 재시작 대사 대상
+        rig.market.prices[sym] = 95.0
+    J.save_journal_state(rig.cycle.journal_state, rig.data)         # 진입 사이클이 저장해 둔 저널 상태
+    rig.scanner.candidates = []
+    real_sell, real_save = rig.broker.market_sell, rig.portfolio.save
+    sold: list[str] = []
+
+    def sell(symbol, base_amount):
+        sold.append(symbol)
+        return real_sell(symbol, base_amount)
+
+    def save(*a, **k):
+        if len(sold) >= 2:
+            raise OSError(28, "No space left on device")
+        return real_save(*a, **k)
+
+    monkeypatch.setattr(rig.broker, "market_sell", sell)
+    monkeypatch.setattr(rig.portfolio, "save", save)
+    monkeypatch.setattr(J, "save_journal_state", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "disk full")))
+    with pytest.raises(C.StateSaveError):
+        rig.cycle.run_once()
+    monkeypatch.undo()
+    assert [ln["symbol"] for ln in rig.journal_lines()] == [sold[0]]
+    restarted = Rig(tmp_path)
+    restarted.scanner.candidates = []
+    restarted.cycle.run_once()
+    assert [ln["symbol"] for ln in restarted.journal_lines()].count(sold[0]) == 1
 
 
 def test_news_is_fetched_after_code_exits(tmp_path):

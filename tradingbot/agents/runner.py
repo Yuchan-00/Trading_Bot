@@ -98,9 +98,10 @@ class AgentRunner:
                 f"역할 {role_id!r} 의 프롬프트 파일이 없습니다: {path} "
                 f"(prompts 디렉터리에 {Path(spec.prompt_file).name} 를 만들어 주세요)"
             )
-        # newline="" 로 읽어 줄바꿈을 원문 그대로 유지(바이트 고정)
+        # 줄바꿈은 LF 로 정규화한다 — Windows 체크아웃(git autocrlf)의 CRLF 가 섞여도 시스템 프롬프트 바이트가
+        # OS 와 무관하게 같다(캐시 키 고정). 스킬 본문은 read_text 의 universal newlines 로 이미 LF.
         with path.open("r", encoding="utf-8", newline="") as fh:
-            prompt = fh.read()
+            prompt = fh.read().replace("\r\n", "\n").replace("\r", "\n")
         self._check_skill_assignment(spec)
         rendered = self.skills.render(role_id, max_tokens=SKILLS_MAX_TOKENS)
         return prompt + SKILLS_HEADER + rendered

@@ -128,12 +128,16 @@ def test_system_prompt_no_skills_for_role(runner):
     assert sp.endswith(SKILLS_HEADER)
 
 
-def test_system_prompt_preserves_crlf(settings, backend, registry, tmp_path):
-    d = tmp_path / "p2"
-    d.mkdir()
-    (d / "technical.md").write_bytes(b"line1\r\nline2\r\n")
-    r = AgentRunner(settings, backend, registry, d)
-    assert r.system_prompt("technical").startswith("line1\r\nline2\r\n")
+def test_system_prompt_crlf_and_lf_files_render_identically(settings, backend, registry, tmp_path):
+    """같은 프롬프트가 CRLF(Windows 체크아웃)든 LF 든 시스템 프롬프트 바이트가 같다(프롬프트 캐시 키 고정)."""
+    d1, d2 = tmp_path / "crlf", tmp_path / "lf"
+    d1.mkdir()
+    d2.mkdir()
+    (d1 / "technical.md").write_bytes(b"line1\r\nline2\r\n")
+    (d2 / "technical.md").write_bytes(b"line1\nline2\n")
+    a = AgentRunner(settings, backend, registry, d1).system_prompt("technical")
+    b = AgentRunner(settings, backend, registry, d2).system_prompt("technical")
+    assert a == b and a.startswith("line1\nline2\n")
 
 
 def test_missing_prompt_file_raises_korean(settings, backend, registry, tmp_path):
@@ -509,3 +513,12 @@ def test_repo_all_assigned_skills_rendered(settings, backend, role_id):
         assert f"## Skill: {name}\n" in sp, f"{role_id}: 스킬 {name} 누락"
     assert sp == r.system_prompt(role_id)
     assert not re.search(r"\b20\d{2}-\d{2}-\d{2}\b", sp), "시스템 프롬프트에 날짜 금지(캐시)"
+
+
+def test_system_prompt_normalizes_crlf(settings, backend, registry, prompts_dir):
+    """Windows 체크아웃(git autocrlf)처럼 CRLF 로 저장된 프롬프트도 LF 로 정규화한다(OS 와 무관한 바이트)."""
+    (prompts_dir / "technical.md").write_bytes(b"# Role: technical\r\nYou are the technical agent.\r\nLine3\r")
+    sp = AgentRunner(settings, backend, registry, prompts_dir).system_prompt("technical")
+    assert "\r" not in sp
+    assert sp.startswith("# Role: technical\nYou are the technical agent.\nLine3\n")
+

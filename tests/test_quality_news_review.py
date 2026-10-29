@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import json
 from pathlib import Path
 
@@ -67,7 +69,8 @@ def test_fetch_news_never_fetches_url_embedded_in_feed_body(no_network):
 
 def test_parse_feed_never_reads_local_file_named_in_feed_body(tmp_path: Path, no_network):
     """본문이 로컬 파일 경로이면 feedparser.parse(str)는 그 파일을 열어 읽는다(디스크 읽기 → LLM 입력)."""
-    secret_file = tmp_path / "a<rss>.xml"
+    # '<' '>' 는 Windows 파일 이름에 쓸 수 없다 → 그 플랫폼에서는 평범한 이름으로 같은 경로(로컬 파일 읽기)를 검사
+    secret_file = tmp_path / ("a<rss>.xml" if os.name != "nt" else "a-rss.xml")
     secret_file.write_text(
         "<rss><channel><item><title>Bitcoin exploit from local disk</title></item></channel></rss>",
         encoding="utf-8",

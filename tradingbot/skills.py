@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -231,6 +232,27 @@ def load_skill(path: Path) -> Skill:
 
 
 # ---------------------------------------------------------------- registry
+def _exact_skill_files(root: Path) -> list[Path]:
+    """``root/<dir>/SKILL.md`` 를 **대소문자까지 정확히** 찾는다.
+
+    Windows·macOS 기본 파일시스템은 대소문자를 구분하지 않아 ``glob("*/SKILL.md")`` 가 ``skill.md`` 도
+    잡는다(그리고 경로를 패턴 철자로 돌려줄 수 있다). 디렉터리 항목의 실제 이름으로 비교한다.
+    """
+    out: list[Path] = []
+    try:
+        dirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                if any(e.name == SKILL_FILENAME and e.is_file() for e in it):
+                    out.append(d / SKILL_FILENAME)
+        except OSError:
+            continue
+    return out
+
+
 class SkillRegistry:
     """``root/<name>/SKILL.md`` 전부를 메모리에 올린다. 같은 입력이면 같은 순서·같은 결과."""
 
@@ -247,7 +269,7 @@ class SkillRegistry:
         if not self.root.is_dir():
             log.warning("스킬 디렉터리가 없음: %s (스킬 없이 진행)", self.root)
             return
-        files = sorted(p for p in self.root.glob(f"*/{SKILL_FILENAME}") if p.is_file())
+        files = sorted(_exact_skill_files(self.root))
         for path in files:
             try:
                 skill = load_skill(path)

@@ -60,7 +60,7 @@ class TestDumps:
         t = make_trade()
         out = json.loads(dumps({"t": t, "p": Path("a/b"), "d": datetime(2026, 1, 2, tzinfo=timezone.utc)}))
         assert out["t"]["symbol"] == "BTC/USDT"
-        assert out["p"] == "a/b"
+        assert out["p"] == str(Path("a/b"))   # Windows 는 a\\b
         assert out["d"] == "2026-01-02T00:00:00+00:00"
 
     def test_set_sorted(self):

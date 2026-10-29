@@ -130,7 +130,7 @@ class TestSaveLoad:
         paper.save()
         paper.state.cycle = 42
         paper.save()
-        assert json.loads(paper.path.read_text())["cycle"] == 42
+        assert json.loads(paper.path.read_text(encoding="utf-8"))["cycle"] == 42
 
     def test_save_retries_then_succeeds(self, paper: Portfolio, monkeypatch, caplog):
         real_replace = os.replace
@@ -150,7 +150,7 @@ class TestSaveLoad:
             paper.save()
         assert calls["n"] == 3
         assert sleeps == [0.1, 0.1]
-        assert json.loads(paper.path.read_text())["cycle"] == 5
+        assert json.loads(paper.path.read_text(encoding="utf-8"))["cycle"] == 5
         assert not any(p.name.startswith("state.json.tmp") for p in paper.path.parent.iterdir())
         assert any("재시도" in r.getMessage() for r in caplog.records)
 
@@ -208,7 +208,7 @@ class TestCorruptPolicy:
         monkeypatch.setattr(pf_mod, "_now_ms", lambda: 1_700_000_000_000)
         path = tmp_path / "state.json"
         for _ in range(2):
-            path.write_text("garbage")
+            path.write_text("garbage", encoding="utf-8")
             Portfolio.load(make_settings("paper"), path)
         assert len(list(tmp_path.glob("state.json.corrupt.*"))) == 2
 
@@ -216,15 +216,15 @@ class TestCorruptPolicy:
     @pytest.mark.parametrize("content", ["{not json", "", '{"mode": "testnet", "bogus": 1}'])
     def test_testnet_live_raise(self, tmp_path: Path, mode: str, content: str):
         path = tmp_path / "state.json"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         with pytest.raises(CorruptStateError):
             Portfolio.load(make_settings(mode), path)
-        assert path.exists() and path.read_text() == content  # 건드리지 않는다
+        assert path.exists() and path.read_text(encoding="utf-8") == content  # 건드리지 않는다
         assert list(tmp_path.glob("state.json.corrupt.*")) == []
 
     def test_corrupt_error_chains_cause_and_names_file(self, tmp_path: Path):
         path = tmp_path / "state.json"
-        path.write_text("{{{")
+        path.write_text("{{{", encoding="utf-8")
         with pytest.raises(CorruptStateError) as ei:
             Portfolio.load(make_settings("live"), path)
         assert isinstance(ei.value.__cause__, json.JSONDecodeError)
@@ -246,7 +246,7 @@ class TestCorruptPolicy:
         assert pf.state.mode == "paper" and pf.state.cycle == 0
         assert pf.state.paper_quote_balance == 10_000.0
         backups = list(tmp_path.glob("state.json.mismatch.*"))
-        assert len(backups) == 1 and json.loads(backups[0].read_text())["cycle"] == 99
+        assert len(backups) == 1 and json.loads(backups[0].read_text(encoding="utf-8"))["cycle"] == 99
         assert list(tmp_path.glob("state.json.corrupt.*")) == []
 
     @pytest.mark.parametrize("mode", ["testnet", "live"])
@@ -258,7 +258,7 @@ class TestCorruptPolicy:
 
     def test_read_oserror_propagates(self, tmp_path: Path, monkeypatch):
         path = tmp_path / "state.json"
-        path.write_text("{}")
+        path.write_text("{}", encoding="utf-8")
 
         def boom(self, *a, **kw):
             raise PermissionError("no")

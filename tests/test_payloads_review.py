@@ -100,8 +100,8 @@ def test_build_flow_symbols_set_is_deterministic_across_hash_seeds():
             "print(json.dumps(P.build_flow({},s)['symbols']))")
     outs = set()
     for seed in ("1", "2", "3", "4", "5", "6"):
-        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(ROOT))
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(ROOT), PYTHONIOENCODING="utf-8")
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8", env=env,
                            cwd=str(ROOT), timeout=60)
         assert r.returncode == 0, r.stderr
         outs.add(r.stdout.strip())

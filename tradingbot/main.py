@@ -94,8 +94,11 @@ def lock_stale_after_s(cycle_minutes: int | float | None) -> float:
 
 
 def _pid_alive(pid: int) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
+    """PID 가 살아 있는 프로세스인지. 판단할 수 없으면 True(잠금을 빼앗지 않는 쪽)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -105,6 +108,43 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Windows: ``OpenProcess`` + ``GetExitCodeProcess`` 로 확인한다.
+
+    Windows 에서 ``os.kill(pid, 0)`` 은 생존 확인이 아니다 — 시그널 0 은 ``CTRL_C_EVENT`` 라서
+    ``GenerateConsoleCtrlEvent`` 로 그 프로세스 그룹(같은 콘솔의 봇 자신 포함)에 Ctrl+C 를 보낸다.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001 - ctypes 없는 특수 빌드: 살아 있다고 보고 잠금을 지킨다
+        return True
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87      # 그런 PID 없음
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # 87 = 그런 PID 없음. 5(ACCESS_DENIED, 다른 사용자의 프로세스)·기타 오류는 판단 불가 → 살아 있다고 본다.
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - API 호출 실패: 잠금을 지키는 쪽
+        return True
 
 
 class BotLock:
@@ -1014,6 +1054,29 @@ def _cmd_backtest(settings: Settings, args: argparse.Namespace, out: TextIO, err
     return EXIT_OK
 
 
-if __name__ == "__main__":  # pragma: no cover
+def prepare_stdio(streams: Sequence[object] | None = None) -> None:
+    """파일·파이프로 리다이렉트된 표준출력/표준에러는 UTF-8 로 쓴다.
+
+    Windows 는 리다이렉트된 스트림에 로캘 인코딩(한국어 Windows 는 cp949)을 쓰는데, cp949 는 알림 로그의
+    이모지(🟢 등)를 인코딩하지 못해 로그 오류가 난다. 콘솔(TTY)은 그대로 둔다(Windows 콘솔은 유니코드 API 사용).
+    """
+    for stream in (streams if streams is not None else (sys.stdout, sys.stderr)):
+        try:
+            if stream is None or not hasattr(stream, "reconfigure"):
+                continue
+            isatty = getattr(stream, "isatty", None)
+            if callable(isatty) and isatty():
+                continue
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 스트림 준비 실패는 실행을 막지 않는다
+            continue
+
+
+def cli() -> int:  # pragma: no cover - 콘솔 진입점(`tradingbot` 명령, `python -m tradingbot.main`)
+    prepare_stdio()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    sys.exit(main())
+    return main()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(cli())

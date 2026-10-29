@@ -51,6 +51,7 @@ COST_LEDGER_FILENAME = "cost_ledger.jsonl"
 BACKTEST_DIRNAME = "backtest_results"
 CONTROL_DIRNAME = "control"
 TOKEN_FILENAME = "dashboard_token"
+POSIX_PERMISSIONS = os.name != "nt"   # Windows 는 POSIX 권한 비트가 의미 없음(ACL 사용)
 STOP_FILENAME = "STOP"
 CLEAR_FILENAME = "CLEAR"
 
@@ -396,7 +397,13 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
         return None
 
     def _ensure_token_private() -> None:
-        """기존 토큰 파일이 group/other 접근 가능하면 0600 으로 좁힌다. 실패하면 경고를 남긴다."""
+        """기존 토큰 파일이 group/other 접근 가능하면 0600 으로 좁힌다. 실패하면 경고를 남긴다.
+
+        POSIX 권한 비트가 없는 Windows 에서는 아무것도 하지 않는다(``chmod`` 는 읽기 전용 비트만 바꾸고
+        ``st_mode`` 는 항상 0o666 이라 매번 헛된 경고만 남는다). Windows 는 사용자 프로필 ACL 로 보호된다.
+        """
+        if not POSIX_PERMISSIONS:
+            return
         try:
             mode = stat.S_IMODE(token_path.stat().st_mode)
         except OSError:

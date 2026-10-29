@@ -26,6 +26,7 @@ def _settings(data_dir: Path, **over):
 
 
 # ======================================================================= S1 토큰 파일이 쓰이는 순간 다른 사용자에게 읽힘
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 비트(0600)는 Windows 에 없음 — Windows 는 사용자 프로필 ACL 로 보호")
 def test_s1_dashboard_token_never_group_or_world_readable_while_on_disk(tmp_path: Path, monkeypatch):
     """``create_app`` 은 토큰을 ``write_text``(umask 기본 0644)로 먼저 쓰고 나서 ``chmod(0o600)`` 한다.
 
@@ -53,6 +54,7 @@ def test_s1_dashboard_token_never_group_or_world_readable_while_on_disk(tmp_path
     assert all(m & 0o077 == 0 for m in observed), f"토큰이 디스크에 있는 동안 권한 {oct(observed[0])}"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 비트(0600)는 Windows 에 없음 — Windows 는 사용자 프로필 ACL 로 보호")
 def test_s1b_dashboard_token_left_readable_when_chmod_fails(tmp_path: Path, monkeypatch):
     """chmod 실패를 조용히 삼켜 토큰이 0644 로 남는다(경고도 없음)."""
     real_chmod = Path.chmod
@@ -86,3 +88,27 @@ def test_s2_dashboard_rejects_foreign_host_header(tmp_path: Path, path: str):
     c = TestClient(create_app(_settings(data_dir), data_dir))
     r = c.get(path, headers={"Host": "attacker.example:8787"})
     assert r.status_code in (400, 403, 421), f"외부 Host 로 {path} 응답 {r.status_code}"
+
+
+def test_s1c_token_permission_narrowing_is_posix_only(tmp_path: Path, monkeypatch, caplog):
+    """POSIX 권한 비트가 없는 플랫폼(Windows)에서는 chmod 하지 않고 헛된 경고도 남기지 않는다."""
+    import tradingbot.dashboard.app as app_mod
+
+    monkeypatch.setattr(app_mod, "POSIX_PERMISSIONS", False)
+    calls: list[str] = []
+    real_chmod = Path.chmod
+
+    def spy_chmod(self: Path, mode, *a, **kw):
+        calls.append(self.name)
+        return real_chmod(self, mode, *a, **kw)
+
+    monkeypatch.setattr(Path, "chmod", spy_chmod)
+    data_dir = tmp_path / "d"
+    (data_dir / "control").mkdir(parents=True)
+    token = data_dir / "control" / "dashboard_token"
+    token.write_text("existing-token-value-123456", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        create_app(_settings(data_dir), data_dir)
+    assert "dashboard_token" not in calls
+    assert not [r for r in caplog.records if "권한" in r.getMessage()]
+    assert token.read_text(encoding="utf-8") == "existing-token-value-123456"

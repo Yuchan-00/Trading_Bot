@@ -668,7 +668,8 @@ def test_summarize_costs_pure(tmp_path: Path):
 
 def test_sorted_json_response_nan_and_keys():
     body = SortedJSONResponse({"b": float("nan"), "a": [float("inf"), 1.5], "c": {"z": Path("/x"), "y": "한"}}).body.decode()
-    assert body == '{"a":[null,1.5],"b":null,"c":{"y":"한","z":"/x"}}'
+    # Path 는 str() 로 직렬화된다 — Windows 에서는 '\\x' 이므로 기대값도 OS 기준으로 만든다.
+    assert body == '{"a":[null,1.5],"b":null,"c":{"y":"한","z":' + json.dumps(str(Path("/x"))) + '}}'
 
 
 def test_settings_secrets_not_exposed(data_dir: Path):

@@ -40,7 +40,7 @@ def test_success_returns_value_and_writes_cache(tmp_path):
     f = FearGreedFetcher(path, http_get=http, clock=clock, timeout_s=3.5)
     assert f() == 34
     assert http.calls == [("https://api.alternative.me/fng/?limit=1", 3.5)]
-    doc = json.loads(path.read_text())
+    doc = json.loads(path.read_text(encoding="utf-8"))
     assert doc == {"value": 34, "fetched_ts": clock.t}
 
 
@@ -71,7 +71,7 @@ def test_file_cache_hit_across_instances(tmp_path):
 def test_stale_cache_fallback_on_network_error(tmp_path):
     path = tmp_path / "fng.json"
     clock = Clock()
-    path.write_text(json.dumps({"value": 77, "fetched_ts": clock.t - 5 * 3600}))
+    path.write_text(json.dumps({"value": 77, "fetched_ts": clock.t - 5 * 3600}), encoding="utf-8")
     http = FakeHttp([OSError("boom")])
     f = FearGreedFetcher(path, ttl_s=3600, http_get=http, clock=clock)
     assert f() == 77
@@ -81,7 +81,7 @@ def test_stale_cache_fallback_on_network_error(tmp_path):
 def test_stale_cache_older_than_24h_is_not_used(tmp_path):
     path = tmp_path / "fng.json"
     clock = Clock()
-    path.write_text(json.dumps({"value": 77, "fetched_ts": clock.t - 25 * 3600}))
+    path.write_text(json.dumps({"value": 77, "fetched_ts": clock.t - 25 * 3600}), encoding="utf-8")
     f = FearGreedFetcher(path, http_get=FakeHttp([TimeoutError()]), clock=clock)
     assert f() is None
 
@@ -122,10 +122,10 @@ def test_no_cache_and_error_returns_none():
 
 def test_corrupt_cache_file_ignored(tmp_path):
     path = tmp_path / "fng.json"
-    path.write_text("{{{ broken")
+    path.write_text("{{{ broken", encoding="utf-8")
     f = FearGreedFetcher(path, http_get=FakeHttp([ValueError("x")]), clock=Clock())
     assert f() is None
-    path.write_text(json.dumps({"value": 500, "fetched_ts": 1_000_000.0}))
+    path.write_text(json.dumps({"value": 500, "fetched_ts": 1_000_000.0}), encoding="utf-8")
     f2 = FearGreedFetcher(path, http_get=FakeHttp([_body("9")]), clock=Clock())
     assert f2() == 9
 
@@ -139,7 +139,7 @@ def test_never_raises_even_if_clock_breaks():
 
 def test_unwritable_cache_path_still_returns_value(tmp_path):
     blocker = tmp_path / "file"
-    blocker.write_text("x")
+    blocker.write_text("x", encoding="utf-8")
     f = FearGreedFetcher(blocker / "fng.json", http_get=FakeHttp([_body("33")]), clock=Clock())
     assert f() == 33
 

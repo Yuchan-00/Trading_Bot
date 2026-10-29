@@ -261,7 +261,7 @@ def test_lock_lost_detected_on_refresh(tmp_path):
     with pytest.raises(C.LockLostError):
         a.refresh()
     a.release()     # 남의 잠금은 지우지 않는다
-    assert json.loads((tmp_path / "bot.lock").read_text())["pid"] == 2002
+    assert json.loads((tmp_path / "bot.lock").read_text(encoding="utf-8"))["pid"] == 2002
 
 
 def test_lock_lost_when_file_deleted(tmp_path):
@@ -275,6 +275,24 @@ def test_lock_lost_when_file_deleted(tmp_path):
 def test_pid_alive_real():
     assert M._pid_alive(os.getpid()) is True
     assert M._pid_alive(0) is False and M._pid_alive(-5) is False
+    assert M._pid_alive(True) is False          # bool 은 PID 가 아니다
+
+
+def test_pid_alive_windows_branch_never_sends_signals(monkeypatch):
+    """Windows 에서 os.kill(pid, 0) 은 CTRL_C_EVENT(콘솔에 Ctrl+C) 이므로 절대 쓰면 안 된다."""
+    seen: list[int] = []
+
+    def boom(*a, **kw):
+        raise AssertionError("Windows 분기에서 os.kill 호출됨")
+
+    monkeypatch.setattr(M, "_pid_alive_windows", lambda pid: seen.append(pid) or True)
+    monkeypatch.setattr(M.os, "kill", boom)
+    monkeypatch.setattr(M.os, "name", "nt")
+    try:
+        assert M._pid_alive(4242) is True
+    finally:
+        monkeypatch.undo()
+    assert seen == [4242]
 
 
 def test_run_refuses_when_locked(tmp_path):
@@ -609,7 +627,7 @@ def test_lock_live_pid_fresh_ts_same_host_is_held(tmp_path):
                    stale_after_s=2700)
     with pytest.raises(M.LockHeldError):
         lk.acquire()
-    assert json.loads(p.read_text())["pid"] == 1001
+    assert json.loads(p.read_text(encoding="utf-8"))["pid"] == 1001
 
 
 def test_lock_other_host_fresh_ts_is_held(tmp_path):
@@ -621,7 +639,7 @@ def test_lock_other_host_fresh_ts_is_held(tmp_path):
                    stale_after_s=2700)
     with pytest.raises(M.LockHeldError, match="old-box"):
         lk.acquire()
-    assert json.loads(p.read_text())["host"] == "old-box"
+    assert json.loads(p.read_text(encoding="utf-8"))["host"] == "old-box"
 
 
 def test_lock_other_host_stale_ts_is_taken_over(tmp_path, caplog):
@@ -898,3 +916,32 @@ def test_build_components_offline_fixture_has_no_fear_greed(tmp_path):
     settings = M.offline_fixture_settings(load_settings(env_for(tmp_path)))
     comp = M.build_components(settings, offline_fixture=True)
     assert comp.cycle.scanner.fear_greed_fetcher is None
+
+
+# ======================================================================= 표준출력 인코딩(Windows 리다이렉트)
+class _FakeStream:
+    def __init__(self, tty: bool):
+        self.tty = tty
+        self.calls: list[dict] = []
+
+    def isatty(self) -> bool:
+        return self.tty
+
+    def reconfigure(self, **kw) -> None:
+        self.calls.append(kw)
+
+
+def test_prepare_stdio_reconfigures_only_redirected_streams():
+    piped, console = _FakeStream(tty=False), _FakeStream(tty=True)
+    M.prepare_stdio([piped, console, None, object()])
+    assert piped.calls == [{"encoding": "utf-8", "errors": "replace"}]
+    assert console.calls == []
+
+
+def test_prepare_stdio_never_raises():
+    class Broken(_FakeStream):
+        def reconfigure(self, **kw):
+            raise ValueError("closed")
+
+    M.prepare_stdio([Broken(tty=False)])
+

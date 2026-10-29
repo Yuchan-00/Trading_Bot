@@ -188,6 +188,9 @@ class BotState(_Model):
     llm_paused_until_ts: int | None = None
     llm_pause_reason: str | None = None
     last_cycle_ts: int | None = None
+    # 마지막으로 처리한 control 파일의 ts(kind → ms). 처리했지만 지우지 못한 STOP/CLEAR 가 재시작 뒤 다시 적용돼
+    # 더 새 요청을 뒤집지 않게(예: 남은 옛 CLEAR 가 그 뒤 STOP 으로 켠 킬스위치를 끔).
+    control_applied_ts: dict[str, int] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------- 주문/체결

@@ -233,8 +233,9 @@ class BotLock:
       호스트는 **획득 시점의 이름**으로 고정해 기록·비교한다(실행 중 hostname 이 바뀌어도 — macOS Bonjour 이름 변경,
       DHCP — 내 잠금을 잃었다고 오판하지 않는다). ``ts`` 쓰기가 마지막 성공 이후 ``stale_after_s × LOCK_REFRESH_FAIL_SHARE``
       이상 계속 실패하고 그 실패가 **연속 2회 이상**이면 ``LockLostError``(다른 인스턴스가 곧 낡은 잠금으로 보고
-      가져갈 수 있으므로 치명 처리). PC 절전 복귀 직후 한 번의 일시 실패는 치명으로 보지 않는다 — 그 전의 실패는
-      원래 예외를 올린다(호출자가 WARNING 후 다음에 다시 시도).
+      가져갈 수 있으므로 치명 처리). PC 절전 복귀 직후 한 번의 일시 실패는 치명으로 보지 않는다 — 단, 이번 사이클이
+      끝나기 전에 ``stale_after_s`` 에 닿을 만큼 오래됐으면(``stale_after_s − LOCK_REFRESH_S − CYCLE_DEADLINE_S`` 이상,
+      긴 절전) 첫 실패도 ``LockLostError``. 그 전의 실패는 원래 예외를 올린다(호출자가 WARNING 후 다음에 다시 시도).
     - ``release()``: 내 잠금일 때만 삭제한다. 삭제 실패는 경고만(다음 실행이 낡은 잠금으로 가져간다).
     - Windows: 파일 교체·삭제는 공유 위반(다른 프로세스가 파일을 읽는 중)이면 잠시 재시도한다(``fsutil``).
       PID 가 살아 있어도 잠금을 쓴 프로세스가 아니면(생성 시각이 ``started_ts`` 보다 늦거나 실행 파일 이름이
@@ -442,9 +443,11 @@ class BotLock:
             since = self._last_ok_ms if self._last_ok_ms is not None else self._started
             failing_s = (float(now) - float(since)) / 1000.0 if since else 0.0
             limit_s = self.stale_after_s * LOCK_REFRESH_FAIL_SHARE
-            # 연속 2회 이상: PC 절전 복귀 직후 한 번의 일시 실패(마지막 성공이 절전 전이라 failing_s 가 큼)는
-            # 치명으로 보지 않고, 다음 갱신(최대 1 사이클 뒤)이 판단한다.
-            if failing_s >= limit_s and self._fails >= 2:
+            # 연속 2회 이상이면 치명. 한 번의 실패(PC 절전 복귀 직후의 일시 실패 — 마지막 성공이 절전 전이라
+            # failing_s 가 큼)는 다음 갱신(최대 1 사이클 뒤)이 판단하되, 이번 사이클이 끝나기 전에 다른 인스턴스가
+            # 낡은 잠금으로 볼 만큼 오래됐으면(긴 절전) 첫 실패도 치명 — 두 인스턴스가 함께 거래하지 않게.
+            near_stale = failing_s >= self.stale_after_s - (LOCK_REFRESH_S + C.CYCLE_DEADLINE_S)
+            if failing_s >= limit_s and (self._fails >= 2 or near_stale):
                 raise C.LockLostError(
                     f"잠금 ts 갱신이 {failing_s:.0f}초째 실패({type(exc).__name__}) — 기준 {limit_s:.0f}초 초과, "
                     f"다른 인스턴스가 낡은 잠금으로 볼 수 있어 중단: {self.path}") from exc
@@ -1218,7 +1221,11 @@ def notify_test(env: Mapping[str, str] | None, out: TextIO, err: TextIO, *,
     """
     from tradingbot.notify import TelegramTransport  # noqa: PLC0415 - 다른 명령의 import 비용을 늘리지 않는다
 
-    src: Mapping[str, str] = _lenient_env(err) if env is None else env
+    try:
+        src: Mapping[str, str] = _lenient_env(err) if env is None else env
+    except ConfigError as exc:
+        err.write(f"설정 오류: {exc}\n")
+        return EXIT_USAGE
     token = (src.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (src.get("TELEGRAM_CHAT_ID") or "").strip()
     mode = (src.get("MODE") or "").strip().lower()[:16] or "paper"
@@ -1381,6 +1388,8 @@ def _log_locations(settings: Settings) -> None:
                     os.getcwd())
         if Path(".env.txt").is_file():
             log.warning("'.env.txt' 가 있습니다 — 메모장이 확장자를 붙였을 수 있습니다. 이름을 '.env' 로 바꾸세요")
+        elif Path(".env").is_dir():
+            log.warning("'.env' 가 폴더입니다(가상환경 이름일 수 있음) — 설정 파일로 읽지 않습니다")
     log.info("데이터 폴더: %s", os.path.abspath(settings.data_dir))
 
 
@@ -1473,7 +1482,7 @@ def prepare_stdio(streams: Sequence[object] | None = None) -> None:
 
 
 class _LogPump:
-    """루트 로거 → 무제한 큐 → 전용 데몬 스레드 → 콘솔(그리고 ``LOG_FILE``) 핸들러.
+    """루트 로거 → 무제한 큐 → 전용 데몬 스레드 → 핸들러(콘솔용 하나, ``LOG_FILE`` 용 하나 — 따로 돈다).
 
     Windows 콘솔(conhost)에서 창을 클릭·드래그해 선택 모드(QuickEdit·Ctrl+A·Ctrl+M·Pause)에 들어가면 콘솔 쓰기
     (WriteConsoleW)가 선택이 끝날 때까지 막힌다. 로그를 거래 스레드에서 직접 쓰면 손절·익절·시간손절을 포함한
@@ -1508,10 +1517,11 @@ class _LogPump:
         with contextlib.suppress(ValueError):
             self.handlers.remove(handler)
 
-    def stop(self, timeout_s: float = 2.0) -> None:
-        """남은 기록을 내보내고 끝낸다. 콘솔이 막혀 있으면 ``timeout_s`` 뒤 포기한다(데몬 스레드)."""
+    def stop(self, timeout_s: float = 2.0) -> bool:
+        """남은 기록을 내보내고 끝낸다. 출력이 막혀 있으면 ``timeout_s`` 뒤 포기하고 False(데몬 스레드는 남는다)."""
         self.queue.put(None)
         self._thread.join(timeout_s)
+        return not self._thread.is_alive()
 
 
 _LOG_PUMP: _LogPump | None = None
@@ -1538,7 +1548,8 @@ def configure_logging(level: int = logging.INFO, stream: TextIO | None = None) -
 def attach_log_file(path: Path) -> logging.Handler | None:
     """``LOG_FILE`` → UTF-8(BOM, 메모장·PowerShell ``Get-Content`` 가 바로 읽음) 추가 쓰기 로그 파일 핸들러.
 
-    전용 스레드가 있으면 거기에 붙인다(파일 쓰기도 거래 스레드를 막지 않게). 열지 못하면 경고만 하고 None.
+    콘솔 펌프가 있으면(``cli()``) 파일에도 자기 큐·스레드를 따로 준다 — 파일 쓰기가 거래 스레드를 막지 않고,
+    콘솔이 선택 모드로 막혀도 파일에는 계속 쓰인다. 열지 못하면 경고만 하고 None.
     회전(rotate)은 하지 않는다 — Windows 는 다른 프로그램이 연 파일의 이름을 바꿀 수 없다.
     """
     try:
@@ -1549,29 +1560,52 @@ def attach_log_file(path: Path) -> logging.Handler | None:
         return None
     handler.setFormatter(logging.Formatter(LOG_FORMAT))
     if _LOG_PUMP is not None:
-        _LOG_PUMP.add_handler(handler)
+        pump = _LogPump([handler])
+        pump.start()
+        feed = logging.handlers.QueueHandler(pump.queue)
+        handler._tb_pump = (pump, feed)          # type: ignore[attr-defined]
+        logging.getLogger().addHandler(feed)
     else:
         logging.getLogger().addHandler(handler)
     return handler
 
 
-def detach_log_file(handler: logging.Handler | None) -> None:
+def detach_log_file(handler: logging.Handler | None, *, timeout_s: float = 5.0) -> None:
+    """``attach_log_file`` 을 되돌린다. 큐에 남은 기록(마지막 '치명 오류로 중단'·'잠금 해제' 등)을 다 쓴 뒤 닫는다."""
     if handler is None:
         return
-    if _LOG_PUMP is not None:
-        _LOG_PUMP.remove_handler(handler)
-    logging.getLogger().removeHandler(handler)
+    root = logging.getLogger()
+    pumped = getattr(handler, "_tb_pump", None)
+    if pumped is not None:
+        pump, feed = pumped
+        root.removeHandler(feed)             # 새 기록은 더 받지 않고
+        if not pump.stop(timeout_s):         # 받은 것은 다 쓴다(파일이 막혀 못 끝내면 닫지 않고 둔다)
+            return
+    root.removeHandler(handler)
     with contextlib.suppress(Exception):
         handler.close()
+
+
+def _exit_past_blocked_console(code: int) -> None:
+    """콘솔 쓰기가 막힌 채(conhost 선택 모드) 끝낼 때: 인터프리터 종료(``logging.shutdown``·stderr 비우기)는 막힌
+    펌프 스레드가 쥔 콘솔 핸들러·stderr 잠금을 기다리며 멈춘다 — 상태 저장·잠금 해제·알림은 이미 끝났으므로
+    리디렉션된 stdout 만 비우고 바로 끝낸다."""
+    with contextlib.suppress(Exception):
+        if not sys.stdout.isatty():
+            sys.stdout.flush()
+    os._exit(code)
 
 
 def cli() -> int:  # pragma: no cover - 콘솔 진입점(`tradingbot` 명령, `python -m tradingbot.main`)
     prepare_stdio()
     pump = configure_logging()
+    code = EXIT_ERROR
     try:
-        return main()
+        code = main()
+        return code
     finally:
-        pump.stop()
+        if not pump.stop():
+            _exit_past_blocked_console(code)
 
 
 if __name__ == "__main__":  # pragma: no cover

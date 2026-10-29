@@ -253,6 +253,122 @@ def test_run_attaches_log_file_from_settings_and_detaches(tmp_path, monkeypatch,
                    for h in logging.getLogger().handlers)
 
 
+@contextlib.contextmanager
+def cli_logging(stream):
+    """``cli()`` 처럼 루트를 콘솔 펌프로 돌리고, 끝나면 원래 핸들러(pytest 의 것 포함)로 되돌린다."""
+    root = logging.getLogger()
+    saved = (root.handlers[:], root.level, logging.raiseExceptions, M._LOG_PUMP)
+    pump = M.configure_logging(stream=stream)
+    try:
+        yield pump
+    finally:
+        if isinstance(stream, BlockingStream):
+            stream.release.set()
+        pump.stop(timeout_s=5)
+        logging.captureWarnings(False)
+        for h in root.handlers[:]:
+            root.removeHandler(h)
+        for h in saved[0]:
+            root.addHandler(h)
+        root.setLevel(saved[1])
+        logging.raiseExceptions = saved[2]
+        M._LOG_PUMP = saved[3]
+
+
+def _eventually(pred, timeout_s: float = 5.0) -> bool:
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_log_file_keeps_writing_while_console_is_blocked(tmp_path):
+    """콘솔이 선택 모드로 막혀도 LOG_FILE 에는 계속 쓴다(파일은 자기 큐·스레드)."""
+    stream = BlockingStream()
+    p = tmp_path / "bot.log"
+    with cli_logging(stream):
+        h = M.attach_log_file(p)
+        lg = logging.getLogger("tradingbot.cycle")
+        lg.info("첫 기록")
+        assert stream.entered.wait(5)                         # 콘솔 쓰기는 막혔다
+        for i in range(5):
+            lg.warning("손절 매도 %d", i)
+        assert _eventually(lambda: "손절 매도 4" in p.read_text(encoding="utf-8-sig"))
+        M.detach_log_file(h)
+    assert not any(isinstance(x, logging.handlers.QueueHandler) for x in logging.getLogger().handlers)
+
+
+def test_detach_log_file_writes_queued_records_before_closing(tmp_path):
+    p = tmp_path / "bot.log"
+    with cli_logging(io.StringIO()):
+        lg = logging.getLogger("tradingbot.main")
+        for round_ in range(3):
+            h = M.attach_log_file(p)
+            for i in range(200):
+                lg.info("기록 %d-%d", round_, i)
+            lg.info("잠금 해제 pid=%d", round_)
+            M.detach_log_file(h)                               # 큐에 남은 것을 다 쓴 뒤 닫는다
+            assert f"잠금 해제 pid={round_}" in p.read_text(encoding="utf-8-sig")
+
+
+def test_fatal_stop_reason_reaches_log_file_through_cli_logging(tmp_path):
+    """cli() 와 같은 로그 배선에서 치명 중단 사유·종료 알림·잠금 해제가 LOG_FILE 에 남는다(텔레그램 없음)."""
+    stream = io.StringIO()
+    f = Factory(cycle=FakeCycle(raise_on={1: C.LockLostError("x")}), notifier=Notifier(None))
+    with cli_logging(stream):
+        code, _, err = call(["run"], tmp_path, factory=f, env=env_for(tmp_path, LOG_FILE="logs/bot.log"))
+    assert code == M.EXIT_ERROR, err
+    text = (tmp_path / "data" / "logs" / "bot.log").read_text(encoding="utf-8-sig")
+    for needle in ("치명 오류로 중단: LockLostError", "[알림 비활성]", "잠금 해제"):
+        assert needle in text, needle
+
+
+def test_log_pump_stop_reports_a_stuck_console():
+    stream = BlockingStream()
+    console = logging.StreamHandler(stream)
+    pump = M._LogPump([console])
+    pump.start()
+    rec = logging.LogRecord("x", logging.INFO, __file__, 1, "기록", None, None)
+    pump.queue.put(rec)
+    assert stream.entered.wait(5)
+    assert pump.stop(timeout_s=0.2) is False                  # 막힌 채 → 포기하고 알린다
+    stream.release.set()
+    assert pump.stop(timeout_s=5) is True
+
+
+def test_cli_exits_even_if_the_console_stays_blocked(tmp_path):
+    """콘솔 선택 모드가 풀리지 않은 채 끝나도 프로세스가 멈춰 있지 않는다(종료 코드 유지)."""
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parent.parent
+    child = (
+        "import logging, sys, threading\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "from tradingbot import main as M\n"
+        "class Blocked:\n"
+        "    encoding = 'utf-8'\n"
+        "    def write(self, s):\n"
+        "        threading.Event().wait()\n"
+        "    def flush(self):\n"
+        "        threading.Event().wait()\n"
+        "    def isatty(self):\n"
+        "        return False\n"
+        "def fake_main(argv=None, **kw):\n"
+        "    logging.getLogger('tradingbot.test').warning('사이클 1 완료')\n"
+        "    return 3\n"
+        "M.main = fake_main\n"
+        "sys.stderr = Blocked()\n"
+        "sys.exit(M.cli())\n"
+    )
+    t0 = time.monotonic()
+    proc = subprocess.run([sys.executable, "-c", child], cwd=tmp_path, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=60)
+    assert proc.returncode == 3 and time.monotonic() - t0 < 30
+
+
 # ======================================================================= 절전 차단
 def test_keep_system_awake_requests_and_releases():
     calls: list[int] = []
@@ -488,7 +604,7 @@ def test_lock_single_refresh_failure_after_sleep_is_not_fatal(tmp_path, monkeypa
     lk = M.BotLock(tmp_path / "bot.lock", pid=111, pid_alive=lambda p: True, clock_ms=lambda: clock[0],
                    hostname=lambda: "h", stale_after_s=2700)
     lk.acquire()
-    clock[0] += 8 * 3600 * 1000           # 8시간 절전
+    clock[0] += 25 * 60 * 1000            # 25분 절전: 한도(1350초)는 넘었지만 낡은 잠금(2700초)까지는 여유가 있다
     real = os.replace
     fails = [OSError(5, "Access is denied")]
 
@@ -503,6 +619,29 @@ def test_lock_single_refresh_failure_after_sleep_is_not_fatal(tmp_path, monkeypa
     assert not isinstance(ei.value, C.LockLostError) and lk.held
     lk.refresh()                          # 다음 갱신은 성공
     assert json.loads((tmp_path / "bot.lock").read_text(encoding="utf-8"))["ts"] == clock[0]
+
+
+def test_lock_single_refresh_failure_after_long_sleep_is_fatal(tmp_path, monkeypatch):
+    """긴 절전 뒤에는 ts 가 이미 낡았다 — 한 번의 실패라도 계속 거래하면 다른 인스턴스와 함께 거래할 수 있다."""
+    real = os.replace
+    deny = {"on": False}
+
+    def replace(a, b):
+        if deny["on"]:
+            raise OSError(5, "Access is denied")
+        return real(a, b)
+
+    monkeypatch.setattr(os, "replace", replace)
+    clock = [1_800_000_000_000]
+    for i, slept_s in enumerate((8 * 3600, 2200)):        # 8시간 절전 / 낡기 직전(2700 − 300 − 300 = 2100초 이상)
+        lk = M.BotLock(tmp_path / f"bot{i}.lock", pid=111, pid_alive=lambda p: True, clock_ms=lambda: clock[0],
+                       hostname=lambda: "h", stale_after_s=2700)
+        deny["on"] = False
+        lk.acquire()
+        clock[0] += slept_s * 1000
+        deny["on"] = True
+        with pytest.raises(C.LockLostError):
+            lk.refresh()
 
 
 def test_lock_two_consecutive_failures_past_limit_are_fatal(tmp_path, monkeypatch):
@@ -695,6 +834,36 @@ def test_older_stop_left_behind_does_not_override_newer_clear(tmp_path):
     assert not (ctl / "STOP").exists() and not (ctl / "CLEAR").exists()
 
 
+def test_undeletable_clear_is_not_reapplied_after_restart(tmp_path, monkeypatch):
+    """지우지 못한 CLEAR 가 남은 채 STOP 으로 킬스위치를 켜고 재시작해도, 옛 CLEAR 가 다시 적용돼 끄지 않는다."""
+    from test_cycle import Rig
+
+    real = fsutil.unlink
+
+    def deny_clear(path, **kw):
+        if Path(path).name == C.CLEAR_FILENAME:
+            raise sharing_error(path)
+        return real(path, **kw)
+
+    monkeypatch.setattr(fsutil, "unlink", deny_clear)
+    rig = Rig(tmp_path)
+    rig.portfolio.set_kill("manual_stop: 처음")
+    ctl = rig.data / "control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    now = rig.clock.ms()
+    (ctl / "CLEAR").write_text(json.dumps({"reason": "해제", "ts": now - 60_000}), encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is False and (ctl / "CLEAR").is_file()          # 적용됐지만 지우지 못함
+    (ctl / "STOP").write_text(json.dumps({"reason": "다시 정지", "ts": now - 30_000}), encoding="utf-8")
+    rig.cycle.run_once()
+    assert rig.state.kill_switch is True and rig.state.kill_reason == "manual_stop: 다시 정지"
+    restarted = Rig(tmp_path)                       # 같은 데이터 폴더로 새 프로세스(재시작)
+    assert restarted.state.kill_switch is True
+    restarted.cycle.run_once()
+    assert restarted.state.kill_switch is True and (ctl / "CLEAR").is_file()
+    assert not restarted.sent_with("킬스위치 해제")
+
+
 # ======================================================================= .env·설정
 @pytest.fixture
 def clean_env(monkeypatch, tmp_path):
@@ -747,6 +916,98 @@ def test_dotenv_unclosed_quote_swallowing_next_line_is_an_error(clean_env):
     warnings: list[str] = []
     read_env(lenient=True, warnings=warnings)
     assert any("해석하지 못했습니다" in w for w in warnings)
+
+
+def test_dotenv_parse_error_never_shows_secret_text(clean_env):
+    """':' 나 공백으로 쓴 비밀값 줄·비밀값으로 시작하는 줄: 오류에는 줄 번호만(이름은 NAME= 꼴일 때만)."""
+    (clean_env / ".env").write_bytes(b"AGENT_BACKEND=mock\nTELEGRAM_BOT_TOKEN: 1234:SECRETPARTxyz\n"
+                                     b"ANTHROPIC_API_KEY sk-ant-api03-SECRETBODY\nSECRETBARE123abc note\n")
+    with pytest.raises(ConfigError, match="2번째 줄") as ei:
+        load_settings()
+    assert "SECRET" not in str(ei.value) and "1234" not in str(ei.value) and "'='" in str(ei.value)
+    warnings: list[str] = []
+    read_env(lenient=True, warnings=warnings)
+    assert len(warnings) == 3 and not any("SECRET" in w or "1234" in w for w in warnings)
+    out, err = io.StringIO(), io.StringIO()
+    M.main(["notify-test"], out=out, err=err)
+    assert "SECRET" not in out.getvalue() + err.getvalue()
+
+
+def test_dotenv_parse_error_line_number_skips_blank_lines(clean_env):
+    (clean_env / ".env").write_bytes(b'MODE=paper\n\nDATA_DIR="X:\\data\\"\nAGENT_BACKEND=mock\n')
+    with pytest.raises(ConfigError, match=r"3번째 줄\(DATA_DIR="):
+        load_settings()
+    (clean_env / ".env").write_bytes(b'MODE=paper\r\n\r\n\r\nDATA_DIR="X:\\data\\"\r\nAGENT_BACKEND=mock\r\n')
+    with pytest.raises(ConfigError, match=r"4번째 줄\(DATA_DIR="):
+        load_settings()
+    # 해석 실패 뒤의 CRLF 를 두 번 세지 않는다(메모장 파일, lenient 의 두 번째 이후 경고)
+    (clean_env / ".env").write_bytes(b"AGENT_BACKEND=mock\r\n\r\nset DATA_DIR=d\r\n\r\nset MODE=paper\r\n")
+    warnings: list[str] = []
+    read_env(lenient=True, warnings=warnings)
+    assert [w.split(" ", 2)[1] for w in warnings] == ["3번째", "5번째"]
+    assert "(DATA_DIR)" in warnings[0] and "set" in warnings[0]
+
+
+def test_dotenv_utf16_with_appended_8bit_lines(clean_env):
+    """PowerShell '>' 로 만든 UTF-16 파일에 cmd·Git Bash 로 덧붙인 줄: 조용히 사라지지 않고, stop 은 계속 된다."""
+    head = "\ufeffAGENT_BACKEND=mock\r\nDATA_DIR=botdata\r\n".encode("utf-16-le")
+    for tail in (b"MODE=paper\n", "# 텔레그램\r\n".encode("cp949")):         # 홀수 길이 / 잘못된 서로게이트
+        (clean_env / ".env").write_bytes(head + tail)
+        with pytest.raises(ConfigError, match="UTF-16"):
+            load_settings()
+        warnings: list[str] = []
+        assert read_env(lenient=True, warnings=warnings)["DATA_DIR"] == "botdata" and warnings
+        out, err = io.StringIO(), io.StringIO()
+        assert M.main(["stop", "--reason", "x"], out=out, err=err) == M.EXIT_OK
+        assert (clean_env / "botdata" / "control" / "STOP").is_file()
+        out, err = io.StringIO(), io.StringIO()
+        assert M.main(["notify-test"], out=out, err=err) == M.EXIT_USAGE       # 트레이스백 없이 '설정 없음'
+    # 짝수 길이로 풀리면 덧붙인 줄이 '=' 없는 한 줄(CJK 글자)이 된다 → 그 줄 번호로 알린다(조용히 기본값으로 돌지 않게)
+    (clean_env / ".env").write_bytes("\ufeffAGENT_BACKEND=mock\r\n".encode("utf-16-le") + b"DATA_DIR=D:/bots\r\n")
+    with pytest.raises(ConfigError, match="2번째 줄"):
+        load_settings()
+    warnings = []
+    read_env(lenient=True, warnings=warnings)
+    assert any("2번째 줄" in w and "인코딩이 섞인" in w for w in warnings)
+
+
+def test_dotenv_utf16_copy_of_env_example_still_loads(clean_env):
+    data = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    (clean_env / ".env").write_bytes(("\ufeff" + data.replace("\n", "\r\n")).encode("utf-16-le"))
+    warnings: list[str] = []
+    env = read_env(lenient=True, warnings=warnings)
+    assert len(warnings) == 1 and "UTF-16" in warnings[0] and env["MODE"] == "paper"
+
+
+def test_env_override_warning_ignores_empty_placeholders(clean_env, monkeypatch, caplog):
+    """.env.example 을 복사한 .env 의 빈 자리(ANTHROPIC_API_KEY= …)는 환경변수에 둔 비밀값과 겹쳐도 경고하지 않는다."""
+    example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    (clean_env / ".env").write_text(example, encoding="utf-8")
+    for k in ("ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.setenv(k, "from-env")
+    monkeypatch.setattr(CFG, "_WARNED_OVERRIDES", set())
+    with caplog.at_level(logging.WARNING, logger="tradingbot.config"):
+        read_env()
+    assert not [r for r in caplog.records if "덮어씁니다" in r.getMessage()]
+    monkeypatch.setenv("AGENT_BACKEND", "mock")          # .env 는 AGENT_BACKEND=anthropic
+    with caplog.at_level(logging.WARNING, logger="tradingbot.config"):
+        read_env()
+    msgs = [r.getMessage() for r in caplog.records if "덮어씁니다" in r.getMessage()]
+    assert len(msgs) == 1 and "AGENT_BACKEND" in msgs[0] and "ANTHROPIC_API_KEY" not in msgs[0]
+
+
+def test_dotenv_directory_is_ignored_like_a_missing_file(clean_env, monkeypatch, caplog):
+    """``python -m venv .env`` 로 만든 폴더는 설정 파일이 아니다(전처럼 환경변수만으로 실행)."""
+    (clean_env / ".env").mkdir()
+    monkeypatch.setenv("AGENT_BACKEND", "mock")
+    monkeypatch.setenv("DATA_DIR", str(clean_env / "data"))
+    assert load_settings().agent_backend == "mock"
+    out, err = io.StringIO(), io.StringIO()
+    with caplog.at_level(logging.INFO, logger="tradingbot.main"):
+        code = M.main(["run", "--once"], env=None, input_fn=lambda prompt: "", out=out, err=err,
+                      components_factory=Factory())
+    assert code == M.EXIT_OK, err.getvalue()
+    assert "에 .env 가 없습니다" in caplog.text and "폴더입니다" in caplog.text
 
 
 def test_data_dir_validation():
@@ -878,6 +1139,33 @@ def test_startup_message_flags_mock_backend():
 
 
 # ======================================================================= 비용 원장(잠긴 파일)
+def test_state_save_waits_the_sharing_budget_once_then_fails(tmp_path, monkeypatch):
+    """state.json 이 다른 프로그램에 열려 있으면 SAVE_SHARING_BUDGET_S 동안만 기다리고(전체 재시도 반복 없이) 실패한다."""
+    from tradingbot import portfolio as PF
+
+    pf = PF.Portfolio.load(load_settings(env_for(tmp_path)), tmp_path / "state.json")
+    sleeps: list[float] = []
+    pf.sleep = sleeps.append
+    monkeypatch.setattr(os, "replace", lambda a, b: (_ for _ in ()).throw(sharing_error(b)))
+    with pytest.raises(PermissionError):
+        pf.save()
+    assert sum(sleeps) == pytest.approx(PF.SAVE_SHARING_BUDGET_S)
+    assert not list(tmp_path.glob("state.json.tmp.*"))
+    monkeypatch.undo()
+    real = os.replace
+    fails = [sharing_error(), sharing_error()]
+
+    def flaky(a, b):
+        if fails:
+            raise fails.pop(0)
+        return real(a, b)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    sleeps.clear()
+    pf.save()
+    assert (tmp_path / "state.json").is_file() and 0 < sum(sleeps) < PF.SAVE_SHARING_BUDGET_S
+
+
 def test_cost_ledger_locked_file_goes_to_pending_and_is_counted(tmp_path, monkeypatch):
     path = tmp_path / "cost_ledger.jsonl"
     led = CostLedger(path, 10, 200)
@@ -895,6 +1183,55 @@ def test_cost_ledger_locked_file_goes_to_pending_and_is_counted(tmp_path, monkey
     led.record(role="head", model="claude-opus-5-5", input_tokens=1000, cached_tokens=0, output_tokens=100)
     again = CostLedger(path, 10, 200)
     assert again.spent_today() == pytest.approx(2 * cost)
+
+
+class _NtOs:
+    """``tradingbot.fsutil`` 에게만 Windows 로 보이게 한다(전역 ``os.name`` 을 바꾸면 pathlib 이 깨진다)."""
+    name = "nt"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+def test_cost_ledger_windows_open_denied_goes_to_pending(tmp_path, monkeypatch):
+    """Windows 의 open() 은 공유 위반에도 errno 13 만 싣는다(winerror 없음) — 그 모양 그대로 보조 파일로 간다."""
+    from tradingbot.llm import cost as COST
+
+    monkeypatch.setattr(fsutil, "os", _NtOs())
+    monkeypatch.setattr(COST, "LEDGER_SHARING_BUDGET_S", 0.05)
+    path = tmp_path / "cost_ledger.jsonl"
+    led = CostLedger(path, 10, 200)
+    real_open = Path.open
+    tries = {"n": 0}
+
+    def open_(self, *a, **k):
+        if self == path:
+            tries["n"] += 1
+            raise PermissionError(13, "Permission denied", str(self))          # winerror 없음
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(Path, "open", open_)
+    led.record(role="head", model="claude-opus-5-5", input_tokens=1000, cached_tokens=0, output_tokens=100)
+    assert pending_ledger_path(path).is_file() and not path.exists()
+    assert tries["n"] >= 2                                     # 원장 자체도 잠깐 다시 시도한 뒤 보조 파일로
+
+
+def test_append_bytes_retries_windows_open_denied(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsutil, "os", _NtOs())
+    target = tmp_path / "decisions.jsonl"
+    real_open = Path.open
+    denied = {"n": 2}
+
+    def open_(self, *a, **k):
+        if self == target and denied["n"]:
+            denied["n"] -= 1
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(Path, "open", open_)
+    sleeps: list[float] = []
+    fsutil.append_bytes(target, b"x\n", sleep=sleeps.append)
+    assert target.read_bytes() == b"x\n" and len(sleeps) == 2
 
 
 def test_cost_ledger_other_errors_still_raise(tmp_path, monkeypatch):
@@ -1043,6 +1380,13 @@ def test_step_safe_throttle_ignores_test_doubles():
     assert not hasattr(b, "throttle")
 
 
+def test_futures_client_gets_step_safe_throttle():
+    from test_exchange_ccxt import FakeExchange as _FE
+
+    broker = CcxtBroker(make_settings("testnet"), exchange=_FE(), sleep=lambda s: None, futures_factory=ThrottleEx)
+    assert getattr(broker._futures_client().throttle, "_tb_step_safe", False)
+
+
 def test_real_ccxt_binance_gets_step_safe_throttle():
     ex = ccxt.binance({"enableRateLimit": True})
     _CcxtBase._configure_exchange(ex, sandbox=False)
@@ -1084,6 +1428,41 @@ def test_post_trade_reviews_run_after_all_code_exits(tmp_path):
     llms = [i for i, x in enumerate(order) if x.startswith("llm:")]
     assert len(sells) == 2 and llms and max(sells) < min(llms), order       # 두 번째 손절이 사후분석을 기다리지 않음
     assert len(rig.sent_with("사후분석")) == 2 and len(rig.journal_lines()) == 2
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_earlier_exit_is_journaled_when_a_later_exit_save_fails(tmp_path, monkeypatch, partial):
+    """사후분석을 미뤄도, 같은 사이클의 뒤 매도가 상태 저장 실패(치명)로 끝나면 앞 거래의 저널 기록은 남는다."""
+    from test_cycle import Rig
+
+    rig = Rig(tmp_path)
+    rig.hold_position("ETH/USDT", sl=99.0, tp=110.0)
+    rig.hold_position("SOL/USDT", sl=99.0, tp=110.0)
+    rig.market.prices["ETH/USDT"] = 95.0
+    rig.market.prices["SOL/USDT"] = 95.0
+    rig.scanner.candidates = []
+    real_sell = rig.broker.market_sell
+    sold: list[str] = []
+
+    def sell(symbol, base_amount):
+        sold.append(symbol)
+        if partial and symbol == "ETH/USDT":
+            base_amount = base_amount / 2                   # 절반만 체결(남은 절반은 보유 중 → 재시작해도 고아 아님)
+        return real_sell(symbol, base_amount)
+
+    real_save = rig.portfolio.save
+
+    def save(*a, **k):
+        if len(sold) >= 2:
+            raise OSError(28, "No space left on device")
+        return real_save(*a, **k)
+
+    monkeypatch.setattr(rig.broker, "market_sell", sell)
+    monkeypatch.setattr(rig.portfolio, "save", save)
+    with pytest.raises(C.StateSaveError):
+        rig.cycle.run_once()
+    lines = rig.journal_lines()
+    assert len(sold) == 2 and [ln.get("symbol") for ln in lines] == [sold[0]], lines
 
 
 def test_news_is_fetched_after_code_exits(tmp_path):

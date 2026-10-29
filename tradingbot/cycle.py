@@ -1103,6 +1103,15 @@ class Cycle:
     # ================================================================ 본체
     def run_once(self) -> CycleSummary:
         run = _Run(self._now(), float(self._mono()))
+        try:
+            return self._run_once(run)
+        except BaseException:
+            # 치명 오류(뒤 매도의 상태 저장 실패 등)로 끝나도 이미 판 거래의 저널 기록은 남긴다 — 사후분석을 미룬 탓에
+            # 사라지지 않게(부분 청산 기록은 재시작 뒤 복구되지 않는다)
+            self._journal_pending_on_abort(run)
+            raise
+
+    def _run_once(self, run: _Run) -> CycleSummary:
         js = self.journal_state
 
         # 1. 잠금·control 파일
@@ -1213,8 +1222,8 @@ class Cycle:
             if info is None:
                 self._consumed_control.pop(kind, None)
                 continue
-            if self._consumed_control.get(kind) == info["ts"]:
-                # 이미 처리했지만 삭제에 실패한 파일 — 다시 적용하지 않고 삭제만 재시도한다
+            if info["ts"] in (self._consumed_control.get(kind), self.state.control_applied_ts.get(kind)):
+                # 이미 처리했지만 삭제에 실패한 파일(재시작 전에 처리한 것 포함) — 다시 적용하지 않고 삭제만 재시도한다
                 self._unlink_control(paths[kind], kind, info["ts"])
                 continue
             events.append((info["ts"], order, kind, info))
@@ -1248,6 +1257,8 @@ class Cycle:
                         extra={"event": "kill_cleared"}))
         if not events:
             return
+        for ts, _, kind, _ in events:
+            self.state.control_applied_ts[kind] = int(ts)     # 적용·무시한 파일 모두 — 같은 저장에 담는다
         # 상태 저장 → 알림 → control 파일 삭제 (저장 실패 시 파일은 남아 재시작 후 다시 처리된다;
         # 삭제 실패가 알림을 막지 않게 알림을 먼저 보낸다)
         self._save()
@@ -1589,6 +1600,7 @@ class Cycle:
             try:
                 review_text = self._post_trade(run, trade, partial)
             except _FATAL:
+                run.pending_reviews.insert(0, (trade, partial, order_id))   # 저널 기록 전(LLM 단계) — 중단 처리가 남긴다
                 raise
             except Exception as exc:  # noqa: BLE001 - 한 거래의 사후분석 실패가 다른 거래 기록을 막지 않게
                 run.errors.append(f"post_trade:{trade.symbol}: {type(exc).__name__}")
@@ -1600,6 +1612,25 @@ class Cycle:
                     "exit", run, symbol=trade.symbol, side="sell", base_amount=trade.base_amount,
                     price=trade.exit_price, pnl_quote=trade.pnl_quote, pnl_pct=trade.pnl_pct, reason=trade.reason,
                     extra={"post_trade_review": review_text, "follow_up": True, "order_id": order_id}))
+
+    def _journal_pending_on_abort(self, run: _Run) -> None:
+        """사이클이 예외로 끝날 때 남은 사후분석 대신 코드 요약으로 저널만 기록한다(LLM·알림 없음, 실패는 삼킨다)."""
+        if not run.pending_reviews:
+            return
+        js = self.journal_state
+        while run.pending_reviews:
+            trade, partial, _ = run.pending_reviews.pop(0)
+            try:
+                rec = None if partial else {"code_summary": J.code_post_trade_summary(trade), "llm": False}
+                reports.append_journal(self.journal_path, trade, rec)
+                if not partial:
+                    J.clear_symbol(js, trade.symbol)
+            except Exception as exc:  # noqa: BLE001 - 원래 오류를 가리지 않는다
+                log.error("중단 중 저널 기록 실패 %s type=%s", trade.symbol, type(exc).__name__)
+        try:
+            J.save_journal_state(js, self.data_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.error("중단 중 저널 상태 저장 실패 type=%s", type(exc).__name__)
 
     def _post_trade(self, run: _Run, trade: ClosedTrade, partial: bool) -> str | None:
         """저널 사후분석·기록·심볼 정리. 전량 청산이면 텔레그램용 사후분석 문구(LLM 또는 코드 요약)를 돌려준다."""

@@ -228,30 +228,45 @@ def _feeds(raw: str) -> tuple[str, ...]:
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
 _PERCENT_VAR = re.compile(r"%[A-Za-z_][A-Za-z0-9_()]*%")
 _WARNED_OVERRIDES: set[tuple[str, ...]] = set()
+# 해석 실패 줄에서 보여줄 이름: ``NAME=`` 꼴의 대문자 설정 이름만(최대 40자). ``KEY: 값``·``KEY 값``·비밀값으로
+# 시작하는 줄은 이름 없이 줄 번호만 — 오류 메시지에 비밀값 일부가 나오지 않게.
+_DOTENV_NAME = re.compile(r"((?i:export|set)\s+)?([A-Z_][A-Z0-9_]{0,39})\s*=")
+_NEWLINES = re.compile(r"\r\n|\n|\r")
+_UTF8_FIX = "메모장에서 '다른 이름으로 저장' → 인코딩 'UTF-8' 로 다시 저장하세요"
+
+
+def _dotenv_present(path: Path) -> bool:
+    # 폴더(``python -m venv .env`` 로 만든 가상환경 등)는 없는 것으로 친다(python-dotenv 도 건너뛴다). FIFO 는 읽는다.
+    return path.exists() and not path.is_dir()
 
 
 def dotenv_location(dotenv_path: Path | None = None) -> tuple[Path, bool]:
     """읽을 .env 의 절대 경로(기본: 현재 작업 폴더의 ``.env``)와 존재 여부."""
     path = dotenv_path if dotenv_path is not None else Path(".env")
-    return Path(os.path.abspath(path)), path.is_file()
+    return Path(os.path.abspath(path)), _dotenv_present(path)
 
 
 def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str]) -> str:
     """.env 바이트 → 텍스트. Windows 도구가 만든 인코딩을 알아보고, 모르는 것은 분명한 오류로 알린다.
 
     - UTF-8(BOM 있든 없든) → 그대로. BOM 은 버린다(python-dotenv 1.2.2 이하는 첫 키에 BOM 이 붙는다).
-    - UTF-16 BOM(Windows PowerShell 5.1 의 ``>`` / ``Out-File``) → 풀어서 쓰되 경고.
+    - UTF-16 BOM(Windows PowerShell 5.1 의 ``>`` / ``Out-File``) → 풀어서 쓰되 경고. 다른 도구로 8비트 줄을 덧붙여
+      풀 수 없으면 strict 는 ``ConfigError``, lenient 는 못 읽는 글자를 바꿔 넣고 경고(stop·status 는 계속 동작).
     - NUL 바이트(BOM 없는 UTF-16 — PowerShell 5.1 ``>>`` 로 덧붙인 줄) → strict 는 ``ConfigError``, lenient 는 NUL 을
       지우고 경고(키가 조용히 사라지지 않게).
     - UTF-8 이 아님(메모장 ANSI = cp949 로 저장한 한글 주석 등) → strict 는 줄 번호를 담은 ``ConfigError``,
       lenient 는 로캘 인코딩(한국어 Windows 는 cp949)으로 읽고 경고.
     """
-    fix = "메모장에서 '다른 이름으로 저장' → 인코딩 'UTF-8' 로 다시 저장하세요"
+    fix = _UTF8_FIX
     if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
         try:
             text = data.decode("utf-16")
         except UnicodeDecodeError as e:
-            raise ConfigError(f"{path}: UTF-16 으로 저장됐지만 읽을 수 없습니다 — {fix}") from e
+            msg = f"{path}: UTF-16 으로 저장됐지만 읽을 수 없습니다(다른 인코딩 줄이 덧붙은 듯) — {fix}"
+            if not lenient:
+                raise ConfigError(msg) from e
+            warnings.append(msg)
+            return data.decode("utf-16", errors="replace")
         msg = f"{path}: UTF-16 으로 저장돼 있습니다(PowerShell '>' 로 만든 파일) — {fix}"
         warnings.append(msg)
         return text
@@ -278,6 +293,35 @@ def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str
             return data.decode("utf-8", errors="replace")
 
 
+def _dotenv_line_problem(binding: object, s: str, before: str, path: Path) -> str | None:
+    """python-dotenv 가 해석하지 못했거나(오류) 조용히 버릴(``=`` 없는 비ASCII 키) 줄의 안내. 문제없으면 None.
+
+    줄 번호는 앞 줄 원문(``before``)에서 센다 — python-dotenv 의 ``original.line`` 은 그 줄 앞의 빈 줄부터 센다.
+    이름은 ``NAME=`` 꼴일 때만 보여준다(``KEY: 값`` 이나 비밀값으로 시작하는 줄의 내용은 쓰지 않는다).
+    """
+    error = bool(getattr(binding, "error", False))
+    key = getattr(binding, "key", None)
+    garbled = (not error and isinstance(key, str) and not key.isascii()
+               and getattr(binding, "value", "") is None)
+    if not (error or garbled):
+        return None
+    body = s.lstrip()
+    line = len(_NEWLINES.findall(before + s[:len(s) - len(body)])) + 1
+    if garbled:
+        return (f"{path} {line}번째 줄에 '=' 없는 글자만 있습니다 — 메모라면 줄 앞에 # 를 붙이세요. 아니면 인코딩이 "
+                f"섞인 것입니다(UTF-16 파일에 cmd·Git Bash 로 줄을 덧붙이면 그 줄의 설정이 사라집니다) — {_UTF8_FIX}")
+    m = _DOTENV_NAME.match(_NEWLINES.split(body, 1)[0])
+    if m and m.group(1):
+        return (f"{path} {line}번째 줄({m.group(2)})을 해석하지 못했습니다 — cmd 의 set 은 .env 에 쓰지 않습니다. "
+                f"{m.group(2)}=값 처럼 쓰세요")
+    if m:
+        return (f"{path} {line}번째 줄({m.group(2)}=…)을 해석하지 못했습니다 — 닫히지 않은 따옴표이거나 따옴표 안의 "
+                "값이 역슬래시(\\)로 끝납니다(닫는 따옴표 뒤에 다른 글자가 있어도 그렇습니다). 경로는 따옴표 없이 "
+                "쓰거나 B:/TradingBot/data 처럼 / 를 쓰세요(그 줄 뒤의 설정이 함께 무시될 수 있습니다)")
+    return (f"{path} {line}번째 줄을 해석하지 못했습니다 — KEY=value 형식이 아닙니다(':' 나 공백 대신 '=' 를 "
+            "쓰세요)")
+
+
 def _dotenv_items(path: Path, *, lenient: bool, warnings: list[str]) -> dict[str, str]:
     """.env 를 읽어 {키: 값}. 해석하지 못한 줄(닫히지 않은 따옴표 — 예: ``DATA_DIR="X:\\data\\"`` 는 닫는 따옴표가
     역슬래시로 이스케이프돼 다음 줄들까지 삼킨다)은 strict 면 ``ConfigError``, lenient 면 경고."""
@@ -295,14 +339,12 @@ def _dotenv_items(path: Path, *, lenient: bool, warnings: list[str]) -> dict[str
         warnings.append(msg)
         return {}
     text = _decode_dotenv(data, path, lenient=lenient, warnings=warnings)
+    consumed = ""                   # 앞 줄들의 원문(바인딩 원문을 이어 붙이면 파일 전체 — 줄 번호를 여기서 센다)
     for binding in parse_stream(io.StringIO(text)):
-        if getattr(binding, "error", False):
-            orig = getattr(binding, "original", None)
-            line = getattr(orig, "line", "?")
-            head = (getattr(orig, "string", "") or "").split("\n", 1)[0].split("=", 1)[0].strip()[:40]
-            msg = (f"{path} {line}번째 줄({head or '?'}=…)을 해석하지 못했습니다 — 닫히지 않은 따옴표이거나 따옴표 안의 "
-                   "값이 역슬래시(\\)로 끝납니다. 경로는 따옴표 없이 쓰거나 B:/TradingBot/data 처럼 / 를 쓰세요"
-                   "(그 줄 뒤의 설정이 함께 무시될 수 있습니다)")
+        s = getattr(getattr(binding, "original", None), "string", "") or ""
+        msg = _dotenv_line_problem(binding, s, consumed, path)
+        consumed += s
+        if msg:
             if not lenient:
                 raise ConfigError(msg)
             warnings.append(msg)
@@ -323,17 +365,18 @@ def read_env(dotenv_path: Path | None = None, *, lenient: bool = False,
     값 검증은 하지 않는다 — ``load_settings`` 가 실패해도 ``DATA_DIR`` 같은 값만 꺼내 쓸 때(CLI stop/status) 쓴다.
     파일 자체가 깨졌으면(인코딩·해석 실패) 기본은 ``ConfigError``. ``lenient=True``(파일만 읽는 명령)는 최대한
     읽고 경고를 ``warnings`` 에 담는다. 같은 키가 환경변수와 .env 에 다른 값으로 있으면(창에 남은 ``set``·``$env:``)
-    이름만 한 번 경고한다(값은 쓰지 않는다).
+    이름만 한 번 경고한다(값은 쓰지 않는다). .env 의 빈 값(``.env.example`` 의 ``ANTHROPIC_API_KEY=`` 같은 자리
+    표시)은 설정하지 않은 것과 같으므로 덮어쓰기로 치지 않는다.
     """
     merged: dict[str, str] = dict(os.environ)
     path = dotenv_path if dotenv_path is not None else Path(".env")
     sink: list[str] = warnings if warnings is not None else []
-    if path.exists():
+    if _dotenv_present(path):
         items = _dotenv_items(path, lenient=lenient, warnings=sink)
         overridden: list[str] = []
         for k, v in items.items():
             if k in merged:
-                if str(merged[k]).strip() != str(v).strip():
+                if str(v).strip() and str(merged[k]).strip() != str(v).strip():
                     overridden.append(k)
             else:
                 merged[k] = v
@@ -389,7 +432,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, dotenv_path: Path | N
         src: Mapping[str, str] = read_env(dotenv_path)
     elif dotenv_path is not None:
         merged = dict(env)
-        if dotenv_path.exists():
+        if _dotenv_present(dotenv_path):
             warnings: list[str] = []
             for k, v in _dotenv_items(dotenv_path, lenient=False, warnings=warnings).items():
                 if k not in merged:

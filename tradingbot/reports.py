@@ -29,6 +29,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from . import fsutil
 from .models import BotState, ClosedTrade, TradeEvent
 
 log = logging.getLogger("tradingbot.reports")
@@ -86,8 +87,8 @@ def _append_line(path: Path, record: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = dumps(_sanitize(record))
-    with path.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    # 바이너리 추가 쓰기: OS 와 무관하게 LF 줄바꿈. Windows 에서 다른 프로그램이 잠갔으면 잠깐 재시도한다.
+    fsutil.append_bytes(path, (line + "\n").encode("utf-8"))
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -96,7 +97,7 @@ def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     try:
         tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        fsutil.replace(tmp, path)
     finally:
         if tmp.exists():
             try:

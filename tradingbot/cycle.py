@@ -5,11 +5,13 @@
    재설정까지 같은 저장에) → 저장 → notify → 파일 삭제(삭제 실패는 알림을 막지 않는다).
 2. 상태(메모리의 Portfolio) 사이클 증가, 날짜 롤오버(전일 ``daily_summary`` notify), 저널 상태 ↔ 장부 대사
    (``Position.thesis`` 로 논지 복구, 미보유 심볼 항목 정리).
-3. ``Scanner.scan``(testnet/live 는 거래소 자본 기준 ``planned_notional``; 뉴스 피드가 없으면 묵은 headline_polarity
-   제거) → 마크 갱신, equity·peak 갱신, 낙폭 사다리(−6% 이면 ``set_kill("drawdown_stop_all")`` + notify) →
-   일별 자본 곡선 기록 → testnet/live 거래소 잔고 대사(유령 포지션 정리) → 저널 일일 리뷰(00:05 UTC 이후 첫 사이클).
-4. **코드 청산**: 보유마다 ``risk.check_exits`` → market_sell → ``close_position`` → ``save`` → notify(exit)
-   → 저널 사후분석(실패 무시) → notify(사후분석 문구).
+3. ``Scanner.scan``(testnet/live 는 거래소 자본 기준 ``planned_notional``; 뉴스 조회는 4 뒤로 미룬다) → 마크 갱신,
+   equity·peak 갱신, 낙폭 사다리(−6% 이면 ``set_kill("drawdown_stop_all")`` + notify) → 일별 자본 곡선 기록 →
+   testnet/live 거래소 잔고 대사(유령 포지션 정리).
+4. **코드 청산**: 보유마다 ``risk.check_exits`` → market_sell → ``close_position`` → ``save`` → notify(exit).
+   모든 매도가 끝난 뒤 저널 사후분석(LLM, 실패 무시) → notify(사후분석 문구) → 뉴스 조회(뉴스 피드가 없으면 묵은
+   headline_polarity 제거) → 저널 일일 리뷰(00:05 UTC 이후 첫 사이클). LLM 호출·느린 피드가 손절 매도를 늦추지 않게
+   이 순서를 지킨다.
 5. G0(새 중단·해제는 notify). 실패면 결정 로그·보고서 쓰고 종료(LLM 0회).
 6. ``run_pipeline``. ``BudgetExceeded``(→ ``PipelineResult.budget_exceeded``) → ``pause_llm(다음 UTC 자정)`` +
    notify(budget_exceeded); 인증 오류 기권 다수 → ``pause_llm(60분)`` + notify(llm_paused).
@@ -39,6 +41,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -57,6 +60,7 @@ from tradingbot import gates as G
 from tradingbot import journal as J
 from tradingbot import reports
 from tradingbot import risk
+from tradingbot import fsutil
 from tradingbot.agents import payloads as P
 from tradingbot.agents.pipeline import (
     HEALTH_FLAG_MAX,
@@ -304,6 +308,8 @@ class _Run:
         self.rollover: str | None = None
         self.review: str | None = None
         self.budget_exceeded = False
+        # 매도 체결 뒤 미룬 사후분석(LLM)·저널 기록: (거래, 부분 청산 여부, 주문 ID). 모든 매도가 끝난 뒤 처리한다.
+        self.pending_reviews: list[tuple[ClosedTrade, bool, str | None]] = []
 
 
 # ======================================================================= Cycle
@@ -547,6 +553,27 @@ class Cycle:
             self._clear_tone()
         return self._last_market_tone
 
+    def _can_defer_news(self) -> bool:
+        """스캐너가 뉴스 조회를 코드 청산 뒤로 미룰 수 있나(``scan(include_news=...)`` + ``fetch_news``).
+
+        테스트 대역 스캐너는 대개 둘 다 없다 → 예전처럼 스캔 안에서 뉴스까지 받는다.
+        """
+        scan = getattr(self.scanner, "scan", None)
+        if not callable(scan) or not callable(getattr(self.scanner, "fetch_news", None)):
+            return False
+        try:
+            return "include_news" in inspect.signature(scan).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _fetch_news_after_exits(self, run: _Run) -> None:
+        """코드 청산 뒤에 뉴스를 받아 ``run.scan`` 에 채운다(파이프라인·경보는 그 뒤에 쓴다)."""
+        scan = run.scan
+        if scan is None:
+            return
+        items = list(self.scanner.fetch_news(list(scan.universe)))
+        run.scan = scan.model_copy(update={"news": items, "news_available": bool(items)})
+
     def _apply_news_availability(self, run: _Run) -> None:
         """뉴스 피드가 없으면(news_available=False) 묵은 톤을 지우고 종합심리에서 headline_polarity 를 뺀다."""
         scan = run.scan
@@ -593,7 +620,7 @@ class Cycle:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(self._series, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-            os.replace(tmp, p)
+            fsutil.replace(tmp, p)
         except OSError as exc:
             # 보조 상태 — 사이클을 멈추지 않는다
             run.errors.append(f"equity_series_save: {type(exc).__name__}")
@@ -794,7 +821,7 @@ class Cycle:
                     os.fsync(f.fileno())
                 except OSError:  # 일부 파일시스템은 fsync 미지원
                     pass
-            os.replace(tmp, p)
+            fsutil.replace(tmp, p)
             _fsync_dir(p.parent)
         except OSError as exc:
             # 보조 상태 — 사이클을 멈추지 않는다(다음 사이클에 같은 경보가 다시 갈 수는 있다)
@@ -1095,15 +1122,23 @@ class Cycle:
         planned = self._planned_notional()
         if planned is not None:
             scan_kw["planned_notional"] = planned
+        defer_news = self._can_defer_news()
+        if defer_news:
+            scan_kw["include_news"] = False
         run.scan = self._stage(run, "scan", lambda: self.scanner.scan(self.state, run.now_ms, **scan_kw))
-        self._stage(run, "news_tone", lambda: self._apply_news_availability(run))
+        if not defer_news:
+            self._stage(run, "news_tone", lambda: self._apply_news_availability(run))
         self._stage(run, "marks", lambda: self._update_marks(run))
         self._stage(run, "equity_series", lambda: self._record_day_point(run))
         self._stage(run, "exchange_reconcile", lambda: self._reconcile_exchange(run))
-        self._stage(run, "daily_review", lambda: self._maybe_daily_review(run))
 
-        # 4. 코드 청산
+        # 4. 코드 청산 — 손절·익절·시간손절을 LLM 호출(사후분석·일일 리뷰)·뉴스 조회보다 먼저 집행한다
         self._stage(run, "code_exits", lambda: self._code_exits(run))
+        self._stage(run, "post_trade", lambda: self._drain_reviews(run))
+        if defer_news:
+            self._stage(run, "news", lambda: self._fetch_news_after_exits(run))
+            self._stage(run, "news_tone", lambda: self._apply_news_availability(run))
+        self._stage(run, "daily_review", lambda: self._maybe_daily_review(run))
 
         # 5. G0
         g0 = self._stage(run, "g0", lambda: self._g0(run))
@@ -1136,6 +1171,8 @@ class Cycle:
             log.info("G0 차단 — LLM 0회: %s", "; ".join(g0.reasons))
         elif run.scan is None:
             run.skipped.append("pipeline:no_scan")
+        # 총괄 SELL 의 사후분석도 모든 매도가 끝난 뒤
+        self._stage(run, "post_trade", lambda: self._drain_reviews(run))
 
         # 8. 결정 로그·보고서·저장
         self.state.last_cycle_ts = run.now_ms
@@ -1182,8 +1219,14 @@ class Cycle:
                 continue
             events.append((info["ts"], order, kind, info))
         events.sort()
+        # CLEAR 보다 오래된 STOP 은 적용하지 않는다(지우기만): clear-stop 이 STOP 을 지우지 못한 채 남았거나
+        # stop → clear-stop 이 한 사이클 안에 왔을 때, 옛 STOP 이 낙폭 정지 사유를 덮어써 해제를 망치지 않게.
+        latest_clear = max((ts for ts, _, kind, _ in events if kind == "clear"), default=None)
         pending: list[TradeEvent] = []
-        for _, _, kind, info in events:
+        for ts, _, kind, info in events:
+            if kind == "stop" and latest_clear is not None and ts <= latest_clear:
+                log.info("CLEAR 보다 오래된 STOP 은 적용하지 않고 지웁니다")
+                continue
             if kind == "stop":
                 reason = f"manual_stop: {info.get('reason') or '사유 없음'}"
                 if not self.state.kill_switch or self.state.kill_reason != reason:
@@ -1215,7 +1258,7 @@ class Cycle:
 
     def _unlink_control(self, path: Path, kind: str, ts: int) -> None:
         try:
-            path.unlink(missing_ok=True)
+            fsutil.unlink(path)
             self._consumed_control.pop(kind, None)
         except OSError as exc:
             self._consumed_control[kind] = int(ts)
@@ -1260,7 +1303,8 @@ class Cycle:
         if last is not None and last >= yesterday:
             return
         trades = list(self.state.closed_trades)
-        if last is None and not trades:
+        # 일일 리뷰는 코드 청산 뒤에 돈다 — 이번 사이클(오늘) 청산은 '첫 가동' 판정에 넣지 않는다
+        if last is None and not any(_utc_date(t.closed_ts) <= yesterday for t in trades):
             J.start_new_day(js, yesterday)        # 첫 가동: 리뷰할 것이 없다
             self._save_journal(run)
             return
@@ -1533,14 +1577,29 @@ class Cycle:
             self._notify(ev.model_copy(update={"extra": {**ev.extra, "state_saved": False}}))
             raise
         self._notify(ev)
-        review_text = self._post_trade(run, trade, partial)
-        if review_text and not partial:
-            # notify 가 extra.post_trade_review + follow_up 을 '📝 사후분석' 전용 메시지로 렌더한다
-            self._notify(self._event(
-                "exit", run, symbol=symbol, side="sell", base_amount=trade.base_amount, price=trade.exit_price,
-                pnl_quote=trade.pnl_quote, pnl_pct=trade.pnl_pct, reason=trade.reason,
-                extra={"post_trade_review": review_text, "follow_up": True, "order_id": fill.order_id}))
+        # 사후분석(LLM 호출 — 응답이 늦으면 수십 초)은 이 사이클의 모든 매도가 끝난 뒤 _drain_reviews 가 한다:
+        # 손절이 여러 개 걸린 사이클에서 앞 거래의 사후분석이 다음 손절 매도를 늦추지 않게.
+        run.pending_reviews.append((trade, partial, fill.order_id))
         return trade
+
+    def _drain_reviews(self, run: _Run) -> None:
+        """미룬 사후분석·저널 기록을 순서대로 처리하고 '📝 사후분석' 후속 알림을 보낸다(거래별 실패는 서로 막지 않음)."""
+        while run.pending_reviews:
+            trade, partial, order_id = run.pending_reviews.pop(0)
+            try:
+                review_text = self._post_trade(run, trade, partial)
+            except _FATAL:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 한 거래의 사후분석 실패가 다른 거래 기록을 막지 않게
+                run.errors.append(f"post_trade:{trade.symbol}: {type(exc).__name__}")
+                log.error("사후분석 실패 %s type=%s", trade.symbol, type(exc).__name__)
+                continue
+            if review_text and not partial:
+                # notify 가 extra.post_trade_review + follow_up 을 '📝 사후분석' 전용 메시지로 렌더한다
+                self._notify(self._event(
+                    "exit", run, symbol=trade.symbol, side="sell", base_amount=trade.base_amount,
+                    price=trade.exit_price, pnl_quote=trade.pnl_quote, pnl_pct=trade.pnl_pct, reason=trade.reason,
+                    extra={"post_trade_review": review_text, "follow_up": True, "order_id": order_id}))
 
     def _post_trade(self, run: _Run, trade: ClosedTrade, partial: bool) -> str | None:
         """저널 사후분석·기록·심볼 정리. 전량 청산이면 텔레그램용 사후분석 문구(LLM 또는 코드 요약)를 돌려준다."""

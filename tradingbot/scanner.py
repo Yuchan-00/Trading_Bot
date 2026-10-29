@@ -44,6 +44,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from tradingbot import indicators as ind_mod
+from tradingbot import fsutil
 from tradingbot import news as news_mod
 from tradingbot import quality as quality_mod
 from tradingbot.config import HardLimits, Settings
@@ -538,7 +539,7 @@ class Scanner:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(payload)
-                os.replace(tmp, path)
+                fsutil.replace(tmp, path)
             except BaseException:
                 try:
                     os.unlink(tmp)
@@ -690,12 +691,18 @@ class Scanner:
             return []
 
     # ------------------------------------------------------------ 본체
+    def fetch_news(self, symbols: Sequence[str]) -> list[NewsItem]:
+        """뉴스 피드 조회(예외를 던지지 않는다). ``scan(include_news=False)`` 뒤에 따로 부를 때 쓴다."""
+        return self._fetch_news(symbols)
+
     def scan(self, state: BotState, now_ms: int, *, headline_polarity: float | None = None,
-             planned_notional: float | None = None) -> ScanResult:
+             planned_notional: float | None = None, include_news: bool = True) -> ScanResult:
         """한 사이클 스캔. 어떤 종목 실패도 전파하지 않는다.
 
         ``headline_polarity``: news_sentiment 결과(−1..1). 없으면 None(종합심리에서 빠짐).
         ``planned_notional``: 리스크 팩 충격 추정용 계획 주문액. 없으면 추정 자본×MAX_POSITION_PCT.
+        ``include_news=False``: 뉴스 피드를 조회하지 않는다(``news=[]``). 사이클은 코드 청산(손절·익절)을 먼저
+        끝낸 뒤 :meth:`fetch_news` 로 따로 가져온다 — 느리거나 멈춘 피드가 손절 매도를 늦추지 않게.
         """
         now_ms = int(now_ms)
         th = self.thresholds
@@ -830,8 +837,8 @@ class Scanner:
         # 종합심리
         sentiment = self._sentiment(ok, universe, now_ms, headline_polarity)
 
-        # 뉴스
-        news_items = self._fetch_news(universe)
+        # 뉴스(사이클은 코드 청산 뒤로 미룬다 — include_news=False)
+        news_items = self._fetch_news(universe) if include_news else []
 
         self._save_history()
 
@@ -841,9 +848,9 @@ class Scanner:
             flow_packs=flow_packs, risk_packs=risk_packs, liquidity=liquidity, quality=qualities,
             news=news_items, news_available=bool(news_items), marks=marks, fetched=fetched,
         )
-        log.info("스캔 완료: 유니버스 %d, 정상 %d, 후보 %s, 제외 %d, 레짐 %s, 펀딩창 %s, 뉴스 %d",
+        log.info("스캔 완료: 유니버스 %d, 정상 %d, 후보 %s, 제외 %d, 레짐 %s, 펀딩창 %s, 뉴스 %s",
                  len(universe), len(ok), [c.symbol for c in candidates], len(skipped), regime.verdict,
-                 funding_window, len(news_items))
+                 funding_window, len(news_items) if include_news else "나중에 조회")
         return result
 
     def _exclusion_reason(self, state: BotState, sym: str, whitelist: Sequence[str], gate: LiquidityGate,

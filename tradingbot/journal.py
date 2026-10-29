@@ -31,6 +31,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from tradingbot import fsutil
 from tradingbot.agents.schemas import (
     BearOutput,
     BullOutput,
@@ -187,7 +188,7 @@ def load_journal_state(data_dir: Path | str) -> JournalState:
     except (OSError, ValueError, ValidationError) as exc:
         target = p.with_name(f"{p.name}.corrupt-{int(time.time() * 1000)}")
         try:
-            os.replace(p, target)
+            fsutil.replace(p, target)
         except OSError:
             target = p
         log.error("저널 상태 손상 — 격리 후 새 상태로 시작: %s (%s)", target, type(exc).__name__)
@@ -208,7 +209,7 @@ def save_journal_state(state: JournalState, data_dir: Path | str) -> Path:
                 os.fsync(fh.fileno())
             except OSError:
                 pass
-        os.replace(tmp, p)
+        fsutil.replace(tmp, p)
     except OSError:
         try:
             if tmp.exists():
@@ -225,8 +226,7 @@ def append_journal_log(data_dir: Path | str, record: Mapping[str, Any]) -> Path:
     p = Path(data_dir) / "logs" / JOURNAL_LOG_FILE
     p.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(_jsonable(record), sort_keys=True, ensure_ascii=False)
-    with open(p, "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    fsutil.append_bytes(p, (line + "\n").encode("utf-8"))   # LF 줄바꿈 + Windows 공유 위반 재시도
     return p
 
 

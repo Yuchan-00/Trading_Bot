@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 import feedparser
 
+from . import fsutil
 from .models import NewsItem
 
 log = logging.getLogger("tradingbot.news")
@@ -304,7 +305,7 @@ def _save_cache(path: Path | None, cache: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(cache, sort_keys=True, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        fsutil.replace(tmp, path)
     except Exception as e:
         log.warning("뉴스 캐시 쓰기 실패 %s: %s", path, type(e).__name__)
 

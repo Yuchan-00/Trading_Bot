@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from tradingbot import indicators
+from tradingbot import fsutil
 from tradingbot.config import HardLimits
 from tradingbot.models import Candle, ClosedTrade, ExitReason, IndicatorSet, Position
 from tradingbot.risk import check_exits, clamp_stops, default_stops, enforce_net_rr, size_position
@@ -853,7 +854,7 @@ def _save_cache(path: Path, candles: Sequence[Candle]) -> None:
             json.dumps([c.model_dump() for c in candles], sort_keys=True, ensure_ascii=False),
             encoding="utf-8",
         )
-        tmp.replace(path)
+        fsutil.replace(tmp, path)
     except OSError as e:
         log.warning("캐시 쓰기 실패 %s: %s", path, e)
 
@@ -1045,7 +1046,7 @@ def _write_run_card(out_dir: Path, result: BacktestResult) -> tuple[Path, Path]:
 def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    fsutil.replace(tmp, path)
 
 
 def render_markdown(result: BacktestResult) -> str:

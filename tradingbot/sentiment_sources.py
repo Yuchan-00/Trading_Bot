@@ -23,6 +23,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from tradingbot import fsutil
+
 log = logging.getLogger("tradingbot.sentiment_sources")
 
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
@@ -166,7 +168,7 @@ class FearGreedFetcher:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.cache_path.with_name(self.cache_path.name + ".tmp")
             tmp.write_text(json.dumps({"value": value, "fetched_ts": ts}), encoding="utf-8")
-            os.replace(tmp, self.cache_path)
+            fsutil.replace(tmp, self.cache_path)
         except Exception as e:
             log.warning("fear&greed 캐시 저장 실패: %s", type(e).__name__)
 

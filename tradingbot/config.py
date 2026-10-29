@@ -5,12 +5,18 @@
 """
 from __future__ import annotations
 
+import codecs
+import io
+import locale
+import logging
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Literal
+
+log = logging.getLogger("tradingbot.config")
 
 Mode = Literal["paper", "testnet", "live"]
 Tier = Literal["analysis", "research", "head"]
@@ -99,6 +105,8 @@ class Settings:
     dashboard_port: int
     data_dir: Path
     news_feeds: tuple[str, ...]
+    log_file: Path | None = None                     # LOG_FILE(상대 경로면 DATA_DIR 기준). None 이면 콘솔만
+    scanner_env: tuple[tuple[str, str], ...] = ()    # SCANNER_* 원문(.env 포함) → scanner.Thresholds.from_env
 
     _SECRET_FIELDS = ("anthropic_api_key", "binance_api_key", "binance_api_secret", "telegram_bot_token")
 
@@ -217,26 +225,162 @@ def _feeds(raw: str) -> tuple[str, ...]:
     return feeds
 
 
-def read_env(dotenv_path: Path | None = None) -> dict[str, str]:
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
+_PERCENT_VAR = re.compile(r"%[A-Za-z_][A-Za-z0-9_()]*%")
+_WARNED_OVERRIDES: set[tuple[str, ...]] = set()
+
+
+def dotenv_location(dotenv_path: Path | None = None) -> tuple[Path, bool]:
+    """읽을 .env 의 절대 경로(기본: 현재 작업 폴더의 ``.env``)와 존재 여부."""
+    path = dotenv_path if dotenv_path is not None else Path(".env")
+    return Path(os.path.abspath(path)), path.is_file()
+
+
+def _decode_dotenv(data: bytes, path: Path, *, lenient: bool, warnings: list[str]) -> str:
+    """.env 바이트 → 텍스트. Windows 도구가 만든 인코딩을 알아보고, 모르는 것은 분명한 오류로 알린다.
+
+    - UTF-8(BOM 있든 없든) → 그대로. BOM 은 버린다(python-dotenv 1.2.2 이하는 첫 키에 BOM 이 붙는다).
+    - UTF-16 BOM(Windows PowerShell 5.1 의 ``>`` / ``Out-File``) → 풀어서 쓰되 경고.
+    - NUL 바이트(BOM 없는 UTF-16 — PowerShell 5.1 ``>>`` 로 덧붙인 줄) → strict 는 ``ConfigError``, lenient 는 NUL 을
+      지우고 경고(키가 조용히 사라지지 않게).
+    - UTF-8 이 아님(메모장 ANSI = cp949 로 저장한 한글 주석 등) → strict 는 줄 번호를 담은 ``ConfigError``,
+      lenient 는 로캘 인코딩(한국어 Windows 는 cp949)으로 읽고 경고.
+    """
+    fix = "메모장에서 '다른 이름으로 저장' → 인코딩 'UTF-8' 로 다시 저장하세요"
+    if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
+        try:
+            text = data.decode("utf-16")
+        except UnicodeDecodeError as e:
+            raise ConfigError(f"{path}: UTF-16 으로 저장됐지만 읽을 수 없습니다 — {fix}") from e
+        msg = f"{path}: UTF-16 으로 저장돼 있습니다(PowerShell '>' 로 만든 파일) — {fix}"
+        warnings.append(msg)
+        return text
+    if b"\x00" in data:
+        line = data[:data.index(b"\x00")].count(b"\n") + 1
+        msg = (f"{path} {line}번째 줄 근처에 NUL 바이트가 있습니다 — Windows PowerShell 5.1 의 '>'·'>>' 는 UTF-16 으로 "
+               f"씁니다. {fix}")
+        if not lenient:
+            raise ConfigError(msg)
+        warnings.append(msg)
+        data = data.replace(b"\x00", b"")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        line = data[:e.start].count(b"\n") + 1
+        msg = f"{path} {line}번째 줄이 UTF-8 이 아닙니다(ANSI/cp949 로 저장된 듯) — {fix}"
+        if not lenient:
+            raise ConfigError(msg) from e
+        warnings.append(msg)
+        enc = locale.getpreferredencoding(False) or "utf-8"
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            return data.decode("utf-8", errors="replace")
+
+
+def _dotenv_items(path: Path, *, lenient: bool, warnings: list[str]) -> dict[str, str]:
+    """.env 를 읽어 {키: 값}. 해석하지 못한 줄(닫히지 않은 따옴표 — 예: ``DATA_DIR="X:\\data\\"`` 는 닫는 따옴표가
+    역슬래시로 이스케이프돼 다음 줄들까지 삼킨다)은 strict 면 ``ConfigError``, lenient 면 경고."""
+    try:
+        from dotenv import dotenv_values
+        from dotenv.parser import parse_stream
+    except ImportError:  # pragma: no cover - 의존성은 requirements 에 있음
+        return {}
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        msg = f"{path} 를 읽지 못했습니다({type(e).__name__})"
+        if not lenient:
+            raise ConfigError(msg) from e
+        warnings.append(msg)
+        return {}
+    text = _decode_dotenv(data, path, lenient=lenient, warnings=warnings)
+    for binding in parse_stream(io.StringIO(text)):
+        if getattr(binding, "error", False):
+            orig = getattr(binding, "original", None)
+            line = getattr(orig, "line", "?")
+            head = (getattr(orig, "string", "") or "").split("\n", 1)[0].split("=", 1)[0].strip()[:40]
+            msg = (f"{path} {line}번째 줄({head or '?'}=…)을 해석하지 못했습니다 — 닫히지 않은 따옴표이거나 따옴표 안의 "
+                   "값이 역슬래시(\\)로 끝납니다. 경로는 따옴표 없이 쓰거나 B:/TradingBot/data 처럼 / 를 쓰세요"
+                   "(그 줄 뒤의 설정이 함께 무시될 수 있습니다)")
+            if not lenient:
+                raise ConfigError(msg)
+            warnings.append(msg)
+    dotenv_log = logging.getLogger("dotenv.main")
+    prev_disabled = dotenv_log.disabled
+    dotenv_log.disabled = True      # 위에서 이미 한국어로 알렸다(라이브러리의 영어 경고 중복 방지)
+    try:
+        values = dotenv_values(stream=io.StringIO(text))
+    finally:
+        dotenv_log.disabled = prev_disabled
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def read_env(dotenv_path: Path | None = None, *, lenient: bool = False,
+             warnings: list[str] | None = None) -> dict[str, str]:
     """os.environ 위에 .env(기본 ``./.env``)를 얹은 사본. 이미 있는 환경변수가 우선한다.
 
-    검증은 하지 않는다 — ``load_settings`` 가 실패해도 ``DATA_DIR`` 같은 값만 꺼내 쓸 때(CLI stop/status) 쓴다.
+    값 검증은 하지 않는다 — ``load_settings`` 가 실패해도 ``DATA_DIR`` 같은 값만 꺼내 쓸 때(CLI stop/status) 쓴다.
+    파일 자체가 깨졌으면(인코딩·해석 실패) 기본은 ``ConfigError``. ``lenient=True``(파일만 읽는 명령)는 최대한
+    읽고 경고를 ``warnings`` 에 담는다. 같은 키가 환경변수와 .env 에 다른 값으로 있으면(창에 남은 ``set``·``$env:``)
+    이름만 한 번 경고한다(값은 쓰지 않는다).
     """
     merged: dict[str, str] = dict(os.environ)
     path = dotenv_path if dotenv_path is not None else Path(".env")
+    sink: list[str] = warnings if warnings is not None else []
     if path.exists():
-        try:
-            from dotenv import dotenv_values
-        except ImportError:  # pragma: no cover - 의존성은 requirements에 있음
-            dotenv_values = None  # type: ignore[assignment]
-        if dotenv_values is not None:
-            for k, v in dotenv_values(path).items():
-                if v is not None and k not in merged:
-                    merged[k] = v
+        items = _dotenv_items(path, lenient=lenient, warnings=sink)
+        overridden: list[str] = []
+        for k, v in items.items():
+            if k in merged:
+                if str(merged[k]).strip() != str(v).strip():
+                    overridden.append(k)
+            else:
+                merged[k] = v
+        if overridden:
+            key = tuple(sorted(overridden))
+            if key not in _WARNED_OVERRIDES:
+                _WARNED_OVERRIDES.add(key)
+                msg = (f"환경변수가 .env 값을 덮어씁니다: {', '.join(key)} — 콘솔 창에 남은 set/$env: 값일 수 있습니다"
+                       "(.env 를 쓰려면 그 환경변수를 지우세요)")
+                if warnings is not None:
+                    warnings.append(msg)
+                else:
+                    log.warning("%s", msg)
+    if warnings is None:
+        for w in sink:
+            log.warning("%s", w)
     return merged
 
 
 _read_env = read_env  # 하위 호환 별칭
+
+
+def parse_data_dir(raw: str | None, *, key: str = "DATA_DIR", default: str = ".") -> Path:
+    """경로 설정값 검사. Windows 경로를 .env 에 쓸 때 생기는 실수를 분명한 오류로 바꾼다.
+
+    - 큰따옴표 안의 ``\\t \\b \\n \\r`` 같은 역슬래시는 python-dotenv 가 이스케이프로 바꾼다 → 제어 문자·따옴표가
+      섞인 값은 ``ConfigError``(그대로 쓰면 엉뚱한 폴더·WinError 123).
+    - ``%USERPROFILE%`` 같은 cmd 변수는 펼쳐지지 않는다 → ``ConfigError``(``${USERPROFILE}`` 은 python-dotenv 가 펼친다).
+    """
+    v = (raw or "").strip()
+    if not v:
+        return Path(default).expanduser()
+    if _CONTROL_CHARS.search(v) or '"' in v:
+        raise ConfigError(
+            f"{key}: 경로에 제어 문자나 따옴표가 섞였습니다({v!r}) — .env 의 큰따옴표 안에서는 \\t \\b \\n \\r 같은 "
+            f"역슬래시가 이스케이프로 바뀝니다. 따옴표 없이 쓰거나 B:/TradingBot/data 처럼 / 를 쓰세요")
+    if _PERCENT_VAR.search(v):
+        raise ConfigError(f"{key}: %변수% 는 펼쳐지지 않습니다({v!r}) — 실제 경로를 쓰거나 ${{USERPROFILE}} 형식을 쓰세요")
+    return Path(v).expanduser()
+
+
+def _log_file(src: Mapping[str, str], data_dir: Path) -> Path | None:
+    raw = _get(src, "LOG_FILE")
+    if not raw or raw.lower() in ("none", "off", "false", "0"):
+        return None
+    p = parse_data_dir(raw, key="LOG_FILE")
+    return p if p.is_absolute() else data_dir / p
 
 
 def load_settings(env: Mapping[str, str] | None = None, *, dotenv_path: Path | None = None) -> Settings:
@@ -246,11 +390,12 @@ def load_settings(env: Mapping[str, str] | None = None, *, dotenv_path: Path | N
     elif dotenv_path is not None:
         merged = dict(env)
         if dotenv_path.exists():
-            from dotenv import dotenv_values
-
-            for k, v in dotenv_values(dotenv_path).items():
-                if v is not None and k not in merged:
+            warnings: list[str] = []
+            for k, v in _dotenv_items(dotenv_path, lenient=False, warnings=warnings).items():
+                if k not in merged:
                     merged[k] = v
+            for w in warnings:
+                log.warning("%s", w)
         src = merged
     else:
         src = env
@@ -280,7 +425,9 @@ def load_settings(env: Mapping[str, str] | None = None, *, dotenv_path: Path | N
     else:
         b_key, b_sec = None, None
 
-    data_dir = Path(_get(src, "DATA_DIR") or ".").expanduser()
+    data_dir = parse_data_dir(_get(src, "DATA_DIR"))
+    log_file = _log_file(src, data_dir)
+    scanner_env = tuple(sorted((k, str(v)) for k, v in src.items() if k.startswith("SCANNER_") and v is not None))
 
     return Settings(
         mode=mode,  # type: ignore[arg-type]
@@ -304,4 +451,6 @@ def load_settings(env: Mapping[str, str] | None = None, *, dotenv_path: Path | N
         dashboard_port=_int(src, "DASHBOARD_PORT", 8787, minimum=1),
         data_dir=data_dir,
         news_feeds=_feeds(_get(src, "NEWS_FEEDS")),
+        log_file=log_file,
+        scanner_env=scanner_env,
     )

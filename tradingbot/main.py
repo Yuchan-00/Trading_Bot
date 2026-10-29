@@ -21,8 +21,13 @@
 - ``bot.lock``(PID) 으로 단일 인스턴스. 기록된 PID 가 살아 있지 않거나, 기록된 호스트가 이 호스트가 아니거나,
   ``ts`` 가 ``max(3 × cycle_minutes × 60, 1800)`` 초보다 오래됐으면 낡은 잠금으로 보고 가져온다.
   루프는 사이클마다, 그리고 사이클 사이 대기 중에도 최대 5분마다 ``ts`` 를 갱신한다.
-- SIGINT/SIGTERM → 진행 중 사이클을 마친 뒤 notify(shutdown) + ``notifier.flush()`` + 잠금 해제.
+- SIGINT/SIGTERM/SIGBREAK(Windows Ctrl+Break) → 진행 중 사이클을 마친 뒤 notify(shutdown) + ``notifier.flush()``
+  + 잠금 해제. 사이클 사이 대기는 1초 조각으로 나눠 기다린다(Windows CPython ≤3.13 은 ``Event.wait`` 가
+  Ctrl+C 로 깨지 않는다).
 - 하트비트 notify(kind ``heartbeat``: 자본·당일 손익·보유 포지션 미실현 %·노출 %·오늘 LLM 비용) 4시간마다.
+- 사이클 사이 공백이 예정 주기의 2배를 넘으면(PC 절전·콘솔 일시정지) 경보(kind ``alert``, ``cycle_gap``).
+- Windows: ``run`` 동안 자동 절전(유휴 타이머)을 막는다(``SetThreadExecutionState``). 로그는 전용 스레드가
+  콘솔에 쓴다(콘솔 창 선택 모드가 쓰기를 막아도 사이클은 계속). ``LOG_FILE`` 이면 UTF-8 로그 파일도 남긴다.
 - ``status`` 는 ``stop``/``clear-stop`` 처럼 설정 검증이 실패해도(키 없음 등) ``DATA_DIR`` 만 풀어 파일 상태를 출력한다.
 
 출력은 ``out``/``err`` 스트림에 쓴다(테스트 주입). 로그는 ``logging.getLogger("tradingbot.main")``.
@@ -30,23 +35,35 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import logging
+import logging.handlers
 import os
+import queue
 import signal
 import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
 from tradingbot import cycle as C
-from tradingbot.config import ConfigError, Settings, load_settings, mask_secret, read_env
+from tradingbot import fsutil
+from tradingbot.config import (
+    ConfigError,
+    Settings,
+    dotenv_location,
+    load_settings,
+    mask_secret,
+    parse_data_dir,
+    read_env,
+)
 from tradingbot.models import BotState, TradeEvent
 
 log = logging.getLogger("tradingbot.main")
@@ -57,6 +74,8 @@ __all__ = [
     "HEARTBEAT_S", "RUN_OFFSET_S", "LIVE_CONFIRM_WORD", "OFFLINE_FIXTURE_DIRNAME", "offline_fixture_settings",
     "LOCK_STALE_MIN_S", "LOCK_REFRESH_S", "LOCK_REFRESH_FAIL_SHARE", "lock_stale_after_s", "heartbeat_event", "FEAR_GREED_CACHE_FILENAME",
     "status_text_from_env", "notify_test", "NOTIFY_TEST_TEXT",
+    "WAIT_POLL_S", "WAKE_OVERDUE_S", "WAKE_SETTLE_S", "CYCLE_GAP_FACTOR", "LOG_FORMAT", "keep_system_awake",
+    "configure_logging", "attach_log_file",
 ]
 
 HEARTBEAT_S = 4 * 3600.0
@@ -73,6 +92,12 @@ LOCK_STALE_CYCLES = 3            # ts 가 이 사이클 수보다 오래되면 �
 LOCK_REFRESH_S = 300.0           # 사이클 사이 대기 중 잠금 ts 갱신 주기(초)
 LOCK_REFRESH_FAIL_SHARE = 0.5    # ts 갱신 실패가 stale_after_s 의 이 비율 이상 이어지면 잠금 상실로 보고 중단
 DEFAULT_CYCLE_MINUTES = 15
+WAIT_POLL_S = 1.0                # 사이클 사이 대기 조각(초) — Windows 에서 Ctrl+C 가 이 안에 반영된다
+WAKE_OVERDUE_S = 120.0           # 대기가 계획보다 이만큼 늦게 끝났으면 PC 절전 복귀로 보고 바로 사이클
+WAKE_SETTLE_S = 20.0             # 절전 복귀 직후 네트워크(Wi-Fi·DHCP)가 돌아올 시간
+CYCLE_GAP_FACTOR = 2.0           # 사이클 간격이 주기의 이 배수를 넘으면 cycle_gap 경보
+PID_REUSE_GRACE_MS = 60_000      # 잠금의 started_ts 보다 이만큼 늦게 생성된 프로세스는 같은 PID 의 다른 프로세스
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 FEAR_GREED_CACHE_FILENAME = "fear_greed.json"
 NOTIFY_TEST_TEXT = "✅ 텔레그램 연결 테스트 [{mode}] — 이 메시지가 보이면 거래 알림이 정상 전송됩니다"
 
@@ -147,6 +172,54 @@ def _pid_alive_windows(pid: int) -> bool:
         return True
 
 
+_FILETIME_EPOCH_OFFSET = 116_444_736_000_000_000   # 1601-01-01 → 1970-01-01, 100ns 단위
+
+
+def _windows_process_identity(pid: int) -> tuple[int | None, str | None]:
+    """Windows: 살아 있는 PID 의 (생성 시각 epoch ms, 실행 파일 이름 소문자). 모르면 각각 None.
+
+    Windows 는 끝난 프로세스의 PID 를 금방 다른 프로세스에 다시 준다. 창 닫기·작업 끝내기로 강제 종료된 봇의
+    ``bot.lock`` PID 를 브라우저 등이 받으면 '살아 있음'으로 보여 재시작이 막히므로, 잠금을 쓴 프로세스인지
+    생성 시각·이미지 이름으로 확인한다. 핸들을 못 열면(보호된 프로세스·다른 사용자) (None, None).
+    """
+    import ntpath
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.OpenProcess.restype = wintypes.HANDLE
+        ft_p = ctypes.POINTER(wintypes.FILETIME)
+        k.GetProcessTimes.argtypes = (wintypes.HANDLE, ft_p, ft_p, ft_p, ft_p)
+        k.GetProcessTimes.restype = wintypes.BOOL
+        k.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                 ctypes.POINTER(wintypes.DWORD))
+        k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k.CloseHandle.restype = wintypes.BOOL
+        handle = k.OpenProcess(0x1000, False, pid)       # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None, None
+        try:
+            created: int | None = None
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if k.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                ft = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                created = (ft - _FILETIME_EPOCH_OFFSET) // 10_000 if ft > _FILETIME_EPOCH_OFFSET else None
+            image: str | None = None
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            if k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                image = ntpath.basename(buf.value).lower() or None
+            return created, image
+        finally:
+            k.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - 판단 불가: 재사용으로 보지 않는다(잠금을 지키는 쪽)
+        return None, None
+
+
 class BotLock:
     """PID 파일 잠금(``<data_dir>/bot.lock``). 내용: ``{"pid","host","ts","started_ts"}`` JSON.
 
@@ -159,19 +232,28 @@ class BotLock:
     - ``refresh()``: 파일의 PID·호스트가 내가 쓴 것인지 확인하고 ``ts`` 를 갱신한다. 아니면 ``cycle.LockLostError``.
       호스트는 **획득 시점의 이름**으로 고정해 기록·비교한다(실행 중 hostname 이 바뀌어도 — macOS Bonjour 이름 변경,
       DHCP — 내 잠금을 잃었다고 오판하지 않는다). ``ts`` 쓰기가 마지막 성공 이후 ``stale_after_s × LOCK_REFRESH_FAIL_SHARE``
-      이상 계속 실패하면 ``LockLostError``(다른 인스턴스가 곧 낡은 잠금으로 보고 가져갈 수 있으므로 치명 처리);
-      그 전의 실패는 원래 예외를 올린다(호출자가 WARNING 후 다음에 다시 시도).
-    - ``release()``: 내 잠금일 때만 삭제한다.
+      이상 계속 실패하고 그 실패가 **연속 2회 이상**이면 ``LockLostError``(다른 인스턴스가 곧 낡은 잠금으로 보고
+      가져갈 수 있으므로 치명 처리). PC 절전 복귀 직후 한 번의 일시 실패는 치명으로 보지 않는다 — 그 전의 실패는
+      원래 예외를 올린다(호출자가 WARNING 후 다음에 다시 시도).
+    - ``release()``: 내 잠금일 때만 삭제한다. 삭제 실패는 경고만(다음 실행이 낡은 잠금으로 가져간다).
+    - Windows: 파일 교체·삭제는 공유 위반(다른 프로세스가 파일을 읽는 중)이면 잠시 재시도한다(``fsutil``).
+      PID 가 살아 있어도 잠금을 쓴 프로세스가 아니면(생성 시각이 ``started_ts`` 보다 늦거나 실행 파일 이름이
+      ``image`` 와 다름 — PID 재사용) 낡은 잠금으로 본다(``pid_alive`` 를 주입하면 이 검사는 쓰지 않는다).
+    - ``took_over``: ``acquire()`` 가 낡은 잠금을 가져왔으면 그 정보(``pid``·``reason``·``ts``), 아니면 None.
 
     ``stale_after_s`` 기본값은 ``lock_stale_after_s(15)``(= 2700초). ``run`` 은 ``cycle_minutes`` 로 계산해 넘긴다.
     """
 
     def __init__(self, path: Path, *, pid: int | None = None, pid_alive: Callable[[int], bool] | None = None,
                  clock_ms: Callable[[], int] | None = None, stale_after_s: float | None = None,
-                 hostname: Callable[[], str] | None = None) -> None:
+                 hostname: Callable[[], str] | None = None,
+                 process_identity: Callable[[int], tuple[int | None, str | None]] | None = None) -> None:
         self.path = Path(path)
         self.pid = int(pid if pid is not None else os.getpid())
         self._alive = pid_alive or _pid_alive
+        if process_identity is None and pid_alive is None and os.name == "nt":
+            process_identity = _windows_process_identity
+        self._identity = process_identity
         self._clock = clock_ms or (lambda: int(time.time() * 1000))
         self._hostname = hostname or socket.gethostname
         self.stale_after_s = float(stale_after_s) if stale_after_s is not None \
@@ -179,7 +261,10 @@ class BotLock:
         self.held = False
         self._started = 0
         self._host: str | None = None        # 획득 시점에 고정한 호스트 이름(기록·비교용)
+        self._image: str | None = None       # 획득 시점의 내 실행 파일 이름(Windows, PID 재사용 판별용)
         self._last_ok_ms: int | None = None  # 마지막으로 ts 쓰기에 성공한 시각
+        self._fails = 0                      # 연속 ts 쓰기 실패 횟수
+        self.took_over: dict | None = None
 
     def _my_host(self) -> str:
         try:
@@ -223,6 +308,33 @@ class BotLock:
             return f"다른 호스트({foreign})의 잠금, 갱신 시각 없음"
         return None
 
+    def pid_reused(self, info: dict | None) -> str | None:
+        """기록된 PID 가 살아 있지만 잠금을 쓴 프로세스가 아니면 그 이유(Windows 전용; 모르면 None).
+
+        - 실행 파일 이름이 잠금의 ``image`` 와 다름(예: msedge.exe 가 PID 를 받음)
+        - 프로세스 생성 시각이 잠금의 ``started_ts`` + ``PID_REUSE_GRACE_MS`` 보다 늦음(잠금을 쓴 프로세스는
+          잠금보다 먼저 생성됐다 — 다른 python.exe 가 PID 를 받은 경우도 잡는다)
+        판단할 수 없으면(핸들을 못 엶 등) None — 잠금을 지키는 쪽.
+        """
+        if self._identity is None or not info:
+            return None
+        pid = info.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        try:
+            created, image = self._identity(pid)
+        except Exception:  # noqa: BLE001
+            return None
+        rec_image = info.get("image")
+        if isinstance(rec_image, str) and rec_image and isinstance(image, str) and image \
+                and image.lower() != rec_image.lower():
+            return f"PID 재사용(현재 {image}, 잠금 {rec_image})"
+        started = info.get("started_ts")
+        if isinstance(started, int) and not isinstance(started, bool) and started > 0 \
+                and isinstance(created, int) and created > started + PID_REUSE_GRACE_MS:
+            return "PID 재사용(잠금 이후 생성된 프로세스)"
+        return None
+
     def holder(self) -> dict | None:
         """현재 잠금 내용(없으면 None, 깨졌으면 ``{"pid": None, "corrupt": True}``)."""
         try:
@@ -244,13 +356,22 @@ class BotLock:
 
     def _content(self) -> str:
         host = self._host if self._host is not None else self._my_host()
-        return json.dumps({"pid": self.pid, "host": host, "ts": self._clock(),
-                           "started_ts": self._started}, sort_keys=True, ensure_ascii=False)
+        info: dict[str, Any] = {"pid": self.pid, "host": host, "ts": self._clock(), "started_ts": self._started}
+        if self._image:
+            info["image"] = self._image
+        return json.dumps(info, sort_keys=True, ensure_ascii=False)
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._started = self._clock()
         self._host = self._my_host()
+        if self._identity is not None and self.pid == os.getpid():
+            try:
+                self._image = self._identity(self.pid)[1]
+            except Exception:  # noqa: BLE001
+                self._image = None
+        self.took_over = None
+        created = False
         for attempt in range(2):
             try:
                 fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -263,30 +384,47 @@ class BotLock:
                     break                       # 이미 내 잠금(재진입)
                 # 다른 호스트의 PID 는 이 호스트에서 검사할 수 없다 → 신선한 ts 가 유일한 생존 신호
                 alive = foreign is not None or (other is not None and self._alive(other))
+                if alive and stale is None and foreign is None:
+                    stale = self.pid_reused(info)
                 if alive and stale is None:
                     where = f", host={foreign}" if foreign else ""
-                    raise LockHeldError(f"다른 인스턴스가 실행 중입니다 (pid={other}{where}, lock={self.path})")
+                    raise LockHeldError(
+                        f"다른 인스턴스가 실행 중입니다 (pid={other}{where}, lock={self.path}) — 실행 중인 봇이 "
+                        f"정말 없다면 그 파일을 지우고 다시 실행하세요")
                 why = stale if stale is not None else "살아 있지 않음"
                 log.warning("낡은 잠금 파일을 가져옵니다 (기록 pid=%s, %s): %s", other, why, self.path)
-                try:
-                    self.path.unlink()
-                except FileNotFoundError:
-                    pass
+                self.took_over = {"pid": other, "reason": why,
+                                  "ts": info.get("ts") if isinstance(info, dict) else None}
+                fsutil.unlink(self.path)
                 if attempt == 1:
                     raise LockHeldError(f"잠금을 얻지 못했습니다: {self.path}")
                 continue
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(self._content())
+            created = True
             break
         self.held = True
-        self._write()
+        if created:
+            self._last_ok_ms = self._clock()
+            self._fails = 0
+        else:
+            try:
+                self._write()                   # 재진입: ts 만 새로 쓴다
+            except OSError as exc:
+                log.warning("잠금 ts 갱신 실패(%s) — 첫 사이클에서 다시 시도합니다: %s", type(exc).__name__, self.path)
         log.info("잠금 획득 pid=%d path=%s", self.pid, self.path)
 
     def _write(self) -> None:
         tmp = self.path.with_name(f".{self.path.name}.{self.pid}.tmp")
-        tmp.write_text(self._content(), encoding="utf-8")
-        os.replace(tmp, self.path)
+        try:
+            tmp.write_text(self._content(), encoding="utf-8")
+            fsutil.replace(tmp, self.path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
         self._last_ok_ms = self._clock()
+        self._fails = 0
 
     def refresh(self) -> None:
         info = self.holder()
@@ -299,11 +437,14 @@ class BotLock:
         try:
             self._write()
         except Exception as exc:  # noqa: BLE001 - 디스크 가득 참·tmp 경로 쓰기 불가 등
+            self._fails += 1
             now = self._clock()
             since = self._last_ok_ms if self._last_ok_ms is not None else self._started
             failing_s = (float(now) - float(since)) / 1000.0 if since else 0.0
             limit_s = self.stale_after_s * LOCK_REFRESH_FAIL_SHARE
-            if failing_s >= limit_s:
+            # 연속 2회 이상: PC 절전 복귀 직후 한 번의 일시 실패(마지막 성공이 절전 전이라 failing_s 가 큼)는
+            # 치명으로 보지 않고, 다음 갱신(최대 1 사이클 뒤)이 판단한다.
+            if failing_s >= limit_s and self._fails >= 2:
                 raise C.LockLostError(
                     f"잠금 ts 갱신이 {failing_s:.0f}초째 실패({type(exc).__name__}) — 기준 {limit_s:.0f}초 초과, "
                     f"다른 인스턴스가 낡은 잠금으로 볼 수 있어 중단: {self.path}") from exc
@@ -315,9 +456,10 @@ class BotLock:
         info = self.holder()
         if info is not None and info.get("pid") == self.pid:
             try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+                fsutil.unlink(self.path)
+            except OSError as exc:
+                # 지우지 못해도 다음 실행이 죽은 PID 의 낡은 잠금으로 보고 가져간다
+                log.warning("잠금 파일 삭제 실패(%s): %s", type(exc).__name__, self.path)
         self.held = False
         log.info("잠금 해제 pid=%d", self.pid)
 
@@ -357,9 +499,13 @@ def build_components(settings: Settings, *, lock: BotLock | None = None, offline
     from tradingbot.llm.cost import CostLedger
     from tradingbot.notify import Notifier, TelegramTransport
     from tradingbot.portfolio import Portfolio
-    from tradingbot.scanner import Scanner
+    from tradingbot.scanner import Scanner, Thresholds
     from tradingbot.skills import SkillRegistry
 
+    if settings.mode == "live" and settings.agent_backend == "mock":
+        # 창에 남은 AGENT_BACKEND=mock(set/$env:)이 .env 를 덮으면 가짜 판단으로 실제 주문이 나간다
+        raise ConfigError("MODE=live 에서는 AGENT_BACKEND=mock 을 쓸 수 없습니다(가짜 판단으로 실제 주문) — "
+                          "환경변수 AGENT_BACKEND 를 지우거나 anthropic 으로 두세요")
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     if offline_fixture:
@@ -398,8 +544,14 @@ def build_components(settings: Settings, *, lock: BotLock | None = None, offline
         from tradingbot.sentiment_sources import FearGreedFetcher
 
         fear_greed = FearGreedFetcher(cache_path=data_dir / C.CACHE_DIRNAME / FEAR_GREED_CACHE_FILENAME)
+    # SCANNER_* 는 Settings 와 같은 출처(os.environ 위에 .env)에서 — 없으면 Scanner 기본(os.environ)
+    scanner_env = dict(getattr(settings, "scanner_env", ()) or ())
+    thresholds = Thresholds.from_env(scanner_env) if scanner_env else None
+    if thresholds is not None and thresholds != Thresholds():
+        log.info("스캐너 임계값(설정 반영): %s", {k: v for k, v in dataclasses.asdict(thresholds).items()
+                                         if v != getattr(Thresholds(), k)})
     scanner = Scanner(settings, market, news_fetcher=None if offline_fixture else news.default_fetcher,
-                      fear_greed_fetcher=fear_greed, cache_dir=data_dir / C.CACHE_DIRNAME)
+                      fear_greed_fetcher=fear_greed, cache_dir=data_dir / C.CACHE_DIRNAME, thresholds=thresholds)
     cycle = C.Cycle(settings, market, broker, portfolio, backend, ledger, notifier, skills, scanner=scanner, lock=lock)
     return Components(settings, market, broker, portfolio, backend, ledger, notifier, skills, cycle)
 
@@ -449,7 +601,11 @@ def next_run_ts(now_s: float, cycle_minutes: int, offset_s: float = RUN_OFFSET_S
 
 
 def install_signal_handlers(stop_event: threading.Event) -> dict:
-    """SIGINT/SIGTERM → ``stop_event.set()``. 이전 핸들러를 돌려준다(메인 스레드가 아니면 빈 dict)."""
+    """SIGINT/SIGTERM/SIGBREAK → ``stop_event.set()``. 이전 핸들러를 돌려준다(메인 스레드가 아니면 빈 dict).
+
+    SIGBREAK 는 Windows 의 Ctrl+Break(기본 처리는 즉시 강제 종료 — 종료 알림·잠금 해제 없음). 다른 OS 에는 없다.
+    콘솔 창 닫기·작업 끝내기·로그오프는 잡을 수 없다(즉시 종료; 다음 실행이 낡은 잠금을 가져간다).
+    """
     prev: dict = {}
 
     def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
@@ -458,7 +614,7 @@ def install_signal_handlers(stop_event: threading.Event) -> dict:
 
     if threading.current_thread() is not threading.main_thread():
         return prev
-    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None), getattr(signal, "SIGBREAK", None)):
         if sig is None:
             continue
         try:
@@ -474,6 +630,58 @@ def _restore_signals(prev: Mapping) -> None:
             signal.signal(sig, h)
         except (ValueError, OSError, TypeError):  # pragma: no cover
             pass
+
+
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _windows_execution_state_setter() -> Callable[[int], int] | None:  # pragma: no cover - Windows 전용
+    """kernel32.SetThreadExecutionState (argtypes 를 선언한 비공유 인스턴스). 못 쓰면 None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        fn = k.SetThreadExecutionState
+        fn.argtypes = (wintypes.DWORD,)
+        fn.restype = wintypes.DWORD
+        return lambda flags: int(fn(flags))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@contextlib.contextmanager
+def keep_system_awake(*, setter: Callable[[int], int] | None = None) -> Iterator[bool]:
+    """``run`` 동안 Windows 자동 절전(유휴 타이머)을 막는다 — 절전 중에는 손절·익절이 집행되지 않는다.
+
+    ``SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)``: 화면 꺼짐은 막지 않는다. 덮개 닫기·전원 버튼·
+    시작 > 절전 같은 사용자 절전과 배터리 사용 중 모던 스탠바이는 막지 못한다. 요청은 이 스레드에 묶이며
+    끝나면 ``ES_CONTINUOUS`` 로 되돌린다(프로세스가 끝나도 Windows 가 풀어 준다). Windows 가 아니면(그리고
+    ``setter`` 를 주지 않으면) 아무것도 하지 않는다. 실패해도 실행은 계속한다. 값은 차단 성공 여부.
+    """
+    if setter is None:
+        if os.name != "nt":
+            yield False
+            return
+        setter = _windows_execution_state_setter()  # pragma: no cover - Windows 전용
+    ok = False
+    if setter is not None:
+        try:
+            ok = bool(setter(ES_CONTINUOUS | ES_SYSTEM_REQUIRED))
+        except Exception:  # noqa: BLE001
+            ok = False
+    if ok:
+        log.info("Windows 자동 절전 차단(실행 중에만, 화면 꺼짐은 허용)")
+    else:
+        log.warning("Windows 자동 절전 차단 실패 — 전원 설정에서 절전 모드를 '안 함'으로 두세요"
+                    "(PC 가 잠든 동안 손절·익절이 집행되지 않습니다)")
+    try:
+        yield ok
+    finally:
+        if ok and setter is not None:
+            with contextlib.suppress(Exception):
+                setter(ES_CONTINUOUS)
 
 
 def _event(settings: Settings, kind: str, **kw: Any) -> TradeEvent:
@@ -555,21 +763,56 @@ def heartbeat_event(comp: Components) -> TradeEvent:
                   extra=extra)
 
 
+def _poll_wait(stop: threading.Event, seconds: float, *, poll_s: float = WAIT_POLL_S,
+               clock: Callable[[], float] | None = None,
+               monotonic: Callable[[], float] = time.monotonic) -> bool:
+    """``stop.wait(seconds)`` 를 ``poll_s`` 조각으로 나눠 기다린다(종료 요청이면 True).
+
+    - Windows CPython ≤3.13 에서는 ``Event.wait(timeout)`` 이 Ctrl+C 로 깨지 않는다(gh-125541, 3.14 에서 수정).
+      파이썬 SIGINT 핸들러는 대기가 끝나야 돌므로, 조각마다 돌아와야 Ctrl+C 가 ~1초 안에 반영된다.
+    - 마감은 ``monotonic`` 과 벽시계(``clock``) 둘 중 먼저 오는 쪽: PC 절전에서 깨어나면(벽시계는 절전 시간을
+      센다) 남은 대기를 버리고 바로 돌아온다. 벽시계가 뒤로 가도 ``monotonic`` 마감이 상한이다.
+    """
+    seconds = max(0.0, float(seconds))
+    deadline = monotonic() + seconds
+    wall_deadline = clock() + seconds if clock is not None else None
+    while True:
+        left = deadline - monotonic()
+        if wall_deadline is not None:
+            left = min(left, wall_deadline - clock())
+        if left <= 0:
+            return stop.is_set()
+        if stop.wait(min(left, poll_s)):
+            return True
+
+
 def _wait_with_lock_refresh(wait_fn: Callable[[float], bool], wait_s: float, lock: Any,
-                            refresh_s: float = LOCK_REFRESH_S) -> bool:
+                            refresh_s: float = LOCK_REFRESH_S, *, clock: Callable[[], float] | None = None,
+                            settle_s: float = WAKE_SETTLE_S) -> bool:
     """``wait_s`` 를 최대 ``refresh_s`` 조각으로 나눠 기다리며 조각 사이마다 ``lock.refresh()`` (ts 갱신).
 
     종료 요청이면 True. 잠금이 없으면 한 번에 기다린다. ``LockLostError`` 는 전파한다(호출자가 치명 처리).
+    ``clock``(벽시계)을 주면 남은 대기를 ``시작 + wait_s`` 마감으로 자른다: PC 가 절전했다 깨어나면 남은 조각을
+    마저 기다리지 않는다. 마감을 ``WAKE_OVERDUE_S`` 넘게 지났으면(절전 복귀) 네트워크가 돌아올 ``settle_s`` 만
+    더 기다린 뒤 돌아온다.
     """
     refresh = getattr(lock, "refresh", None) if lock is not None else None
     if not callable(refresh) or refresh_s <= 0:
         return bool(wait_fn(wait_s))
     remaining = max(0.0, float(wait_s))
+    deadline = clock() + remaining if clock is not None else None
     while True:
         chunk = min(remaining, float(refresh_s))
         if wait_fn(chunk):
             return True
         remaining -= chunk
+        if deadline is not None:
+            late = clock() - deadline
+            if late > WAKE_OVERDUE_S:
+                log.warning("대기가 예정보다 %.0f초 늦게 끝남(PC 절전·일시정지 의심) — %.0f초 뒤 바로 사이클을 돌립니다",
+                            late, settle_s)
+                return bool(settle_s > 0 and wait_fn(settle_s))
+            remaining = min(remaining, -late)
         if remaining <= 1e-9:
             return False
         try:
@@ -580,6 +823,24 @@ def _wait_with_lock_refresh(wait_fn: Callable[[float], bool], wait_s: float, loc
             log.warning("대기 중 잠금 갱신 실패: %s", type(exc).__name__)
 
 
+def _notify_cycle_gap(comp: Components, gap_s: float) -> None:
+    """사이클 시작 간격 ``gap_s`` 가 주기의 ``CYCLE_GAP_FACTOR`` 배를 넘으면 경보(kind ``alert``, ``cycle_gap``)."""
+    try:
+        period_s = max(1, int(comp.settings.cycle_minutes)) * 60.0
+        if not (gap_s > CYCLE_GAP_FACTOR * period_s):
+            return
+        n_pos = len(getattr(comp.portfolio.state, "positions", None) or {})
+        reason = (f"{gap_s / 60.0:.0f}분 동안 사이클이 없었습니다(예정 {period_s / 60.0:.0f}분마다) — 그동안 손절·익절·"
+                  "시간손절이 집행되지 않았습니다. PC 절전·콘솔 일시정지·과부하를 확인하세요")
+        log.warning("사이클 공백 %.0f초(보유 %d개) — PC 절전·일시정지 의심", gap_s, n_pos)
+        comp.notifier.notify(_event(comp.settings, "alert", reason=reason,
+                                    extra={"alert": "cycle_gap", "gap_s": round(gap_s),
+                                           "cycle_minutes": int(comp.settings.cycle_minutes),
+                                           "positions": n_pos}))
+    except Exception as exc:  # noqa: BLE001 - 경보 실패가 루프를 멈추면 안 된다
+        log.warning("사이클 공백 경보 생성 실패: %s", type(exc).__name__)
+
+
 def run_loop(comp: Components, *, once: bool, stop_event: threading.Event | None = None,
              clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic,
              heartbeat_s: float = HEARTBEAT_S, max_cycles: int | None = None,
@@ -587,13 +848,16 @@ def run_loop(comp: Components, *, once: bool, stop_event: threading.Event | None
              lock_refresh_s: float = LOCK_REFRESH_S) -> int:
     """사이클 루프. 치명 오류(손상 상태·저장 실패·잠금 상실·설정 오류)면 EXIT_ERROR.
 
-    ``wait(seconds) -> bool`` 은 다음 실행까지 대기하고 종료 요청이면 True(기본 ``stop_event.wait``).
+    ``wait(seconds) -> bool`` 은 다음 실행까지 대기하고 종료 요청이면 True(기본: ``stop_event`` 를 1초 조각으로
+    기다림 — Windows 에서도 Ctrl+C 가 바로 반영되고, PC 절전에서 깨어나면 남은 대기를 버린다).
     ``lock``(없으면 ``comp.cycle.lock``)이 있으면 대기를 ``lock_refresh_s``(기본 5분) 조각으로 나눠 그 사이마다
     ``lock.refresh()`` 로 ``ts`` 를 갱신한다(긴 대기 중에 잠금이 낡아 보이지 않게).
+    사이클 시작 간격이 주기의 ``CYCLE_GAP_FACTOR`` 배를 넘으면 notify(alert ``cycle_gap``) — 그동안 손절·익절이
+    집행되지 않았음을 알린다.
     ``max_cycles`` 는 시도 횟수(실패 포함) 상한(테스트용). 종료 시 항상 notify(shutdown) + ``notifier.flush()``.
     """
     stop = stop_event or threading.Event()
-    wait_fn = wait or stop.wait
+    wait_fn = wait or (lambda seconds: _poll_wait(stop, seconds, clock=clock))
     settings = comp.settings
     notifier = comp.notifier
     if lock is None:
@@ -601,10 +865,15 @@ def run_loop(comp: Components, *, once: bool, stop_event: threading.Event | None
     code = EXIT_OK
     reason = "정상 종료"
     last_hb = monotonic()
+    last_start: float | None = None
     n = 0
     try:
         while not stop.is_set():
             n += 1
+            started = clock()
+            if last_start is not None:
+                _notify_cycle_gap(comp, started - last_start)
+            last_start = started
             try:
                 summary = comp.cycle.run_once()
                 log.info("사이클 %s 완료 (오류 %d)", summary.cycle, len(summary.errors))
@@ -635,7 +904,7 @@ def run_loop(comp: Components, *, once: bool, stop_event: threading.Event | None
                     log.warning("하트비트 생성 실패: %s", type(exc).__name__)
             wait_s = max(0.0, next_run_ts(clock(), settings.cycle_minutes) - clock())
             try:
-                stopped = _wait_with_lock_refresh(wait_fn, wait_s, lock, lock_refresh_s)
+                stopped = _wait_with_lock_refresh(wait_fn, wait_s, lock, lock_refresh_s, clock=clock)
             except C.LockLostError as exc:
                 code, reason = EXIT_ERROR, f"치명 오류로 중단: {type(exc).__name__}"
                 log.error("%s (대기 중 잠금 갱신)", reason)
@@ -688,12 +957,13 @@ def _env_float(src: Mapping[str, str], key: str, default: float) -> float:
     return v if v == v and v not in (float("inf"), float("-inf")) and v > 0 else default
 
 
-def status_text_from_env(env: Mapping[str, str] | None = None) -> str:
+def status_text_from_env(env: Mapping[str, str] | None = None, *, err: TextIO | None = None) -> str:
     """설정 검증 없이(백엔드 키가 없거나 설정이 깨져도) ``DATA_DIR`` 의 파일만 읽어 상태를 요약한다.
 
-    ``env`` 가 None 이면 ``read_env()``(os.environ 위에 .env). 모드·종목·예산은 원문 값(없으면 기본)을 표시만 한다.
+    ``env`` 가 None 이면 ``read_env(lenient=True)``(os.environ 위에 .env; 인코딩이 깨진 .env 도 경고 후 읽음).
+    모드·종목·예산은 원문 값(없으면 기본)을 표시만 한다. DATA_DIR 값이 잘못됐으면 ``ConfigError``.
     """
-    src: Mapping[str, str] = read_env(None) if env is None else env
+    src: Mapping[str, str] = _lenient_env(err) if env is None else env
     data_dir = _control_data_dir(src)
     mode = (src.get("MODE") or "").strip().lower() or "paper"
     from tradingbot.config import DEFAULT_SYMBOLS
@@ -709,8 +979,31 @@ def status_text_from_env(env: Mapping[str, str] | None = None) -> str:
                         monthly_budget=_env_float(src, "LLM_MONTHLY_BUDGET_USD", 200.0), cycle_minutes=cm)
 
 
+def _describe_lock(data_dir: Path, cycle_minutes: int | None) -> tuple[dict | None, str, bool]:
+    """``<data_dir>/bot.lock`` 을 읽어 (내용, 상태 라벨, 실행 중인 봇이 있는가). 파일이 없으면 (None, "없음", False)."""
+    lk = BotLock(Path(data_dir) / C.LOCK_FILENAME, stale_after_s=lock_stale_after_s(cycle_minutes))
+    lock = lk.holder()
+    if lock is None:
+        return None, "없음", False
+    pid = lock.get("pid")
+    stale = lk.stale_reason(lock)
+    foreign = lk._foreign_host(lock)
+    alive = _pid_alive(pid) if isinstance(pid, int) else False
+    if foreign is not None and stale is None:
+        return lock, f"실행 중(다른 호스트 {foreign})", True    # 다른 호스트의 PID 는 여기서 검사할 수 없다 → ts 로 판단
+    if alive and stale is None:
+        reused = lk.pid_reused(lock)
+        if reused is not None:
+            return lock, f"낡음: {reused}", False
+        return lock, "실행 중", True
+    if stale is not None:
+        return lock, f"낡음: {stale}", False
+    return lock, "낡음: 프로세스 없음", False
+
+
 def _status_text(data_dir: Path, *, mode: str, symbols: str, daily_budget: float, monthly_budget: float,
                  cycle_minutes: int | None) -> str:
+    data_dir = Path(os.path.abspath(data_dir))    # resolve() 는 하지 않는다(매핑·subst 드라이브 문자 유지)
     lines = [f"모드: {mode}  데이터: {data_dir}  종목: {symbols}"]
     state, err = _read_state(data_dir)
     if state is None:
@@ -745,28 +1038,17 @@ def _status_text(data_dir: Path, *, mode: str, symbols: str, daily_budget: float
         lines.append(f"STOP 대기: {stop.get('reason') or '-'}")
     if clear is not None:
         lines.append("CLEAR 대기: 다음 사이클에 킬스위치 해제")
-    lk = BotLock(data_dir / C.LOCK_FILENAME, stale_after_s=lock_stale_after_s(cycle_minutes))
-    lock = lk.holder()
+    lock, label, _running = _describe_lock(data_dir, cycle_minutes)
     if lock is None:
         lines.append("실행 중 인스턴스: 없음")
     else:
-        pid = lock.get("pid")
-        stale = lk.stale_reason(lock)
-        foreign = lk._foreign_host(lock)
-        alive = _pid_alive(pid) if isinstance(pid, int) else False
-        if foreign is not None and stale is None:
-            label = f"실행 중(다른 호스트 {foreign})"    # 다른 호스트의 PID 는 여기서 검사할 수 없다 → ts 로 판단
-        elif alive and stale is None:
-            label = "실행 중"
-        elif stale is not None:
-            label = f"낡음: {stale}"
-        else:
-            label = "낡음: 프로세스 없음"
         ts = lock.get("ts")
         ts_s = _fmt_ts(ts) if isinstance(ts, int) and not isinstance(ts, bool) else "-"
-        lines.append(f"잠금: pid={pid} ({label}) 갱신 {ts_s}")
+        lines.append(f"잠금: pid={lock.get('pid')} ({label}) 갱신 {ts_s}")
     ledger_p = data_dir / "cost_ledger.jsonl"
-    if ledger_p.is_file():
+    from tradingbot.llm.cost import pending_ledger_path
+
+    if ledger_p.is_file() or pending_ledger_path(ledger_p).is_file():
         try:
             from tradingbot.llm.cost import CostLedger
 
@@ -782,23 +1064,41 @@ def _write_control(path: Path, reason: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"reason": reason, "ts": int(time.time() * 1000)}, sort_keys=True, ensure_ascii=False)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(payload + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(payload + "\n", encoding="utf-8")
+        fsutil.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 def write_stop(data_dir: Path, reason: str) -> Path:
-    """``control/STOP`` 작성(+ 대기 중 CLEAR 삭제). 다음 사이클에 킬스위치."""
+    """``control/STOP`` 작성(+ 대기 중 CLEAR 삭제). 다음 사이클에 킬스위치.
+
+    CLEAR 를 지우지 못해도(다른 프로그램이 열고 있음) 실패로 보지 않는다 — 사이클은 시각 순으로 처리하므로
+    방금 쓴(더 새) STOP 이 이긴다.
+    """
     control = Path(data_dir) / C.CONTROL_DIRNAME
     stop = control / C.STOP_FILENAME
     _write_control(stop, reason or "cli")
-    (control / C.CLEAR_FILENAME).unlink(missing_ok=True)
+    try:
+        fsutil.unlink(control / C.CLEAR_FILENAME)
+    except OSError as exc:
+        log.warning("대기 중 CLEAR 삭제 실패(%s) — 더 새 STOP 이 우선합니다", type(exc).__name__)
     return stop
 
 
 def write_clear(data_dir: Path, reason: str = "cli") -> Path:
-    """``control/STOP`` 삭제 + ``control/CLEAR`` 작성. 다음 사이클에 킬스위치 해제."""
+    """``control/STOP`` 삭제 + ``control/CLEAR`` 작성. 다음 사이클에 킬스위치 해제.
+
+    STOP 을 지우지 못해도 CLEAR 는 쓴다 — 사이클은 CLEAR 보다 오래된 STOP 을 적용하지 않고 지운다.
+    """
     control = Path(data_dir) / C.CONTROL_DIRNAME
-    (control / C.STOP_FILENAME).unlink(missing_ok=True)
+    try:
+        fsutil.unlink(control / C.STOP_FILENAME)
+    except OSError as exc:
+        log.warning("대기 중 STOP 삭제 실패(%s) — 더 새 CLEAR 를 기록합니다", type(exc).__name__)
     clear = control / C.CLEAR_FILENAME
     _write_control(clear, reason)
     return clear
@@ -812,7 +1112,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--once", action="store_true", help="한 사이클만 실행하고 종료")
     r.add_argument("--cycle-minutes", type=int, default=None, help="사이클 주기(분) 덮어쓰기")
     r.add_argument("--offline-fixture", action="store_true",
-                   help="합성 시세(키·네트워크 없음, paper 전용)로 실행 — 체험/점검용")
+                   help="합성 시세(키·네트워크 없음, paper 전용)로 실행 — 체험/점검용(백엔드는 자동으로 mock)")
+    r.add_argument("--mock-scenario", choices=("conservative", "approve"), default=None,
+                   help="mock 백엔드 응답 시나리오(MOCK_SCENARIO 보다 우선). --offline-fixture 또는 AGENT_BACKEND=mock 전용")
     sub.add_parser("dashboard", help="로컬 대시보드 실행")
     b = sub.add_parser("backtest", help="규칙 전용 기준선 백테스트")
     b.add_argument("--days", type=int, default=90)
@@ -845,30 +1147,45 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     if args.command == "notify-test":
         # 텔레그램 값만 있으면 된다 — API 키·백엔드 설정이 없어도 연결을 확인할 수 있어야 한다(stop/clear-stop 처럼)
         return notify_test(env, out, err, http_post=http_post)
+    offline = args.command == "run" and bool(getattr(args, "offline_fixture", False))
     try:
-        settings = load_settings(env)
+        settings_env: Mapping[str, str] | None = env
+        if offline:
+            # 오프라인 픽스처는 어차피 mock 백엔드로 돈다 — ANTHROPIC_API_KEY 없이 체험할 수 있게 검증도 mock 으로
+            settings_env = {**(read_env(None) if env is None else env), "AGENT_BACKEND": "mock"}
+        settings = load_settings(settings_env)
         if args.command == "run":
             _positive_int(args.cycle_minutes, "--cycle-minutes")
             if args.cycle_minutes is not None:
                 settings = dataclasses.replace(settings, cycle_minutes=int(args.cycle_minutes))
+            if getattr(args, "mock_scenario", None) and settings.agent_backend != "mock":
+                raise ConfigError("--mock-scenario 는 --offline-fixture 또는 AGENT_BACKEND=mock 에서만 쓸 수 있습니다")
         if args.command == "backtest":
             _positive_int(args.days, "--days")
     except ConfigError as exc:
         if args.command in ("stop", "clear-stop"):
             # 제어 파일 쓰기는 DATA_DIR 만 있으면 된다 — 백엔드/키 설정이 깨져 있어도 킬스위치는 켜고 끌 수 있어야 한다
-            data_dir = _control_data_dir(env)
             err.write(f"설정 경고(무시하고 진행): {exc}\n")
-            return _cmd_control(args, data_dir, out)
+            try:
+                data_dir = _control_data_dir(env, err)
+            except ConfigError as exc2:
+                err.write(f"설정 오류: {exc2}\n")
+                return EXIT_USAGE
+            return _cmd_control(args, data_dir, out, err)
         if args.command == "status":
             # status 도 파일만 읽는다 — 키가 없거나 설정이 깨져 있어도 상태는 볼 수 있어야 한다
             err.write(f"설정 경고(무시하고 진행): {exc}\n")
-            out.write(status_text_from_env(env))
+            try:
+                out.write(status_text_from_env(env, err=err))
+            except ConfigError as exc2:
+                err.write(f"설정 오류: {exc2}\n")
+                return EXIT_USAGE
             return EXIT_OK
         err.write(f"설정 오류: {exc}\n")
         return EXIT_USAGE
 
     if args.command in ("stop", "clear-stop"):
-        return _cmd_control(args, Path(settings.data_dir), out)
+        return _cmd_control(args, Path(settings.data_dir), out, err, cycle_minutes=settings.cycle_minutes)
     if args.command == "status":
         out.write(status_text(settings))
         return EXIT_OK
@@ -877,8 +1194,9 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     if args.command == "backtest":
         return _cmd_backtest(settings, args, out, err)
     # load_settings 와 같은 출처(os.environ 위에 .env)에서 읽는다 — .env 의 MOCK_SCENARIO 도 반영.
+    # --mock-scenario 가 있으면 그것이 우선한다.
     src_env: Mapping[str, str] = read_env(None) if env is None else env
-    mock_scenario = (src_env.get("MOCK_SCENARIO") or "").strip() or None
+    mock_scenario = getattr(args, "mock_scenario", None) or (src_env.get("MOCK_SCENARIO") or "").strip() or None
     # input_fn 미주입(실제 CLI) → 기본 input() + live 확인은 TTY 에서만(파이프로 'LIVE' 주입 차단).
     require_tty = input_fn is None
     return _cmd_run(settings, args, input_fn=input_fn or input, out=out, err=err,
@@ -895,7 +1213,7 @@ def notify_test(env: Mapping[str, str] | None, out: TextIO, err: TextIO, *,
     """
     from tradingbot.notify import TelegramTransport  # noqa: PLC0415 - 다른 명령의 import 비용을 늘리지 않는다
 
-    src: Mapping[str, str] = read_env(None) if env is None else env
+    src: Mapping[str, str] = _lenient_env(err) if env is None else env
     token = (src.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (src.get("TELEGRAM_CHAT_ID") or "").strip()
     mode = (src.get("MODE") or "").strip().lower()[:16] or "paper"
@@ -925,20 +1243,51 @@ def notify_test(env: Mapping[str, str] | None, out: TextIO, err: TextIO, *,
     return EXIT_OK
 
 
-def _control_data_dir(env: Mapping[str, str] | None) -> Path:
-    """설정 검증 없이 DATA_DIR 만 푼다(load_settings 와 같은 출처: os.environ 위에 .env, 기본 '.')."""
-    src: Mapping[str, str] = read_env(None) if env is None else env
-    return Path((src.get("DATA_DIR") or "").strip() or ".").expanduser()
+def _control_data_dir(env: Mapping[str, str] | None, err: TextIO | None = None) -> Path:
+    """설정 검증 없이 DATA_DIR 만 푼다(load_settings 와 같은 출처: os.environ 위에 .env, 기본 '.').
+
+    ``.env`` 인코딩이 깨졌어도 관대하게 읽는다(경고는 ``err``). DATA_DIR 값 자체가 잘못됐으면 ``ConfigError``.
+    """
+    src: Mapping[str, str] = _lenient_env(err) if env is None else env
+    return parse_data_dir((src.get("DATA_DIR") or "").strip())
 
 
-def _cmd_control(args: argparse.Namespace, data_dir: Path, out: TextIO) -> int:
-    """``stop`` / ``clear-stop``: control 파일만 쓴다."""
-    if args.command == "stop":
-        path = write_stop(data_dir, args.reason)
-        out.write(f"STOP 요청 기록: {path} — 다음 사이클에 킬스위치가 켜집니다\n")
-        return EXIT_OK
-    path = write_clear(data_dir)
-    out.write(f"CLEAR 요청 기록: {path} — 다음 사이클에 킬스위치가 해제됩니다\n")
+def _lenient_env(err: TextIO | None) -> dict[str, str]:
+    """``read_env(lenient=True)`` + 경고를 ``err`` 로(파일만 읽는 명령: status·stop·clear-stop·notify-test)."""
+    warnings: list[str] = []
+    src = read_env(None, lenient=True, warnings=warnings)
+    for w in warnings:
+        (err or sys.stderr).write(f"설정 경고: {w}\n")
+    return src
+
+
+def _cmd_control(args: argparse.Namespace, data_dir: Path, out: TextIO, err: TextIO | None = None, *,
+                 cycle_minutes: int | None = None) -> int:
+    """``stop`` / ``clear-stop``: control 파일만 쓴다.
+
+    절대 경로를 보여 주고, 그 폴더에서 실행 중인 봇이 없으면 경고한다(봇이 다른 DATA_DIR 로 돌고 있으면
+    이 요청은 적용되지 않는다). 쓰기 실패는 트레이스백 대신 안내 문구 + 종료 코드 1.
+    """
+    err = err or sys.stderr
+    abs_dir = Path(os.path.abspath(data_dir))     # resolve() 는 하지 않는다(매핑·subst 드라이브 문자 유지)
+    try:
+        if args.command == "stop":
+            path = write_stop(abs_dir, args.reason)
+            msg = f"STOP 요청 기록: {path} — 다음 사이클에 킬스위치가 켜집니다\n"
+        else:
+            path = write_clear(abs_dir)
+            msg = f"CLEAR 요청 기록: {path} — 다음 사이클에 킬스위치가 해제됩니다\n"
+    except OSError as exc:
+        err.write(f"제어 파일 쓰기 실패({type(exc).__name__}): {abs_dir / C.CONTROL_DIRNAME} — "
+                  "다른 프로그램이 그 파일을 열고 있지 않은지 확인하고 잠시 뒤 다시 실행하세요\n")
+        return EXIT_ERROR
+    out.write(msg)
+    lock, label, running = _describe_lock(abs_dir, cycle_minutes)
+    if running and lock is not None:
+        out.write(f"대상 봇: pid={lock.get('pid')} ({label})\n")
+    else:
+        err.write(f"경고: {abs_dir} 에서 실행 중인 봇을 찾지 못했습니다 — 봇이 다른 DATA_DIR(.env·환경변수)로 "
+                  "실행 중이면 이 요청은 적용되지 않습니다(다음에 이 폴더로 시작하는 봇에는 적용)\n")
     return EXIT_OK
 
 
@@ -961,6 +1310,8 @@ def _cmd_run(settings: Settings, args: argparse.Namespace, *, input_fn: Callable
                       "파이프/리다이렉트된 표준입력은 거부합니다. 실행하지 않습니다\n")
             log.warning("live 확인: 표준입력이 TTY 가 아님 — 실행 거부")
             return EXIT_REFUSED
+        out.write(f"판단 백엔드: {settings.agent_backend} · 종목: {', '.join(settings.symbols)} · "
+                  f"데이터: {os.path.abspath(settings.data_dir)}\n")
         if not confirm_live(input_fn, out):
             err.write("\nLIVE 확인 실패 — 실행하지 않습니다\n")
             log.warning("live 확인 입력 불일치 — 실행 거부")
@@ -973,9 +1324,15 @@ def _cmd_run(settings: Settings, args: argparse.Namespace, *, input_fn: Callable
     except LockHeldError as exc:
         err.write(f"{exc}\n")
         return EXIT_LOCKED
+    except OSError as exc:
+        err.write(f"잠금 파일 처리 실패({type(exc).__name__}): {os.path.abspath(lock.path)} — 폴더 경로·권한을 "
+                  "확인하고, 다른 프로그램이 그 파일을 열고 있다면 잠시 뒤 다시 실행하세요\n")
+        return EXIT_ERROR
+    log_handler = attach_log_file(Path(settings.log_file)) if getattr(settings, "log_file", None) else None
     stop = stop_event or threading.Event()
     prev = install_signal_handlers(stop)
     try:
+        _log_locations(settings)
         factory = components_factory or build_components
         try:
             extra: dict[str, Any] = {}
@@ -994,14 +1351,50 @@ def _cmd_run(settings: Settings, args: argparse.Namespace, *, input_fn: Callable
         st = comp.portfolio.state
         comp.notifier.notify(_event(settings, "startup", equity=_safe_equity(comp),
                                     reason=("1회 실행" if args.once else "루프 시작")
-                                    + (" — 킬스위치 ON" if st.kill_switch else ""),
+                                    + (" — 킬스위치 ON" if st.kill_switch else "")
+                                    + _startup_recovery_note(lock, st, settings),
                                     extra={"symbols": list(settings.symbols), "cycle_minutes": settings.cycle_minutes,
                                            "backend": settings.agent_backend,
+                                           **({"mock_scenario": mock_scenario}
+                                              if settings.agent_backend == "mock" and mock_scenario else {}),
                                            **({"offline_fixture": True} if offline else {})}))
-        return run_loop(comp, once=bool(args.once), stop_event=stop, lock=lock)
+        with keep_system_awake():
+            return run_loop(comp, once=bool(args.once), stop_event=stop, lock=lock)
     finally:
         _restore_signals(prev)
         lock.release()
+        detach_log_file(log_handler)
+
+
+def _log_locations(settings: Settings) -> None:
+    """시작 시 실제로 쓰는 위치(절대 경로)를 남긴다 — 다른 폴더에서 실행해 .env 를 못 읽은 경우를 바로 알 수 있게."""
+    env_path, env_found = dotenv_location()
+    if env_found:
+        log.info("설정 파일: %s", env_path)
+    else:
+        log.warning("작업 폴더 %s 에 .env 가 없습니다 — 환경변수와 기본값만 씁니다(봇 폴더에서 실행했는지 확인)",
+                    os.getcwd())
+        if Path(".env.txt").is_file():
+            log.warning("'.env.txt' 가 있습니다 — 메모장이 확장자를 붙였을 수 있습니다. 이름을 '.env' 로 바꾸세요")
+    log.info("데이터 폴더: %s", os.path.abspath(settings.data_dir))
+
+
+def _startup_recovery_note(lock: BotLock, state: Any, settings: Settings) -> str:
+    """시작 알림에 붙일 복구 안내: 낡은 잠금을 가져왔으면(이전 실행이 비정상 종료) + 마지막 사이클이 오래됐으면."""
+    parts: list[str] = []
+    took = getattr(lock, "took_over", None)
+    if isinstance(took, dict):
+        ts = took.get("ts")
+        when = f", 마지막 갱신 {_fmt_ts(ts)}" if isinstance(ts, int) and not isinstance(ts, bool) and ts > 0 else ""
+        parts.append(f"이전 실행이 정상 종료되지 않았습니다(잠금 인수: pid {took.get('pid')}{when})")
+    last = getattr(state, "last_cycle_ts", None)
+    if isinstance(last, int) and not isinstance(last, bool) and last > 0:
+        age_s = time.time() - last / 1000.0
+        period_s = max(1, int(settings.cycle_minutes)) * 60.0
+        n_pos = len(getattr(state, "positions", None) or {})
+        if age_s > CYCLE_GAP_FACTOR * period_s and n_pos:
+            parts.append(f"마지막 사이클 {age_s / 60.0:.0f}분 전 — 보유 {n_pos}개는 그동안 손절·익절이 집행되지 않았습니다")
+    return "".join(f" — {p}" for p in parts)
 
 
 def _cmd_dashboard(settings: Settings, out: TextIO) -> int:  # pragma: no cover - 서버 실행
@@ -1072,10 +1465,106 @@ def prepare_stdio(streams: Sequence[object] | None = None) -> None:
             continue
 
 
+class _LogPump:
+    """루트 로거 → 무제한 큐 → 전용 데몬 스레드 → 콘솔(그리고 ``LOG_FILE``) 핸들러.
+
+    Windows 콘솔(conhost)에서 창을 클릭·드래그해 선택 모드(QuickEdit·Ctrl+A·Ctrl+M·Pause)에 들어가면 콘솔 쓰기
+    (WriteConsoleW)가 선택이 끝날 때까지 막힌다. 로그를 거래 스레드에서 직접 쓰면 손절·익절·시간손절을 포함한
+    사이클 전체가 그동안 멈추므로, 거래 스레드는 큐에 넣기만 하고 막히는 것은 이 스레드뿐이게 한다.
+    큐는 무제한(``SimpleQueue``): 크기 제한이 있으면 가득 찼을 때 ``handleError`` 가 호출 스레드에서 stderr 에 쓴다.
+    """
+
+    def __init__(self, handlers: Sequence[logging.Handler]) -> None:
+        self.queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.handlers: list[logging.Handler] = list(handlers)
+        self._thread = threading.Thread(target=self._run, name="log-pump", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            record = self.queue.get()
+            if record is None:
+                return
+            for h in list(self.handlers):
+                try:
+                    if record.levelno >= h.level:
+                        h.handle(record)
+                except Exception:  # noqa: BLE001 - 로그 출력 실패가 펌프를 멈추면 안 된다
+                    pass
+
+    def add_handler(self, handler: logging.Handler) -> None:
+        self.handlers.append(handler)
+
+    def remove_handler(self, handler: logging.Handler) -> None:
+        with contextlib.suppress(ValueError):
+            self.handlers.remove(handler)
+
+    def stop(self, timeout_s: float = 2.0) -> None:
+        """남은 기록을 내보내고 끝낸다. 콘솔이 막혀 있으면 ``timeout_s`` 뒤 포기한다(데몬 스레드)."""
+        self.queue.put(None)
+        self._thread.join(timeout_s)
+
+
+_LOG_PUMP: _LogPump | None = None
+
+
+def configure_logging(level: int = logging.INFO, stream: TextIO | None = None) -> _LogPump:
+    """콘솔 로그를 전용 스레드로 내보내도록 루트 로거를 구성한다(``cli()`` 가 부른다; 테스트는 caplog 를 쓴다)."""
+    global _LOG_PUMP
+    console = logging.StreamHandler(stream)        # None → sys.stderr
+    console.setFormatter(logging.Formatter(LOG_FORMAT))
+    pump = _LogPump([console])
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(logging.handlers.QueueHandler(pump.queue))
+    root.setLevel(level)
+    logging.captureWarnings(True)        # warnings.showwarning 은 sys.stderr 에 직접 쓴다
+    logging.raiseExceptions = False      # 핸들러 오류 트레이스백을 호출(거래) 스레드에서 stderr 에 쓰지 않는다
+    pump.start()
+    _LOG_PUMP = pump
+    return pump
+
+
+def attach_log_file(path: Path) -> logging.Handler | None:
+    """``LOG_FILE`` → UTF-8(BOM, 메모장·PowerShell ``Get-Content`` 가 바로 읽음) 추가 쓰기 로그 파일 핸들러.
+
+    전용 스레드가 있으면 거기에 붙인다(파일 쓰기도 거래 스레드를 막지 않게). 열지 못하면 경고만 하고 None.
+    회전(rotate)은 하지 않는다 — Windows 는 다른 프로그램이 연 파일의 이름을 바꿀 수 없다.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = logging.FileHandler(path, encoding="utf-8-sig")
+    except OSError as exc:
+        log.warning("로그 파일을 열지 못함(%s): %s — 콘솔 로그만 씁니다", type(exc).__name__, path)
+        return None
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    if _LOG_PUMP is not None:
+        _LOG_PUMP.add_handler(handler)
+    else:
+        logging.getLogger().addHandler(handler)
+    return handler
+
+
+def detach_log_file(handler: logging.Handler | None) -> None:
+    if handler is None:
+        return
+    if _LOG_PUMP is not None:
+        _LOG_PUMP.remove_handler(handler)
+    logging.getLogger().removeHandler(handler)
+    with contextlib.suppress(Exception):
+        handler.close()
+
+
 def cli() -> int:  # pragma: no cover - 콘솔 진입점(`tradingbot` 명령, `python -m tradingbot.main`)
     prepare_stdio()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    return main()
+    pump = configure_logging()
+    try:
+        return main()
+    finally:
+        pump.stop()
 
 
 if __name__ == "__main__":  # pragma: no cover

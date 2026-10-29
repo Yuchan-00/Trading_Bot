@@ -233,6 +233,44 @@ def _order_not_found_types() -> tuple[type[BaseException], ...]:
     return (ccxt.OrderNotFound,)
 
 
+def _invalid_nonce_types() -> tuple[type[BaseException], ...]:
+    """Binance -1021(요청 시각이 서버 시각과 어긋남) — ccxt 는 ``InvalidNonce``(NetworkError 하위)로 올린다."""
+    ccxt = _ccxt_module()
+    if ccxt is None:  # pragma: no cover
+        return ()
+    return (ccxt.InvalidNonce,)
+
+
+def _install_step_safe_throttle(ex: Any) -> None:
+    """ccxt 속도 제한기가 PC 시계 역행에 잠들지 않게 한다.
+
+    ccxt 는 벽시계(ms)로 마지막 요청과의 간격을 잰다. PC 시계가 뒤로 Δ 바뀌면(Windows 시간 동기화·수동 변경)
+    다음 요청이 Δ 동안 잠든다 — 1시간 역행이면 봇이 1시간 멈추고 그동안 손절·익절이 집행되지 않는다.
+    마지막 요청 시각이 '미래'면 지금으로 당겨 연속 요청처럼 최대 ``rateLimit`` 만 기다리게 한다.
+    정상 동작(시계가 앞으로만 감)은 바뀌지 않는다. 필요한 속성이 없는 테스트 대역은 건드리지 않는다.
+    """
+    orig = getattr(ex, "throttle", None)
+    ms = getattr(ex, "milliseconds", None)
+    if not callable(orig) or not callable(ms) or not hasattr(ex, "lastRestRequestTimestamp") \
+            or getattr(orig, "_tb_step_safe", False):
+        return
+
+    def throttle(cost: Any = None) -> Any:
+        try:
+            now = ms()
+            if ex.lastRestRequestTimestamp > now:
+                ex.lastRestRequestTimestamp = now
+        except Exception:  # noqa: BLE001 - 속도 제한기 보정 실패가 호출을 막으면 안 된다
+            pass
+        return orig(cost)
+
+    throttle._tb_step_safe = True  # type: ignore[attr-defined]
+    try:
+        ex.throttle = throttle
+    except Exception:  # pragma: no cover - 속성 대입이 막힌 객체
+        pass
+
+
 # ---------------------------------------------------------------- 데이터 파싱(공유)
 def _timeframe_ms(timeframe: str) -> int | None:
     """'15m'·'1h'·'1d'·'1w' -> 밀리초. 알 수 없는 형식('1M' 등)은 None(페이지 조회 불가 → 단일 호출)."""
@@ -447,17 +485,27 @@ class _CcxtBase:
 
     @staticmethod
     def _configure_exchange(ex: Any, *, sandbox: bool) -> None:
+        """현물 전용 설정 + 시계 보정.
+
+        ``fetchCurrencies``/``fetchMargins`` 를 끈다: 현물 봇은 입출금·마진 정보를 쓰지 않고, 켜 두면 키가 있을 때
+        ``load_markets`` 가 시계 보정(``adjustForTimeDifference``)보다 **먼저** 서명 SAPI 호출을 해서, PC 시계가 1초
+        이상 빠르면 시작부터 -1021 로 공개 시세 조회까지 막힌다.
+        """
         opts = getattr(ex, "options", None)
         if isinstance(opts, dict):
             opts["adjustForTimeDifference"] = True
             opts["defaultType"] = "spot"
+            opts["fetchCurrencies"] = False
+            opts["fetchMargins"] = False
         else:
             try:
-                ex.options = {"adjustForTimeDifference": True, "defaultType": "spot"}
+                ex.options = {"adjustForTimeDifference": True, "defaultType": "spot",
+                              "fetchCurrencies": False, "fetchMargins": False}
             except Exception:  # pragma: no cover
                 pass
         if sandbox:
             ex.set_sandbox_mode(True)
+        _install_step_safe_throttle(ex)
 
     def _default_futures_client(self) -> Any:
         ccxt = _ccxt_module()
@@ -474,9 +522,31 @@ class _CcxtBase:
             return InsufficientFunds(text)
         return ExchangeError(text)
 
+    def _resync_time(self) -> bool:
+        """거래소 서버 시각과의 차이를 다시 잰다(``load_time_difference``). 실패해도 예외를 올리지 않는다.
+
+        ccxt 는 시계 차이를 ``load_markets`` 때 한 번만 잰다. 그 뒤 PC 시계가 동기화·수동 변경으로 1초 이상
+        앞으로(또는 10초 이상 뒤로) 바뀌면 모든 서명 요청(잔고·주문)이 -1021 로 거부돼 손절 매도도 못 한다.
+        """
+        fn = getattr(self._ex, "load_time_difference", None)
+        if not callable(fn):
+            return False
+        try:
+            diff = fn()
+        except Exception as e:  # noqa: BLE001
+            log.warning("거래소 시계 재보정 실패: %s", type(e).__name__)
+            return False
+        log.warning("거래소 시계 재보정(-1021 — PC 시계가 바뀐 것으로 보임): timeDifference=%s ms", diff)
+        return True
+
     def _retry(self, what: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """NetworkError/RateLimitExceeded/ExchangeNotAvailable만 최대 3회(지수 백오프). 나머지는 즉시 감싸서 전파."""
+        """NetworkError/RateLimitExceeded/ExchangeNotAvailable만 최대 3회(지수 백오프). 나머지는 즉시 감싸서 전파.
+
+        -1021(``InvalidNonce``)이면 한 번 시계를 재보정한 뒤 다시 시도한다.
+        """
         retryable = _retryable_types()
+        nonce = _invalid_nonce_types()
+        resynced = False
         last: BaseException | None = None
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
@@ -486,6 +556,10 @@ class _CcxtBase:
             except retryable as e:  # type: ignore[misc]
                 last = e
                 msg = _scrub_exception(e, self._settings)
+                if nonce and isinstance(e, nonce) and not resynced:
+                    resynced = True
+                    if self._resync_time() and attempt < RETRY_ATTEMPTS:
+                        continue                # 보정됐으면 기다리지 않고 바로 다시
                 if attempt >= RETRY_ATTEMPTS:
                     break
                 delay = RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
@@ -567,6 +641,7 @@ class _CcxtBase:
         if self._futures is None:
             factory = self._futures_factory or self._default_futures_client
             self._futures = factory()
+            _install_step_safe_throttle(self._futures)
         return self._futures
 
     def _fetch_mark_price(self, client: Any, fsym: str, symbol: str) -> float | None:
@@ -803,6 +878,8 @@ class CcxtBroker(_CcxtBase):
         """create_order를 중복 주문 없이 최대 3회 시도한다."""
         retryable = _retryable_types()
         ratelimit = _ratelimit_types()
+        nonce = _invalid_nonce_types()
+        resynced = False
         cid = self._new_client_order_id()
         params = dict(params, newClientOrderId=cid)
         what = f"create_order {symbol} {side}"
@@ -819,6 +896,10 @@ class CcxtBroker(_CcxtBase):
                 last = e
                 msg = _scrub_exception(e, self._settings)
                 log.warning("%s 실패(%d/%d) %s: %s", what, attempt, RETRY_ATTEMPTS, type(e).__name__, msg)
+                if nonce and isinstance(e, nonce) and not resynced:
+                    # -1021 은 체결 엔진에 닿기 전에 거부된다(중복 주문 없음). 재보정해야 아래 조회(서명)도 통한다.
+                    resynced = True
+                    self._resync_time()
                 if not isinstance(e, ratelimit):
                     found = self._lookup_by_client_id(symbol, cid)
                     if found is not None:

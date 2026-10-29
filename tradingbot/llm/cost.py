@@ -4,6 +4,8 @@
   ``CostLedger(prices=...)``로 덮어쓸 수 있다.
 - ``CostLedger``: jsonl 파일에 호출마다 한 줄을 append 하고, 시작 시 파일을 읽어 당일/당월 합계를 복원한다.
   ``check()``는 예산 초과(또는 초과 예상)이면 ``BudgetExceeded``를 던진다.
+- Windows 에서 다른 프로그램(Excel 등)이 원장 파일을 잠가 추가 쓰기가 거부되면, 잠깐 재시도한 뒤 보조 파일
+  ``<원장>.pending.jsonl`` 에 쓴다(지출을 잃지도, 봇을 멈추지도 않게). 합계는 두 파일을 더해 복원한다.
 - 날짜는 전부 UTC.
 """
 from __future__ import annotations
@@ -18,7 +20,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from tradingbot import fsutil
+
 logger = logging.getLogger("tradingbot.llm.cost")
+
+#: 원장이 잠겼을 때 쓰는 보조 파일 접미사: cost_ledger.jsonl → cost_ledger.pending.jsonl
+PENDING_SUFFIX = ".pending"
+#: 원장 추가 쓰기의 공유 위반 재시도 시간(초). 그 뒤에는 보조 파일로 간다.
+LEDGER_SHARING_BUDGET_S = 1.0
+
+
+def pending_ledger_path(path: Path) -> Path:
+    """원장 경로 → 보조(잠김 대비) 원장 경로."""
+    p = Path(path)
+    return p.with_name(f"{p.stem}{PENDING_SUFFIX}{p.suffix}")
 
 # (input, cached_input, output) USD per 1M tokens. 2026-10 기준.
 PRICES_USD_PER_MTOK: dict[str, tuple[float, float, float]] = {
@@ -129,36 +144,55 @@ class CostLedger:
 
     # ------------------------------------------------------------------ 복원
     def _restore(self) -> None:
-        if not self.path.exists():
+        paths = [p for p in (self.path, pending_ledger_path(self.path)) if p.exists()]
+        if not paths:
             return
         bad = 0
-        try:
-            with self.path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        date = str(rec["date"])
-                        cost = float(rec["cost_usd"])
-                    except (ValueError, KeyError, TypeError):
-                        bad += 1
-                        continue
-                    if not math.isfinite(cost) or cost < 0.0:  # NaN/inf/음수(손상·조작) 방어
-                        bad += 1
-                        continue
-                    self._by_date[date] = self._by_date.get(date, 0.0) + cost
-        except OSError as e:
-            # 원장은 일/월 예산의 유일한 영속 저장소: 못 읽으면 예산 상태를 모르므로 시작을 거부한다(SPEC §0).
-            logger.error("비용 원장 읽기 실패 %s: %s", self.path, e)
-            raise
+        for path in paths:
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                            date = str(rec["date"])
+                            cost = float(rec["cost_usd"])
+                        except (ValueError, KeyError, TypeError):
+                            bad += 1
+                            continue
+                        if not math.isfinite(cost) or cost < 0.0:  # NaN/inf/음수(손상·조작) 방어
+                            bad += 1
+                            continue
+                        self._by_date[date] = self._by_date.get(date, 0.0) + cost
+            except OSError as e:
+                # 원장은 일/월 예산의 유일한 영속 저장소: 못 읽으면 예산 상태를 모르므로 시작을 거부한다(SPEC §0).
+                logger.error("비용 원장 읽기 실패 %s: %s", path, e)
+                raise
         if bad:
             logger.warning("비용 원장에 손상된 줄 %d개 무시 (%s)", bad, self.path)
         logger.info(
             "비용 원장 복원: 오늘 %.4f USD, 이달 %.4f USD (%s)",
-            self.spent_today(), self.spent_month(), self.path,
+            self.spent_today(), self.spent_month(), ", ".join(str(p) for p in paths),
         )
+
+    @staticmethod
+    def _append_line(path: Path, line: str) -> None:
+        """``line`` 을 한 줄로 추가한다(공유 위반이면 ``LEDGER_SHARING_BUDGET_S`` 동안 재시도)."""
+        def _op() -> None:
+            with path.open("a+b") as fh:
+                # 크래시로 잘린 마지막 줄(개행 없음) 뒤에 바로 붙이면 이번 정상 기록까지 손상 줄로 합쳐져
+                # 재시작 시 버려진다(지출 과소 복원). 마지막 바이트가 개행이 아니면 개행을 먼저 쓴다.
+                prefix = b""
+                end = fh.seek(0, os.SEEK_END)
+                if end > 0:
+                    fh.seek(end - 1)
+                    if fh.read(1) != b"\n":
+                        prefix = b"\n"
+                fh.write(prefix + (line + "\n").encode("utf-8"))
+
+        fsutil.retry(_op, what="비용 원장 추가 쓰기", path=path, budget_s=LEDGER_SHARING_BUDGET_S)
 
     # ------------------------------------------------------------------ 단가
     def price_for(self, model: str) -> tuple[float, float, float]:
@@ -231,16 +265,16 @@ class CostLedger:
             self._by_date[date] = self._by_date.get(date, 0.0) + cost
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a+b") as fh:
-                    # 크래시로 잘린 마지막 줄(개행 없음) 뒤에 바로 붙이면 이번 정상 기록까지 손상 줄로 합쳐져
-                    # 재시작 시 버려진다(지출 과소 복원). 마지막 바이트가 개행이 아니면 개행을 먼저 쓴다.
-                    prefix = b""
-                    end = fh.seek(0, os.SEEK_END)
-                    if end > 0:
-                        fh.seek(end - 1)
-                        if fh.read(1) != b"\n":
-                            prefix = b"\n"
-                    fh.write(prefix + (line + "\n").encode("utf-8"))
+                try:
+                    self._append_line(self.path, line)
+                except OSError as e:
+                    if not fsutil.is_transient_sharing_error(e):
+                        raise
+                    # 다른 프로그램이 원장을 잠갔다(Windows) → 보조 파일에 남긴다. 합계는 두 파일을 더해 복원한다.
+                    pending = pending_ledger_path(self.path)
+                    self._append_line(pending, line)
+                    logger.warning("비용 원장이 다른 프로그램에 잠겨 있어 보조 파일에 기록: %s (원장을 연 프로그램을 "
+                                   "닫으세요)", pending.name)
             except OSError as e:
                 # 상태 저장 실패는 멈춘다(SPEC §0): 삼키면 재시작 후 합계가 0 으로 복원돼 월 예산을 조용히 넘긴다.
                 logger.error("비용 원장 쓰기 실패 %s: %s", self.path, e)

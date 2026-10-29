@@ -3,6 +3,8 @@
 역할
 - ``BotState``를 메모리에 들고 ``state.json``에 **원자적으로** 저장한다
   (tmp 파일 → ``os.replace``, 실패 시 재시도, 최종 실패는 ``OSError`` 전파 → 사이클 중단).
+  Windows 에서 다른 프로세스가 state.json 을 열고 있어 교체가 거부되면(공유 위반) 최대
+  ``SAVE_SHARING_BUDGET_S`` 초까지 기다리며 다시 시도한다(``fsutil``).
 - 손상 정책: 파일을 읽을 수 없으면 paper는 ``state.json.corrupt.<ts>``로 격리하고 새로 시작,
   testnet/live는 ``CorruptStateError``로 멈춘다. 파일의 mode가 설정과 다를 때도 같은 원칙.
 - 체결(``Fill``)을 포지션/거래 장부에 반영한다. 돈 계산은 이 모듈이 유일한 진실이다:
@@ -24,6 +26,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from tradingbot import fsutil
 from tradingbot.config import HardLimits, Settings
 from tradingbot.models import BotState, ClosedTrade, DailyStats, ExitReason, Fill, Position
 
@@ -35,6 +38,9 @@ STATE_VERSION: int = 1
 #: ``save()``가 실패했을 때 다시 시도하는 횟수(첫 시도 제외). SPEC: 5회, 0.1s 간격.
 SAVE_RETRIES: int = 5
 SAVE_RETRY_DELAY_S: float = 0.1
+#: Windows 공유 위반(대시보드·백신·동기화 프로그램이 state.json 을 잠깐 열고 있음)이면 교체를 이만큼(초) 더 기다린다.
+#: 상태 저장 실패는 봇을 멈추므로(그동안 손절·익절 미집행) 다른 파일보다 길게 준다.
+SAVE_SHARING_BUDGET_S: float = 10.0
 
 #: 부분 체결 판정 허용 오차. 체결 수량이 보유 수량의 (1 - 0.5%) 미만이면 부분 청산.
 PARTIAL_FILL_TOLERANCE: float = 0.005
@@ -203,7 +209,7 @@ class Portfolio:
         while target.exists():
             target = base.with_name(f"{base.name}.{n}")
             n += 1
-        os.replace(p, target)
+        fsutil.replace(p, target)
         return target
 
     # ------------------------------------------------------------ 저장
@@ -218,6 +224,7 @@ class Portfolio:
         last_exc: OSError | None = None
         attempts = 1 + SAVE_RETRIES
         for attempt in range(1, attempts + 1):
+            replacing = False
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -227,7 +234,8 @@ class Portfolio:
                         os.fsync(f.fileno())
                     except OSError:  # 일부 파일시스템은 fsync 미지원
                         pass
-                os.replace(tmp, p)
+                replacing = True
+                fsutil.replace(tmp, p, budget_s=SAVE_SHARING_BUDGET_S, sleep=self.sleep)
                 _fsync_dir(p.parent)
                 if attempt > 1:
                     log.warning("상태 저장 성공 (재시도 %d회 후): %s", attempt - 1, p)
@@ -235,6 +243,8 @@ class Portfolio:
             except OSError as e:
                 last_exc = e
                 log.warning("상태 저장 실패 (%d/%d): %s: %s", attempt, attempts, type(e).__name__, e)
+                if replacing and fsutil.is_transient_sharing_error(e):
+                    break           # 공유 위반은 fsutil.replace 가 이미 SAVE_SHARING_BUDGET_S 동안 다시 시도했다
                 if attempt < attempts:
                     self.sleep(SAVE_RETRY_DELAY_S)
         try:

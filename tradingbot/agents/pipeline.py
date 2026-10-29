@@ -44,6 +44,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from tradingbot import gates as _gates
+from tradingbot import fsutil
 from tradingbot.agents import payloads as P
 from tradingbot.agents.schemas import (
     BearOutput,
@@ -258,7 +259,7 @@ class NewsStore:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            fsutil.replace(tmp, self.path)
         except BaseException:
             try:
                 os.unlink(tmp)

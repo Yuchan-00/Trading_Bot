@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from . import fsutil
 from .config import HardLimits, mask_secret
 from .models import TradeEvent
 
@@ -600,8 +601,7 @@ class Notifier:
             }
             line = json.dumps(record, sort_keys=True, ensure_ascii=False, default=repr) + "\n"
             self.failed_log.parent.mkdir(parents=True, exist_ok=True)
-            with self.failed_log.open("a", encoding="utf-8") as f:
-                f.write(line)
+            fsutil.append_bytes(self.failed_log, line.encode("utf-8"))  # LF 줄바꿈 + Windows 공유 위반 재시도
         except Exception as e:  # noqa: BLE001 - 기록 실패가 사이클을 죽이면 안 된다
             log.error("failed_log 기록 실패 (%s): %s: %s", self.failed_log, type(e).__name__, e)
 

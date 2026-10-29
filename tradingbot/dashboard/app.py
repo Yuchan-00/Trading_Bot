@@ -34,6 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from tradingbot import risk
+from tradingbot import fsutil
 from tradingbot.config import HardLimits, Settings, mask_secret
 from tradingbot.models import BotState
 
@@ -48,6 +49,7 @@ DECISIONS_FILENAME = "decisions.jsonl"
 JOURNAL_FILENAME = "journal.jsonl"
 CYCLES_DIRNAME = "cycles"
 COST_LEDGER_FILENAME = "cost_ledger.jsonl"
+COST_LEDGER_PENDING_FILENAME = "cost_ledger.pending.jsonl"
 BACKTEST_DIRNAME = "backtest_results"
 CONTROL_DIRNAME = "control"
 TOKEN_FILENAME = "dashboard_token"
@@ -492,7 +494,7 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
         tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         try:
             tmp.write_text(payload + "\n", encoding="utf-8")
-            os.replace(tmp, target)
+            fsutil.replace(tmp, target)
         finally:
             try:
                 tmp.unlink()
@@ -646,6 +648,8 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
     def get_costs() -> dict:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         records = _read_jsonl(data_dir / COST_LEDGER_FILENAME)
+        # 원장이 다른 프로그램에 잠겼을 때 봇이 쓰는 보조 파일(llm/cost.py)도 더한다
+        records += _read_jsonl(data_dir / COST_LEDGER_PENDING_FILENAME)
         return summarize_costs(records, today, settings)
 
     @app.get("/api/backtests")
@@ -680,11 +684,14 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             with control_lock:
                 control_dir.mkdir(parents=True, exist_ok=True)
                 _write_control_file(stop_path, payload)
-                if clear_path.exists():
-                    clear_path.unlink()
         except OSError as e:
             log.error("STOP 파일 쓰기 실패: %s", e)
             raise HTTPException(status_code=500, detail="STOP 파일을 쓸 수 없습니다") from e
+        try:
+            with control_lock:
+                fsutil.unlink(clear_path)      # 못 지워도 괜찮다 — 방금 쓴(더 새) STOP 이 이긴다
+        except OSError as e:
+            log.warning("대기 중 CLEAR 삭제 실패(%s) — 더 새 STOP 이 우선합니다", type(e).__name__)
         log.warning("대시보드에서 STOP 요청: %r", reason[:120])
         return {"ok": True, "reason": reason, "ts": ts, "path": str(stop_path)}
 
@@ -704,8 +711,12 @@ def create_app(settings: Settings, data_dir: Path) -> FastAPI:
             with control_lock:
                 control_dir.mkdir(parents=True, exist_ok=True)
                 if stop_path.exists():
-                    stop_path.unlink()
-                    removed = True
+                    try:
+                        fsutil.unlink(stop_path)
+                        removed = True
+                    except OSError as e:
+                        # 못 지워도 CLEAR 는 쓴다 — 사이클은 CLEAR 보다 오래된 STOP 을 적용하지 않고 지운다
+                        log.warning("대기 중 STOP 삭제 실패(%s) — 더 새 CLEAR 를 기록합니다", type(e).__name__)
                 payload = json.dumps({"reason": reason, "ts": ts}, sort_keys=True, ensure_ascii=False)
                 _write_control_file(clear_path, payload)
         except OSError as e:
